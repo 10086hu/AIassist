@@ -56,6 +56,17 @@ def evaluate_result_detail(result_id: str, db: Session = Depends(get_db)) -> dic
     return _check_result_to_detail(row)
 
 
+@router.delete("/results/{result_id}")
+def delete_evaluate_result(result_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+    row = db.get(CheckResult, result_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="审查记录不存在")
+
+    db.delete(row)
+    db.commit()
+    return {"success": True, "deleted_id": result_id}
+
+
 @router.post("/duplicate/internal", response_model=DuplicateInternalResponse)
 async def evaluate_duplicate_internal(
     file: UploadFile = File(...),

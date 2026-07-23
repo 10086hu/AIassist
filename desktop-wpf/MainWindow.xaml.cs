@@ -33,6 +33,7 @@ public partial class MainWindow : Window
     private StackPanel? _rulesEditorPanel;
     private TextBlock? _ruleStatsTextBlock;
     private string _activeRuleModule = "function_correspondence";
+    private string? _activeRecordId;
     private Button? _reportNavButton;
     private Button? _recordsNavButton;
     private Button? _rulesNavButton;
@@ -392,8 +393,7 @@ public partial class MainWindow : Window
         body.Children.Add(Card(listScroller, new Thickness(0), new Thickness(0, 0, 14, 0)));
 
         _recordDetailPanel = new StackPanel();
-        _recordDetailPanel.Children.Add(Text("结果详情", 18, FontWeights.Bold));
-        _recordDetailPanel.Children.Add(Text("选择左侧记录后查看模块名称、风险等级、摘要和 findings 明细。", 13, null, FindBrush("MutedBrush"), new Thickness(0, 6, 0, 0), true));
+        ResetRecordDetail();
         var detailScroller = new ScrollViewer { VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Content = _recordDetailPanel };
         var detailCard = Card(detailScroller, new Thickness(16), new Thickness(0));
         Grid.SetColumn(detailCard, 1);
@@ -1129,6 +1129,7 @@ public partial class MainWindow : Window
         if (!root.TryGetProperty("items", out var items) || items.ValueKind != JsonValueKind.Array || items.GetArrayLength() == 0)
         {
             _recordsListPanel.Children.Add(Text("暂无真实审查记录。", 13, null, FindBrush("MutedBrush"), new Thickness(16, 0, 16, 16), true));
+            ResetRecordDetail();
             return;
         }
 
@@ -1199,6 +1200,8 @@ public partial class MainWindow : Window
         }
 
         _recordDetailPanel.Children.Clear();
+        var id = GetString(root, "id");
+        _activeRecordId = id;
         var module = GetString(root, "module");
         var moduleName = GetString(root, "module_name");
         var risk = GetString(root, "risk_level");
@@ -1206,6 +1209,11 @@ public partial class MainWindow : Window
 
         _recordDetailPanel.Children.Add(Text(moduleName, 18, FontWeights.Bold, FindBrush("TextBrush"), null, true));
         _recordDetailPanel.Children.Add(Text($"风险等级：{risk}｜问题数量：{count}", 13, null, FindBrush("MutedBrush"), new Thickness(0, 6, 0, 10), true));
+
+        var deleteButton = Button("删除当前记录", false);
+        deleteButton.Margin = new Thickness(0, 0, 0, 12);
+        deleteButton.Click += async (_, _) => await DeleteRecordAsync(id);
+        _recordDetailPanel.Children.Add(deleteButton);
 
         if (root.TryGetProperty("summary", out var summary) && summary.ValueKind == JsonValueKind.Object)
         {
@@ -1225,6 +1233,61 @@ public partial class MainWindow : Window
         {
             _recordDetailPanel.Children.Add(Text("未发现需要复核的问题。", 13, null, Brush(2, 122, 72), null, true));
         }
+    }
+
+    private async Task DeleteRecordAsync(string resultId)
+    {
+        if (string.IsNullOrWhiteSpace(resultId))
+        {
+            return;
+        }
+
+        var confirm = MessageBox.Show(
+            this,
+            "确定删除这条审查记录吗？此操作不会删除原始报告文件。",
+            "删除审查记录",
+            MessageBoxButton.OKCancel,
+            MessageBoxImage.Warning);
+        if (confirm != MessageBoxResult.OK)
+        {
+            return;
+        }
+
+        try
+        {
+            using var response = await BackendClient.DeleteAsync($"{BackendBaseUrl}/evaluate/results/{resultId}");
+            var responseBody = await response.Content.ReadAsStringAsync();
+            if (!response.IsSuccessStatusCode)
+            {
+                MessageBox.Show(this, $"删除失败：{ExtractErrorMessage(responseBody)}", "删除失败", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
+            if (_activeRecordId == resultId)
+            {
+                ResetRecordDetail();
+            }
+
+            await LoadRecordsAsync();
+            StatusTextBlock.Text = "审查记录已删除。";
+        }
+        catch (Exception exc)
+        {
+            MessageBox.Show(this, $"删除失败：{exc.Message}", "删除失败", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
+    private void ResetRecordDetail()
+    {
+        _activeRecordId = null;
+        if (_recordDetailPanel == null)
+        {
+            return;
+        }
+
+        _recordDetailPanel.Children.Clear();
+        _recordDetailPanel.Children.Add(Text("结果详情", 18, FontWeights.Bold));
+        _recordDetailPanel.Children.Add(Text("请选择一条记录查看详情。", 13, null, FindBrush("MutedBrush"), new Thickness(0, 6, 0, 0), true));
     }
 
     private void RenderRuleDirectory()
