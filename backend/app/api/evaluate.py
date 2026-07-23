@@ -36,6 +36,26 @@ def evaluate_rules(module: str, rule_source: str = "api") -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.get("/results")
+def evaluate_results(limit: int = 50, db: Session = Depends(get_db)) -> dict[str, Any]:
+    limit = max(1, min(limit, 100))
+    rows = (
+        db.query(CheckResult)
+        .order_by(CheckResult.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return {"items": [_check_result_to_list_item(row) for row in rows]}
+
+
+@router.get("/results/{result_id}")
+def evaluate_result_detail(result_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+    row = db.get(CheckResult, result_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="审查记录不存在")
+    return _check_result_to_detail(row)
+
+
 @router.post("/duplicate/internal", response_model=DuplicateInternalResponse)
 async def evaluate_duplicate_internal(
     file: UploadFile = File(...),
@@ -269,6 +289,66 @@ def _store_check_result(
             model_name="local-python-checker",
         )
     )
+
+
+def _check_result_to_list_item(row: CheckResult) -> dict[str, Any]:
+    payload = _load_reference_payload(row)
+    result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+    summary = _result_summary(result)
+    project_name = payload.get("project_name") or (row.project.name if row.project else "")
+    return {
+        "id": row.id,
+        "project_name": project_name,
+        "report_name": project_name,
+        "module": row.module,
+        "module_name": result.get("module_name") or _module_display_name(row.module),
+        "status": row.result_label,
+        "risk_level": row.severity,
+        "summary": summary,
+        "created_at": row.created_at.isoformat() if row.created_at else "",
+        "findings_count": _findings_count(result),
+    }
+
+
+def _check_result_to_detail(row: CheckResult) -> dict[str, Any]:
+    payload = _load_reference_payload(row)
+    result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+    return {
+        **_check_result_to_list_item(row),
+        "result": result,
+        "findings": result.get("findings") or [],
+    }
+
+
+def _load_reference_payload(row: CheckResult) -> dict[str, Any]:
+    try:
+        payload = json.loads(row.reference_data or "{}")
+        return payload if isinstance(payload, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def _result_summary(result: dict[str, Any]) -> dict[str, Any]:
+    summary = result.get("summary") or result.get("risk_summary") or {}
+    return summary if isinstance(summary, dict) else {}
+
+
+def _findings_count(result: dict[str, Any]) -> int:
+    summary = _result_summary(result)
+    for key in ("displayed_findings_count", "merged_findings_count", "total_findings"):
+        try:
+            return int(summary.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+    findings = result.get("findings")
+    return len(findings) if isinstance(findings, list) else 0
+
+
+def _module_display_name(module: str) -> str:
+    return {
+        "function_correspondence": "建设功能的对应关系检查",
+        "sensitive_word": "敏感词检查",
+    }.get(module, module)
 
 
 def _highest_risk(risk_counts: dict[str, Any]) -> str:

@@ -1297,6 +1297,7 @@ def check_sensitive_words(
     use_llm: bool = False,
     llm_max_items: int = 15,
     project_level: str = "通用",
+    selected_rule_ids: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     """敏感词检查主函数。
 
@@ -1330,6 +1331,12 @@ def check_sensitive_words(
             if (r.rule_name, r.rule_detail) not in existing:
                 rules.append(r)
                 existing.add((r.rule_name, r.rule_detail))
+
+    if selected_rule_ids:
+        selected = {str(rule_id).strip() for rule_id in selected_rule_ids if str(rule_id).strip()}
+        filtered_rules = [rule for rule in rules if rule.rule_id in selected]
+        if filtered_rules:
+            rules = filtered_rules
 
     terms = build_terms_from_rules(rules)
     terms.extend(load_custom_terms(terms_file))

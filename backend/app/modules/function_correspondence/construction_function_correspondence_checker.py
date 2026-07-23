@@ -1023,6 +1023,7 @@ def check_construction_function_correspondence(
     use_llm: bool = False,
     deepseek_api_key: Optional[str] = None,
     output_path: Optional[str] = None,
+    selected_rule_ids: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     """
     建设功能对应关系检查主函数。
@@ -1043,6 +1044,11 @@ def check_construction_function_correspondence(
     lines, tables = parse_report_file(report_path)
     sections = detect_sections(lines)
     rules = filter_rules_by_project_level(load_rules(rules_xlsx_path, rule_api_base), project_level)
+    if selected_rule_ids:
+        selected = {str(rule_id).strip() for rule_id in selected_rule_ids if str(rule_id).strip()}
+        filtered_rules = [rule for rule in rules if rule.rule_id in selected]
+        if filtered_rules:
+            rules = filtered_rules
 
     items = extract_feature_items(sections, tables)
     matrix = cluster_features(items)
