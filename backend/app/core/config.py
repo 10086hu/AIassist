@@ -20,6 +20,10 @@ class Settings:
     deepseek_api_key: str = os.getenv("DEEPSEEK_API_KEY", "")
     deepseek_api_url: str = os.getenv("DEEPSEEK_API_URL", "https://api.deepseek.com/v1")
     deepseek_model: str = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+    rule_api_base_url: str = os.getenv(
+        "RULE_API_BASE_URL",
+        "https://decree-tapering-that.ngrok-free.dev/rules",
+    )
 
     @property
     def cors_origins(self) -> List[str]:

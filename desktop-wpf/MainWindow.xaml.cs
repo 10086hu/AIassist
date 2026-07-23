@@ -1,4 +1,9 @@
 ﻿using Microsoft.Win32;
+using System.IO;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Text;
+using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
@@ -8,7 +13,11 @@ namespace AiReportDesktop;
 
 public partial class MainWindow : Window
 {
+    private const string BackendBaseUrl = "http://127.0.0.1:8000/api";
+    private static readonly HttpClient BackendClient = new() { Timeout = TimeSpan.FromSeconds(120) };
+
     private readonly List<CheckBox> _checkBoxes = new();
+    private readonly Dictionary<string, List<CheckBox>> _ruleCheckBoxesByModule = new();
     private Grid? _contentHost;
     private Grid? _reportPage;
     private UIElement? _recordsPage;
@@ -25,18 +34,19 @@ public partial class MainWindow : Window
     private TextBlock? _tableCompletenessTextBlock;
     private TextBlock? _chapterCompletenessTextBlock;
     private bool _isCompletenessChecked;
+    private bool _isChecking;
 
-    private readonly (string Title, string Description, string Badge)[] _checkItems =
+    private readonly CheckItem[] _checkItems =
     {
-        ("建设依据审查", "根据上传的政策依据附件，结合可研中的依据表述，审查依据、附件内容与建设内容是否一致。", "依据"),
-        ("重复建设检查", "筛查可研自身重复功能点，并支持与历史批复功能点清单进行比对。", "重复"),
-        ("建设功能的对应关系检查", "检查建设内容、业务功能分析、系统功能需求分析、应用功能设计、功能点清单之间的对应关系。", "对应"),
-        ("数据填报合理性", "检查用户量、业务量、并发数、高峰期用户、活跃用户比例、数据量、存储量和计算资源依据。", "数据"),
-        ("资源申请的合理性", "检查云资源和三大件资源申请是否与系统功能、数据规模和性能需求匹配。", "资源"),
-        ("安全内容的合理性", "检查安全需求分析与项目建设内容、安全建设内容之间的匹配性。", "安全"),
-        ("价格合理性", "根据软件造价标准拆解功能点，形成可复核的核价结果入口。", "造价"),
-        ("软硬件产品价格参考", "展示政采网、住建部询价网和价格数据的参考价信息。", "询价"),
-        ("敏感词检测", "识别报告中不符合要求的词语、表达等敏感或违规内容。", "敏感")
+        new("建设依据审查", "basis", "根据上传的政策依据附件，结合可研中的依据表述，审查依据、附件内容与建设内容是否一致。", "依据", false),
+        new("重复建设检查", "duplicate", "筛查可研自身重复功能点，并支持与历史批复功能点清单进行比对。", "重复", false),
+        new("建设功能的对应关系检查", "function_correspondence", "检查建设内容、业务功能分析、系统功能需求分析、应用功能设计、功能点清单之间的对应关系。", "对应", true),
+        new("数据填报合理性", "data_reasonableness", "检查用户量、业务量、并发数、高峰期用户、活跃用户比例、数据量、存储量和计算资源依据。", "数据", false),
+        new("资源申请的合理性", "resource", "检查云资源和三大件资源申请是否与系统功能、数据规模和性能需求匹配。", "资源", false),
+        new("安全内容的合理性", "security", "检查安全需求分析与项目建设内容、安全建设内容之间的匹配性。", "安全", false),
+        new("价格合理性", "price", "根据软件造价标准拆解功能点，形成可复核的核价结果入口。", "造价", false),
+        new("软硬件产品价格参考", "price_reference", "展示政采网、住建部询价网和价格数据的参考价信息。", "询价", false),
+        new("敏感词检测", "sensitive_word", "识别报告中不符合要求的词语、表达等敏感或违规内容。", "敏感", true)
     };
 
     public MainWindow()
@@ -45,7 +55,10 @@ public partial class MainWindow : Window
         PrepareText();
         PrepareNavigation();
         BuildCheckItems();
+        Loaded += OnWindowLoaded;
     }
+
+    private sealed record CheckItem(string Title, string ModuleCode, string Description, string Badge, bool IsChecked);
 
     private void PrepareText()
     {
@@ -295,18 +308,38 @@ public partial class MainWindow : Window
             var checkBox = new CheckBox
             {
                 Content = item.Title,
-                IsChecked = true,
+                IsChecked = item.IsChecked,
+                Tag = item,
                 FontWeight = FontWeights.SemiBold,
                 FontSize = 14,
                 VerticalAlignment = VerticalAlignment.Center
             };
+            checkBox.Checked += OnCheckItemSelectionChanged;
+            checkBox.Unchecked += OnCheckItemSelectionChanged;
             header.Children.Add(checkBox);
             _checkBoxes.Add(checkBox);
 
             stack.Children.Add(header);
             stack.Children.Add(Text(item.Description, 14, null, Brush(102, 112, 133), new Thickness(0, 12, 0, 0), true));
+            if (!IsRunnableModule(item.ModuleCode))
+            {
+                stack.Children.Add(Text("本阶段暂未接入后端执行。", 12, FontWeights.SemiBold, Brush(181, 71, 8), new Thickness(0, 8, 0, 0), true));
+            }
             border.Child = stack;
             CheckItemsGrid.Children.Add(border);
+        }
+    }
+
+    private async void OnWindowLoaded(object sender, RoutedEventArgs e)
+    {
+        await LoadRulesAsync();
+    }
+
+    private async void OnCheckItemSelectionChanged(object sender, RoutedEventArgs e)
+    {
+        if (sender is CheckBox { Tag: CheckItem item } && IsRunnableModule(item.ModuleCode))
+        {
+            await LoadRulesForModuleAsync(item.ModuleCode);
         }
     }
 
@@ -779,7 +812,7 @@ public partial class MainWindow : Window
         var dialog = new OpenFileDialog
         {
             Title = "选择可研报告",
-            Filter = "报告文件|*.docx;*.doc;*.pdf;*.xlsx;*.xls|所有文件|*.*"
+            Filter = "报告文件|*.docx;*.doc;*.pdf;*.txt;*.xlsx;*.xls|所有文件|*.*"
         };
 
         if (dialog.ShowDialog(this) == true)
@@ -809,30 +842,438 @@ public partial class MainWindow : Window
         StatusTextBlock.Text = "已清空检测范围。";
     }
 
-    private void OnStartCheckClicked(object sender, RoutedEventArgs e)
+    private async void OnStartCheckClicked(object sender, RoutedEventArgs e)
     {
+        if (_isChecking)
+        {
+            return;
+        }
+
         if (ReportPathTextBlock.Text == "尚未选择可研报告")
         {
             MessageBox.Show(this, "请先选择可研报告文件。", "缺少报告", MessageBoxButton.OK, MessageBoxImage.Warning);
             return;
         }
 
-        if (!_isCompletenessChecked)
+        var reportPath = ReportPathTextBlock.Text;
+        if (!File.Exists(reportPath))
         {
-            MessageBox.Show(this, "请先完成前置完整性检查，再创建专项检测任务。", "完整性检查未完成", MessageBoxButton.OK, MessageBoxImage.Warning);
+            MessageBox.Show(this, "选择的报告文件不存在，请重新选择。", "文件不存在", MessageBoxButton.OK, MessageBoxImage.Warning);
             return;
         }
 
-        var selectedCount = _checkBoxes.Count(item => item.IsChecked == true);
-        if (selectedCount == 0)
+        var selectedItems = _checkBoxes
+            .Where(item => item.IsChecked == true)
+            .Select(item => item.Tag as CheckItem)
+            .Where(item => item != null)
+            .Cast<CheckItem>()
+            .ToList();
+        if (selectedItems.Count == 0)
         {
             MessageBox.Show(this, "请至少选择一个检测项。", "缺少检测项", MessageBoxButton.OK, MessageBoxImage.Warning);
             return;
         }
 
-        StatusTextBlock.Text = $"已创建检测任务：{selectedCount} 项。请在审查记录中查看任务状态和结果摘要。";
+        var runnableItems = selectedItems.Where(item => IsRunnableModule(item.ModuleCode)).ToList();
+        if (runnableItems.Count == 0)
+        {
+            MessageBox.Show(this, "本阶段已接入“建设功能的对应关系检查”和“敏感词检测”，请至少选择其中一项。", "暂无可执行检测项", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        if (!_isCompletenessChecked)
+        {
+            StatusTextBlock.Text = "尚未执行前置完整性检查，本次继续执行已接入的专项检测。";
+        }
+
+        var startButton = sender as Button;
+        try
+        {
+            _isChecking = true;
+            if (startButton != null)
+            {
+                startButton.IsEnabled = false;
+            }
+
+            ResetResults();
+            StatusTextBlock.Text = "正在检查后端服务连接...";
+            if (!await IsBackendAvailableAsync())
+            {
+                StatusTextBlock.Text = "后端服务未启动。";
+                MessageBox.Show(this, "无法连接后端服务，请先启动 FastAPI：uvicorn app.main:app --reload", "后端未启动", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
+            var skippedCount = selectedItems.Count - runnableItems.Count;
+            if (skippedCount > 0)
+            {
+                AddResultNotice($"已跳过 {skippedCount} 个尚未接入后端的检测项。");
+            }
+
+            for (var index = 0; index < runnableItems.Count; index++)
+            {
+                var item = runnableItems[index];
+                StatusTextBlock.Text = $"正在执行 {item.Title}（{index + 1}/{runnableItems.Count}）...";
+                await LoadRulesForModuleAsync(item.ModuleCode);
+                using var result = await UploadAndRunCheckAsync(item, reportPath);
+                RenderCheckResult(result);
+            }
+
+            StatusTextBlock.Text = $"检测完成：已执行 {runnableItems.Count} 项。";
+        }
+        catch (HttpRequestException exc)
+        {
+            StatusTextBlock.Text = "检测失败：后端请求异常。";
+            AddResultNotice($"请求失败：{exc.Message}");
+        }
+        catch (TaskCanceledException)
+        {
+            StatusTextBlock.Text = "检测失败：请求超时。";
+            AddResultNotice("请求超时，请确认后端服务运行正常，或稍后重试。");
+        }
+        catch (Exception exc)
+        {
+            StatusTextBlock.Text = "检测失败。";
+            AddResultNotice(exc.Message);
+        }
+        finally
+        {
+            _isChecking = false;
+            if (startButton != null)
+            {
+                startButton.IsEnabled = true;
+            }
+        }
     }
+
+    private static bool IsRunnableModule(string moduleCode) =>
+        moduleCode is "function_correspondence" or "sensitive_word";
+
+    private static string EndpointForModule(string moduleCode) => moduleCode switch
+    {
+        "function_correspondence" => $"{BackendBaseUrl}/evaluate/function-correspondence",
+        "sensitive_word" => $"{BackendBaseUrl}/evaluate/sensitive-word",
+        _ => throw new InvalidOperationException($"暂未接入检测模块：{moduleCode}")
+    };
+
+    private static string ProjectLevelForModule(string moduleCode) =>
+        moduleCode == "function_correspondence" ? "市级项目" : "通用";
+
+    private async Task<bool> IsBackendAvailableAsync()
+    {
+        try
+        {
+            using var response = await BackendClient.GetAsync($"{BackendBaseUrl}/health");
+            return response.IsSuccessStatusCode;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private async Task LoadRulesAsync()
+    {
+        RulesListPanel.Children.Clear();
+        _ruleCheckBoxesByModule.Clear();
+        await LoadRulesForModuleAsync("function_correspondence");
+        await LoadRulesForModuleAsync("sensitive_word");
+    }
+
+    private async Task LoadRulesForModuleAsync(string moduleCode)
+    {
+        if (!IsRunnableModule(moduleCode))
+        {
+            return;
+        }
+
+        if (_ruleCheckBoxesByModule.TryGetValue(moduleCode, out var existing) && existing.Count > 0)
+        {
+            return;
+        }
+
+        try
+        {
+            using var response = await BackendClient.GetAsync($"{BackendBaseUrl}/evaluate/rules?module={moduleCode}");
+            if (!response.IsSuccessStatusCode)
+            {
+                AddRuleLoadError(moduleCode, await response.Content.ReadAsStringAsync());
+                return;
+            }
+
+            using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+            AddRuleSection(document.RootElement);
+        }
+        catch (Exception exc)
+        {
+            AddRuleLoadError(moduleCode, exc.Message);
+        }
+    }
+
+    private void AddRuleLoadError(string moduleCode, string message)
+    {
+        var moduleName = moduleCode == "function_correspondence" ? "建设功能的对应关系检查" : "敏感词检查";
+        _ruleCheckBoxesByModule[moduleCode] = new List<CheckBox>();
+        RulesListPanel.Children.Add(Card(
+            Text($"{moduleName} 规则加载失败：{message}", 13, null, Brush(180, 35, 24), null, true),
+            new Thickness(12),
+            new Thickness(0, 0, 0, 10)));
+    }
+
+    private void AddRuleSection(JsonElement root)
+    {
+        var moduleCode = GetString(root, "module_code");
+        var moduleName = GetString(root, "module_name");
+        var source = GetString(root, "source");
+        var checkBoxes = new List<CheckBox>();
+        _ruleCheckBoxesByModule[moduleCode] = checkBoxes;
+
+        var stack = new StackPanel();
+        stack.Children.Add(Text(moduleName, 15, FontWeights.Bold, FindBrush("TextBrush")));
+        stack.Children.Add(Text($"规则来源：{(source == "rule_api" ? "规则库 API" : "本地默认规则")}", 12, null, FindBrush("MutedBrush"), new Thickness(0, 3, 0, 8)));
+
+        if (root.TryGetProperty("rules", out var rules) && rules.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var rule in rules.EnumerateArray())
+            {
+                var ruleId = GetString(rule, "rule_id");
+                var ruleName = GetString(rule, "rule_name");
+                var category = GetString(rule, "rule_category");
+                var detail = GetString(rule, "rule_detail");
+                var checkBox = new CheckBox
+                {
+                    Content = string.IsNullOrWhiteSpace(category) ? ruleName : $"{ruleName}（{category}）",
+                    IsChecked = true,
+                    Tag = ruleId,
+                    Margin = new Thickness(0, 0, 0, 4),
+                    FontWeight = FontWeights.SemiBold
+                };
+                checkBoxes.Add(checkBox);
+                stack.Children.Add(checkBox);
+                if (!string.IsNullOrWhiteSpace(detail))
+                {
+                    stack.Children.Add(Text(detail, 12, null, FindBrush("MutedBrush"), new Thickness(22, 0, 0, 8), true));
+                }
+            }
+        }
+
+        if (checkBoxes.Count == 0)
+        {
+            stack.Children.Add(Text("未读取到规则，后端会使用检查模块内置默认逻辑。", 12, null, Brush(181, 71, 8), null, true));
+        }
+
+        RulesListPanel.Children.Add(Card(stack, new Thickness(12), new Thickness(0, 0, 0, 10)));
+    }
+
+    private async Task<JsonDocument> UploadAndRunCheckAsync(CheckItem item, string reportPath)
+    {
+        await using var stream = File.OpenRead(reportPath);
+        using var form = new MultipartFormDataContent();
+        using var fileContent = new StreamContent(stream);
+        fileContent.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+
+        form.Add(fileContent, "file", Path.GetFileName(reportPath));
+        form.Add(new StringContent(Path.GetFileNameWithoutExtension(reportPath), Encoding.UTF8), "project_name");
+        form.Add(new StringContent(string.Empty, Encoding.UTF8), "department");
+        form.Add(new StringContent("api", Encoding.UTF8), "rule_source");
+        form.Add(new StringContent(ProjectLevelForModule(item.ModuleCode), Encoding.UTF8), "project_level");
+        form.Add(new StringContent("false", Encoding.UTF8), "use_llm");
+        form.Add(new StringContent(string.Join(",", SelectedRuleIdsForModule(item.ModuleCode)), Encoding.UTF8), "selected_rule_ids");
+
+        using var response = await BackendClient.PostAsync(EndpointForModule(item.ModuleCode), form);
+        var responseBody = await response.Content.ReadAsStringAsync();
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new InvalidOperationException($"{item.Title} 请求失败：{ExtractErrorMessage(responseBody)}");
+        }
+
+        return JsonDocument.Parse(responseBody);
+    }
+
+    private IEnumerable<string> SelectedRuleIdsForModule(string moduleCode)
+    {
+        if (!_ruleCheckBoxesByModule.TryGetValue(moduleCode, out var checkBoxes))
+        {
+            return Enumerable.Empty<string>();
+        }
+
+        return checkBoxes
+            .Where(item => item.IsChecked == true)
+            .Select(item => item.Tag?.ToString())
+            .Where(item => !string.IsNullOrWhiteSpace(item))
+            .Cast<string>();
+    }
+
+    private void ResetResults()
+    {
+        ResultsSummaryPanel.Children.Clear();
+        ResultsSummaryPanel.Children.Add(Text("检测结果", 17, FontWeights.SemiBold));
+        ResultsListPanel.Children.Clear();
+    }
+
+    private void AddResultNotice(string message)
+    {
+        ResultsListPanel.Children.Add(Card(
+            Text(message, 13, null, Brush(71, 84, 103), null, true),
+            new Thickness(12),
+            new Thickness(0, 0, 0, 10)));
+    }
+
+    private void RenderCheckResult(JsonDocument document)
+    {
+        var root = document.RootElement;
+        var moduleCode = GetString(root, "module_code");
+        var moduleName = GetString(root, "module_name");
+        var status = GetString(root, "status");
+        var elapsed = GetDouble(root, "elapsed_seconds");
+        var summary = root.TryGetProperty("summary", out var summaryElement) ? summaryElement : default;
+        var riskSummary = root.TryGetProperty("risk_summary", out var riskSummaryElement) ? riskSummaryElement : default;
+        var summarySource = summary.ValueKind == JsonValueKind.Object ? summary : riskSummary;
+        var findingCount = GetInt(summarySource, "total_findings");
+        var riskText = BuildRiskSummaryText(summarySource);
+
+        ResultsSummaryPanel.Children.Add(Text($"{moduleName}：{status}", 14, FontWeights.SemiBold, FindBrush("TextBrush"), new Thickness(0, 8, 0, 0), true));
+        ResultsSummaryPanel.Children.Add(Text($"问题数量：{findingCount}；耗时：{elapsed:0.###} 秒；{riskText}", 13, null, FindBrush("MutedBrush"), new Thickness(0, 3, 0, 0), true));
+
+        var stack = new StackPanel();
+        stack.Children.Add(Text(moduleName, 16, FontWeights.Bold, FindBrush("TextBrush")));
+        stack.Children.Add(Text($"状态：{status}    问题数量：{findingCount}    耗时：{elapsed:0.###} 秒", 13, null, FindBrush("MutedBrush"), new Thickness(0, 5, 0, 10), true));
+
+        if (root.TryGetProperty("findings", out var findings) && findings.ValueKind == JsonValueKind.Array && findings.GetArrayLength() > 0)
+        {
+            foreach (var finding in findings.EnumerateArray())
+            {
+                stack.Children.Add(moduleCode == "sensitive_word"
+                    ? BuildSensitiveFindingCard(finding)
+                    : BuildFunctionFindingCard(finding));
+            }
+        }
+        else
+        {
+            stack.Children.Add(Text("未发现需要复核的问题。", 13, null, Brush(2, 122, 72), null, true));
+        }
+
+        ResultsListPanel.Children.Add(Card(stack, new Thickness(14), new Thickness(0, 0, 0, 12)));
+    }
+
+    private Border BuildFunctionFindingCard(JsonElement finding)
+    {
+        var title = FirstNonEmpty(GetString(finding, "issue_type"), GetString(finding, "description"), "问题项");
+        var evidence = FirstNonEmpty(GetString(finding, "evidence"), GetString(finding, "source_section"), "无");
+        var stack = new StackPanel();
+        stack.Children.Add(Text($"{GetString(finding, "risk_level")}｜{title}", 14, FontWeights.SemiBold, Brush(181, 71, 8), null, true));
+        stack.Children.Add(Text($"原因：{GetString(finding, "reason")}", 13, null, FindBrush("TextBrush"), new Thickness(0, 5, 0, 0), true));
+        stack.Children.Add(Text($"建议：{GetString(finding, "suggestion")}", 13, null, FindBrush("TextBrush"), new Thickness(0, 3, 0, 0), true));
+        stack.Children.Add(Text($"依据：{evidence}", 12, null, FindBrush("MutedBrush"), new Thickness(0, 3, 0, 0), true));
+        return new Border { Background = Brush(248, 250, 252), BorderBrush = Brush(234, 236, 240), BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), Padding = new Thickness(12), Margin = new Thickness(0, 0, 0, 10), Child = stack };
+    }
+
+    private Border BuildSensitiveFindingCard(JsonElement finding)
+    {
+        var stack = new StackPanel();
+        stack.Children.Add(Text($"{GetString(finding, "risk_level")}｜命中：{GetString(finding, "hit_text")}", 14, FontWeights.SemiBold, Brush(181, 71, 8), null, true));
+        stack.Children.Add(Text($"场景：{GetString(finding, "scene_type")}    章节：{GetString(finding, "section")}", 13, null, FindBrush("TextBrush"), new Thickness(0, 5, 0, 0), true));
+        stack.Children.Add(Text($"上下文：{GetString(finding, "context")}", 13, null, FindBrush("TextBrush"), new Thickness(0, 3, 0, 0), true));
+        stack.Children.Add(Text($"建议：{GetString(finding, "suggestion")}", 13, null, FindBrush("TextBrush"), new Thickness(0, 3, 0, 0), true));
+        return new Border { Background = Brush(248, 250, 252), BorderBrush = Brush(234, 236, 240), BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), Padding = new Thickness(12), Margin = new Thickness(0, 0, 0, 10), Child = stack };
+    }
+
+    private static string BuildRiskSummaryText(JsonElement summary)
+    {
+        if (summary.ValueKind != JsonValueKind.Object)
+        {
+            return "风险汇总：无";
+        }
+
+        if (summary.TryGetProperty("risk_count", out var riskCount))
+        {
+            return $"风险汇总：{JsonObjectToText(riskCount)}";
+        }
+
+        if (summary.TryGetProperty("risk_distribution", out var riskDistribution))
+        {
+            return $"风险汇总：{JsonObjectToText(riskDistribution)}";
+        }
+
+        return "风险汇总：无";
+    }
+
+    private static string JsonObjectToText(JsonElement element)
+    {
+        if (element.ValueKind != JsonValueKind.Object)
+        {
+            return "无";
+        }
+
+        var values = element.EnumerateObject()
+            .Select(item => $"{item.Name} {item.Value}")
+            .ToList();
+        return values.Count == 0 ? "无" : string.Join("，", values);
+    }
+
+    private static string ExtractErrorMessage(string responseBody)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(responseBody);
+            return GetString(document.RootElement, "detail");
+        }
+        catch
+        {
+            return string.IsNullOrWhiteSpace(responseBody) ? "后端未返回错误详情" : responseBody;
+        }
+    }
+
+    private static string GetString(JsonElement element, string propertyName)
+    {
+        if (element.ValueKind == JsonValueKind.Object && element.TryGetProperty(propertyName, out var value))
+        {
+            return value.ValueKind == JsonValueKind.String ? value.GetString() ?? string.Empty : value.ToString();
+        }
+
+        return string.Empty;
+    }
+
+    private static int GetInt(JsonElement element, string propertyName)
+    {
+        if (element.ValueKind == JsonValueKind.Object && element.TryGetProperty(propertyName, out var value))
+        {
+            if (value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out var number))
+            {
+                return number;
+            }
+
+            if (int.TryParse(value.ToString(), out number))
+            {
+                return number;
+            }
+        }
+
+        return 0;
+    }
+
+    private static double GetDouble(JsonElement element, string propertyName)
+    {
+        if (element.ValueKind == JsonValueKind.Object && element.TryGetProperty(propertyName, out var value))
+        {
+            if (value.ValueKind == JsonValueKind.Number && value.TryGetDouble(out var number))
+            {
+                return number;
+            }
+
+            if (double.TryParse(value.ToString(), out number))
+            {
+                return number;
+            }
+        }
+
+        return 0;
+    }
+
+    private static string FirstNonEmpty(params string[] values) =>
+        values.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value)) ?? string.Empty;
 }
+
 
 
 

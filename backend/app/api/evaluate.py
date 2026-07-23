@@ -1,15 +1,39 @@
+import json
+import os
+import tempfile
+from pathlib import Path
+from typing import Any
+
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
+from app.db.models import CheckResult, Project
 from app.db.session import get_db
 from app.modules.duplicate.service import (
     run_internal_duplicate_check,
     run_duplicate_check_from_document,
 )
 from app.schemas import DuplicateInternalResponse
+from app.services.check_service import (
+    list_check_rules,
+    run_function_correspondence_check,
+    run_sensitive_word_check,
+)
 
 
 router = APIRouter()
+
+
+FUNCTION_CORRESPONDENCE_EXTENSIONS = {".docx", ".pdf", ".txt"}
+SENSITIVE_WORD_EXTENSIONS = {".docx", ".pdf", ".txt", ".xlsx", ".xlsm"}
+
+
+@router.get("/rules")
+def evaluate_rules(module: str, rule_source: str = "api") -> dict[str, Any]:
+    try:
+        return list_check_rules(module=module, rule_source=rule_source)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/duplicate/internal", response_model=DuplicateInternalResponse)
@@ -61,6 +85,91 @@ async def evaluate_duplicate_internal(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.post("/function-correspondence")
+async def evaluate_function_correspondence(
+    file: UploadFile = File(...),
+    project_id: str | None = Form(default=None),
+    project_name: str = Form(default="未命名可研项目"),
+    department: str | None = Form(default=None),
+    rule_source: str = Form(default="api"),
+    project_level: str = Form(default="市级项目"),
+    use_llm: bool = Form(default=False),
+    selected_rule_ids: str | None = Form(default=None),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    temp_path = await _save_upload_to_temp(file, FUNCTION_CORRESPONDENCE_EXTENSIONS)
+    try:
+        result = run_function_correspondence_check(
+            report_file_path=temp_path,
+            rule_source=rule_source,
+            project_level=project_level,
+            use_llm=use_llm,
+            selected_rule_ids=_parse_selected_rule_ids(selected_rule_ids),
+        )
+        project = _get_or_create_project(db, project_id, project_name, department)
+        _store_check_result(
+            db=db,
+            project=project,
+            module="function_correspondence",
+            result=result,
+            severity=_highest_risk((result.get("summary") or {}).get("risk_count") or {}),
+            suggestion=_first_finding_value(result.get("findings") or [], "suggestion"),
+        )
+        db.commit()
+        return result
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"建设功能对应关系检查失败：{exc}") from exc
+    finally:
+        _remove_temp_file(temp_path)
+
+
+@router.post("/sensitive-word")
+async def evaluate_sensitive_word(
+    file: UploadFile = File(...),
+    project_id: str | None = Form(default=None),
+    project_name: str = Form(default="未命名可研项目"),
+    department: str | None = Form(default=None),
+    rule_source: str = Form(default="api"),
+    project_level: str = Form(default="通用"),
+    use_llm: bool = Form(default=False),
+    selected_rule_ids: str | None = Form(default=None),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    temp_path = await _save_upload_to_temp(file, SENSITIVE_WORD_EXTENSIONS)
+    try:
+        result = run_sensitive_word_check(
+            report_file_path=temp_path,
+            rule_source=rule_source,
+            project_level=project_level,
+            use_llm=use_llm,
+            selected_rule_ids=_parse_selected_rule_ids(selected_rule_ids),
+        )
+        project = _get_or_create_project(db, project_id, project_name, department)
+        risk_summary = result.get("risk_summary") or {}
+        _store_check_result(
+            db=db,
+            project=project,
+            module="sensitive_word",
+            result=result,
+            severity=_highest_risk(risk_summary.get("risk_distribution") or {}),
+            suggestion=(result.get("suggestions") or [None])[0],
+        )
+        db.commit()
+        return result
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"敏感词检查失败：{exc}") from exc
+    finally:
+        _remove_temp_file(temp_path)
+
+
 @router.post("/{project_id}/resource")
 def evaluate_resource(project_id: str, db: Session = Depends(get_db)) -> dict[str, object]:
     # Week 1 skeleton endpoint. Module 5 rules/RAG/LLM evaluation starts in week 4.
@@ -81,3 +190,97 @@ def evaluate_price(project_id: str, db: Session = Depends(get_db)) -> dict[str, 
         "status": "not_implemented",
         "message": "软硬件产品价格参考接口已预留，当前冲刺先交付模块2内部去重。",
     }
+
+
+async def _save_upload_to_temp(file: UploadFile, allowed_extensions: set[str]) -> str:
+    filename = file.filename or ""
+    suffix = Path(filename).suffix.lower()
+    if suffix not in allowed_extensions:
+        supported = ", ".join(sorted(allowed_extensions))
+        raise HTTPException(status_code=400, detail=f"不支持的文件格式。支持：{supported}")
+
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="上传的文件为空")
+
+    fd, path = tempfile.mkstemp(prefix="aiassist_report_", suffix=suffix)
+    with os.fdopen(fd, "wb") as target:
+        target.write(content)
+    return path
+
+
+def _remove_temp_file(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _parse_selected_rule_ids(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _get_or_create_project(
+    db: Session,
+    project_id: str | None,
+    project_name: str,
+    department: str | None,
+) -> Project:
+    if project_id:
+        project = db.get(Project, project_id)
+        if project is not None:
+            project.status = "evaluated"
+            return project
+
+    project = Project(name=project_name, department=department, status="evaluated")
+    db.add(project)
+    db.flush()
+    return project
+
+
+def _store_check_result(
+    db: Session,
+    project: Project,
+    module: str,
+    result: dict[str, Any],
+    severity: str,
+    suggestion: str | None,
+) -> None:
+    result_json = {
+        "project_name": project.name,
+        "checked_module": module,
+        "result": result,
+    }
+    db.add(
+        CheckResult(
+            project_id=project.id,
+            module=module,
+            check_subtype="aggregate",
+            severity=severity,
+            result_label=str(result.get("status") or "完成"),
+            reason=json.dumps(
+                result.get("summary") or result.get("risk_summary") or {},
+                ensure_ascii=False,
+            ),
+            suggestion=suggestion,
+            reference_data=json.dumps(result_json, ensure_ascii=False),
+            model_name="local-python-checker",
+        )
+    )
+
+
+def _highest_risk(risk_counts: dict[str, Any]) -> str:
+    for risk in ("高", "中", "需人工确认", "需确认", "低"):
+        if int(risk_counts.get(risk) or 0) > 0:
+            return risk
+    return "通过"
+
+
+def _first_finding_value(findings: list[dict[str, Any]], key: str) -> str | None:
+    for item in findings:
+        value = str(item.get(key) or "").strip()
+        if value:
+            return value
+    return None
