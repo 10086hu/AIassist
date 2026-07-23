@@ -21,11 +21,18 @@ public partial class MainWindow : Window
     private readonly StackPanel RulesListPanel = new();
     private readonly StackPanel ResultsSummaryPanel = new();
     private readonly StackPanel ResultsListPanel = new();
+    private readonly Dictionary<string, List<RuleDisplayItem>> _rulesByModule = new();
     private Grid? _contentHost;
     private Grid? _reportPage;
     private UIElement? _recordsPage;
     private UIElement? _rulesPage;
     private UIElement? _settingsPage;
+    private StackPanel? _recordsListPanel;
+    private StackPanel? _recordDetailPanel;
+    private StackPanel? _rulesDirectoryPanel;
+    private StackPanel? _rulesEditorPanel;
+    private TextBlock? _ruleStatsTextBlock;
+    private string _activeRuleModule = "function_correspondence";
     private Button? _reportNavButton;
     private Button? _recordsNavButton;
     private Button? _rulesNavButton;
@@ -62,6 +69,7 @@ public partial class MainWindow : Window
     }
 
     private sealed record CheckItem(string Title, string ModuleCode, string Description, string Badge, bool IsChecked);
+    private sealed record RuleDisplayItem(string RuleId, string RuleName, string RuleCategory, string RuleDetail, string Source);
 
     private void PrepareText()
     {
@@ -150,6 +158,15 @@ public partial class MainWindow : Window
             {
                 button.Style = (Style)FindResource(button.Tag?.ToString() == tag ? "ActiveNavButton" : "NavButton");
             }
+        }
+
+        if (tag == "Records")
+        {
+            _ = LoadRecordsAsync();
+        }
+        else if (tag == "Rules")
+        {
+            _ = LoadRulesAsync();
         }
     }
 
@@ -351,24 +368,38 @@ public partial class MainWindow : Window
         var page = PageGrid(3);
         page.RowDefinitions[2].Height = new GridLength(1, GridUnitType.Star);
         var header = Header("审查记录", "查看报告审查任务、执行状态和结果摘要。", "刷新记录", false);
+        if (header.Children.OfType<Button>().FirstOrDefault() is Button refreshButton)
+        {
+            refreshButton.Click += async (_, _) => await LoadRecordsAsync();
+        }
         page.Children.Add(header);
 
         var stats = new UniformGrid { Columns = 3, Margin = new Thickness(0, 18, 0, 0) };
         Grid.SetRow(stats, 1);
-        stats.Children.Add(StatCard("3", "全部记录", "本地工作台任务汇总", Brush(37, 99, 235)));
-        stats.Children.Add(StatCard("1", "已完成", "可查看结果摘要", Brush(2, 122, 72)));
-        stats.Children.Add(StatCard("2", "待处理", "等待确认审查范围", Brush(181, 71, 8)));
+        stats.Children.Add(StatCard("实时", "全部记录", "来自后端 CheckResult", Brush(37, 99, 235)));
+        stats.Children.Add(StatCard("真实", "结果摘要", "展示最近 50 条", Brush(2, 122, 72)));
+        stats.Children.Add(StatCard("可点选", "问题详情", "查看 findings 明细", Brush(181, 71, 8)));
         page.Children.Add(stats);
 
-        var table = Card(new Grid(), new Thickness(0), new Thickness(0, 18, 0, 0));
-        Grid.SetRow(table, 2);
-        var grid = (Grid)table.Child;
-        for (var i = 0; i < 4; i++) grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        AddRecordHeader(grid);
-        AddRecordRow(grid, 1, "智慧园区可研报告.docx", "九项审查", "已完成", "2026-07-09", "发现 4 项需复核内容", Brush(2, 122, 72));
-        AddRecordRow(grid, 2, "数据中心扩容方案.pdf", "资源、价格、安全", "待处理", "2026-07-09", "已保存任务参数", Brush(181, 71, 8));
-        AddRecordRow(grid, 3, "业务系统升级可研.xlsx", "数据、敏感词", "待确认", "2026-07-08", "等待补充报告材料", Brush(23, 92, 211));
-        page.Children.Add(table);
+        var body = new Grid { Margin = new Thickness(0, 18, 0, 0) };
+        body.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1.25, GridUnitType.Star) });
+        body.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1.1, GridUnitType.Star) });
+        Grid.SetRow(body, 2);
+
+        _recordsListPanel = new StackPanel();
+        _recordsListPanel.Children.Add(Text("正在加载审查记录...", 13, null, FindBrush("MutedBrush"), null, true));
+        var listScroller = new ScrollViewer { VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Content = _recordsListPanel };
+        body.Children.Add(Card(listScroller, new Thickness(0), new Thickness(0, 0, 14, 0)));
+
+        _recordDetailPanel = new StackPanel();
+        _recordDetailPanel.Children.Add(Text("结果详情", 18, FontWeights.Bold));
+        _recordDetailPanel.Children.Add(Text("选择左侧记录后查看模块名称、风险等级、摘要和 findings 明细。", 13, null, FindBrush("MutedBrush"), new Thickness(0, 6, 0, 0), true));
+        var detailScroller = new ScrollViewer { VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Content = _recordDetailPanel };
+        var detailCard = Card(detailScroller, new Thickness(16), new Thickness(0));
+        Grid.SetColumn(detailCard, 1);
+        body.Children.Add(detailCard);
+
+        page.Children.Add(body);
         return page;
     }
 
@@ -380,10 +411,15 @@ public partial class MainWindow : Window
 
         var stats = new UniformGrid { Columns = 4, Margin = new Thickness(0, 18, 0, 0) };
         Grid.SetRow(stats, 1);
-        stats.Children.Add(StatCard("42", "启用规则", "覆盖九项审查目录", Brush(37, 99, 235)));
-        stats.Children.Add(StatCard("6", "待复核", "规则变更需确认", Brush(181, 71, 8)));
-        stats.Children.Add(StatCard("92%", "命中可信度", "近 30 次任务均值", Brush(2, 122, 72)));
-        stats.Children.Add(StatCard("v1.0", "当前版本", "2026-07-09 更新", Brush(52, 64, 84)));
+        stats.Children.Add(StatCard("2", "真实模块", "对应已接入检查能力", Brush(37, 99, 235)));
+        stats.Children.Add(StatCard("全选", "默认策略", "勾选状态保存在本次会话", Brush(2, 122, 72)));
+        stats.Children.Add(StatCard("API", "优先来源", "不可达时使用本地规则", Brush(181, 71, 8)));
+        _ruleStatsTextBlock = Text("加载中", 30, FontWeights.Bold, Brush(52, 64, 84));
+        var statStack = new StackPanel();
+        statStack.Children.Add(_ruleStatsTextBlock);
+        statStack.Children.Add(Text("当前规则", 17, FontWeights.SemiBold, FindBrush("TextBrush")));
+        statStack.Children.Add(Text("按模块动态刷新", 14, null, FindBrush("MutedBrush"), new Thickness(0, 4, 0, 0)));
+        stats.Children.Add(Card(statStack, new Thickness(18, 14, 18, 14), new Thickness(0, 0, 12, 0)));
         page.Children.Add(stats);
 
         var body = new Grid { Margin = new Thickness(0, 18, 0, 0) };
@@ -474,50 +510,19 @@ public partial class MainWindow : Window
     private Border BuildRuleCategories()
     {
         var stack = new StackPanel();
+        _rulesDirectoryPanel = stack;
         stack.Children.Add(Text("规则目录", 18, FontWeights.Bold, FindBrush("TextBrush"), new Thickness(0, 0, 0, 6)));
         stack.Children.Add(Text("按审查场景组织，快速定位规则集。", 13, null, FindBrush("MutedBrush"), new Thickness(0, 0, 0, 14), true));
-        stack.Children.Add(RuleItem("建设依据审查", "8 条规则", "已启用", Brush(37, 99, 235), true));
-        stack.Children.Add(RuleItem("重复建设检查", "5 条规则", "需复核", Brush(181, 71, 8), false));
-        stack.Children.Add(RuleItem("功能对应关系", "7 条规则", "已启用", Brush(2, 122, 72), false));
-        stack.Children.Add(RuleItem("数据填报合理性", "6 条规则", "已启用", Brush(2, 122, 72), false));
-        stack.Children.Add(RuleItem("资源申请合理性", "5 条规则", "已启用", Brush(2, 122, 72), false));
-        stack.Children.Add(RuleItem("安全内容合理性", "4 条规则", "已启用", Brush(2, 122, 72), false));
-        stack.Children.Add(RuleItem("价格合理性", "4 条规则", "需复核", Brush(181, 71, 8), false));
-        stack.Children.Add(RuleItem("产品价格参考", "2 条规则", "已启用", Brush(2, 122, 72), false));
-        stack.Children.Add(RuleItem("敏感词检测", "4 条规则", "已启用", Brush(2, 122, 72), false));
+        stack.Children.Add(Text("正在读取规则库...", 13, null, FindBrush("MutedBrush"), null, true));
         return Card(stack, new Thickness(16), new Thickness(0, 0, 14, 0));
     }
 
     private Border BuildRuleEditor()
     {
         var stack = new StackPanel();
-        stack.Children.Add(Text("建设依据审查", 18, FontWeights.Bold, FindBrush("TextBrush"), new Thickness(0, 0, 0, 6)));
-        stack.Children.Add(Text("核对政策依据、批复文件与建设内容的一致性。", 13, null, FindBrush("MutedBrush"), new Thickness(0, 0, 0, 14), true));
-
-        var chips = new WrapPanel { Margin = new Thickness(0, 0, 0, 12) };
-        chips.Children.Add(Pill("启用中", Brush(2, 122, 72), Brush(236, 253, 243)));
-        chips.Children.Add(Pill("8 条规则", Brush(37, 99, 235), Brush(239, 246, 255)));
-        chips.Children.Add(Pill("重要等级", Brush(181, 71, 8), Brush(255, 250, 235)));
-        stack.Children.Add(chips);
-
-        stack.Children.Add(RuleClause("依据文件完整性", "检查报告引用的政策、批复和附件是否在材料清单中存在。", "缺失材料时标记为重要问题", true));
-        stack.Children.Add(RuleClause("依据内容一致性", "比对建设内容、投资范围与依据文件中的授权边界。", "发现不一致时要求人工复核", true));
-        stack.Children.Add(RuleClause("引用时效性", "识别失效、过期或被替代的政策依据。", "优先提示最新有效依据", false));
-
-        var notes = new Border
-        {
-            Background = Brush(248, 250, 252),
-            BorderBrush = Brush(216, 222, 233),
-            BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(10),
-            Padding = new Thickness(14),
-            Margin = new Thickness(0, 6, 0, 0),
-            Child = Text("复核建议：当规则同时命中“依据缺失”和“建设内容超范围”时，结果摘要中提升为重点复核项。", 14, null, Brush(71, 84, 103), null, true)
-        };
-        stack.Children.Add(notes);
-        var actions = ActionRow(Button("保存规则集", true), Button("复制为新版本", false));
-        actions.Margin = new Thickness(0, 16, 0, 0);
-        stack.Children.Add(actions);
+        _rulesEditorPanel = stack;
+        stack.Children.Add(Text("规则详情", 18, FontWeights.Bold, FindBrush("TextBrush"), new Thickness(0, 0, 0, 6)));
+        stack.Children.Add(Text("选择左侧模块后展示真实规则，默认全选。", 13, null, FindBrush("MutedBrush"), new Thickness(0, 0, 0, 14), true));
         return Card(stack, new Thickness(18), new Thickness(0, 0, 14, 0));
     }
 
@@ -922,7 +927,8 @@ public partial class MainWindow : Window
                 RenderCheckResult(result);
             }
 
-            StatusTextBlock.Text = $"检测完成：已执行 {runnableItems.Count} 项。";
+            await LoadRecordsAsync();
+            StatusTextBlock.Text = $"检测完成：已执行 {runnableItems.Count} 项，请到“审查记录”查看结果。";
         }
         catch (HttpRequestException exc)
         {
@@ -977,10 +983,17 @@ public partial class MainWindow : Window
 
     private async Task LoadRulesAsync()
     {
-        RulesListPanel.Children.Clear();
-        _ruleCheckBoxesByModule.Clear();
-        await LoadRulesForModuleAsync("function_correspondence");
-        await LoadRulesForModuleAsync("sensitive_word");
+        if (!_rulesByModule.ContainsKey("function_correspondence") || !_rulesByModule.ContainsKey("sensitive_word"))
+        {
+            RulesListPanel.Children.Clear();
+            _ruleCheckBoxesByModule.Clear();
+            _rulesByModule.Clear();
+            await LoadRulesForModuleAsync("function_correspondence");
+            await LoadRulesForModuleAsync("sensitive_word");
+        }
+
+        RenderRuleDirectory();
+        RenderRuleModule(_activeRuleModule);
     }
 
     private async Task LoadRulesForModuleAsync(string moduleCode)
@@ -1017,6 +1030,7 @@ public partial class MainWindow : Window
     {
         var moduleName = moduleCode == "function_correspondence" ? "建设功能的对应关系检查" : "敏感词检查";
         _ruleCheckBoxesByModule[moduleCode] = new List<CheckBox>();
+        _rulesByModule[moduleCode] = new List<RuleDisplayItem>();
         RulesListPanel.Children.Add(Card(
             Text($"{moduleName} 规则加载失败：{message}", 13, null, Brush(180, 35, 24), null, true),
             new Thickness(12),
@@ -1029,7 +1043,9 @@ public partial class MainWindow : Window
         var moduleName = GetString(root, "module_name");
         var source = GetString(root, "source");
         var checkBoxes = new List<CheckBox>();
+        var ruleItems = new List<RuleDisplayItem>();
         _ruleCheckBoxesByModule[moduleCode] = checkBoxes;
+        _rulesByModule[moduleCode] = ruleItems;
 
         var stack = new StackPanel();
         stack.Children.Add(Text(moduleName, 15, FontWeights.Bold, FindBrush("TextBrush")));
@@ -1043,6 +1059,7 @@ public partial class MainWindow : Window
                 var ruleName = GetString(rule, "rule_name");
                 var category = GetString(rule, "rule_category");
                 var detail = GetString(rule, "rule_detail");
+                ruleItems.Add(new RuleDisplayItem(ruleId, ruleName, category, detail, source));
                 var checkBox = new CheckBox
                 {
                     Content = string.IsNullOrWhiteSpace(category) ? ruleName : $"{ruleName}（{category}）",
@@ -1066,6 +1083,238 @@ public partial class MainWindow : Window
         }
 
         RulesListPanel.Children.Add(Card(stack, new Thickness(12), new Thickness(0, 0, 0, 10)));
+    }
+
+    private async Task LoadRecordsAsync()
+    {
+        if (_recordsListPanel == null)
+        {
+            return;
+        }
+
+        _recordsListPanel.Children.Clear();
+        _recordsListPanel.Children.Add(Text("正在加载审查记录...", 13, null, FindBrush("MutedBrush"), new Thickness(16), true));
+
+        try
+        {
+            using var response = await BackendClient.GetAsync($"{BackendBaseUrl}/evaluate/results?limit=50");
+            var responseBody = await response.Content.ReadAsStringAsync();
+            if (!response.IsSuccessStatusCode)
+            {
+                _recordsListPanel.Children.Clear();
+                _recordsListPanel.Children.Add(Text($"加载失败：{ExtractErrorMessage(responseBody)}", 13, null, Brush(180, 35, 24), new Thickness(16), true));
+                return;
+            }
+
+            using var document = JsonDocument.Parse(responseBody);
+            RenderRecordList(document.RootElement);
+        }
+        catch (Exception exc)
+        {
+            _recordsListPanel.Children.Clear();
+            _recordsListPanel.Children.Add(Text($"加载失败：{exc.Message}", 13, null, Brush(180, 35, 24), new Thickness(16), true));
+        }
+    }
+
+    private void RenderRecordList(JsonElement root)
+    {
+        if (_recordsListPanel == null)
+        {
+            return;
+        }
+
+        _recordsListPanel.Children.Clear();
+        _recordsListPanel.Children.Add(Text("最近审查记录", 18, FontWeights.Bold, FindBrush("TextBrush"), new Thickness(16, 14, 16, 6)));
+
+        if (!root.TryGetProperty("items", out var items) || items.ValueKind != JsonValueKind.Array || items.GetArrayLength() == 0)
+        {
+            _recordsListPanel.Children.Add(Text("暂无真实审查记录。", 13, null, FindBrush("MutedBrush"), new Thickness(16, 0, 16, 16), true));
+            return;
+        }
+
+        foreach (var item in items.EnumerateArray())
+        {
+            var id = GetString(item, "id");
+            var moduleName = GetString(item, "module_name");
+            var projectName = FirstNonEmpty(GetString(item, "project_name"), GetString(item, "report_name"), "未命名项目");
+            var status = GetString(item, "status");
+            var risk = GetString(item, "risk_level");
+            var count = GetInt(item, "findings_count");
+            var createdAt = GetString(item, "created_at");
+
+            var row = new StackPanel();
+            row.Children.Add(Text(projectName, 15, FontWeights.SemiBold, FindBrush("TextBrush"), null, true));
+            row.Children.Add(Text($"{moduleName}｜{status}｜风险：{risk}｜问题：{count}", 13, null, FindBrush("MutedBrush"), new Thickness(0, 4, 0, 0), true));
+            row.Children.Add(Text(createdAt, 12, null, Brush(102, 112, 133), new Thickness(0, 4, 0, 0), true));
+
+            var button = new Button
+            {
+                Content = row,
+                Style = (Style)FindResource("SecondaryButton"),
+                HorizontalContentAlignment = HorizontalAlignment.Left,
+                Margin = new Thickness(16, 0, 16, 10),
+                Tag = id
+            };
+            button.Click += async (_, _) => await LoadRecordDetailAsync(id);
+            _recordsListPanel.Children.Add(button);
+        }
+    }
+
+    private async Task LoadRecordDetailAsync(string resultId)
+    {
+        if (_recordDetailPanel == null)
+        {
+            return;
+        }
+
+        _recordDetailPanel.Children.Clear();
+        _recordDetailPanel.Children.Add(Text("正在加载详情...", 13, null, FindBrush("MutedBrush"), null, true));
+
+        try
+        {
+            using var response = await BackendClient.GetAsync($"{BackendBaseUrl}/evaluate/results/{resultId}");
+            var responseBody = await response.Content.ReadAsStringAsync();
+            if (!response.IsSuccessStatusCode)
+            {
+                _recordDetailPanel.Children.Clear();
+                _recordDetailPanel.Children.Add(Text($"加载失败：{ExtractErrorMessage(responseBody)}", 13, null, Brush(180, 35, 24), null, true));
+                return;
+            }
+
+            using var document = JsonDocument.Parse(responseBody);
+            RenderRecordDetail(document.RootElement);
+        }
+        catch (Exception exc)
+        {
+            _recordDetailPanel.Children.Clear();
+            _recordDetailPanel.Children.Add(Text($"加载失败：{exc.Message}", 13, null, Brush(180, 35, 24), null, true));
+        }
+    }
+
+    private void RenderRecordDetail(JsonElement root)
+    {
+        if (_recordDetailPanel == null)
+        {
+            return;
+        }
+
+        _recordDetailPanel.Children.Clear();
+        var module = GetString(root, "module");
+        var moduleName = GetString(root, "module_name");
+        var risk = GetString(root, "risk_level");
+        var count = GetInt(root, "findings_count");
+
+        _recordDetailPanel.Children.Add(Text(moduleName, 18, FontWeights.Bold, FindBrush("TextBrush"), null, true));
+        _recordDetailPanel.Children.Add(Text($"风险等级：{risk}｜问题数量：{count}", 13, null, FindBrush("MutedBrush"), new Thickness(0, 6, 0, 10), true));
+
+        if (root.TryGetProperty("summary", out var summary) && summary.ValueKind == JsonValueKind.Object)
+        {
+            _recordDetailPanel.Children.Add(Text($"摘要：{JsonObjectToText(summary)}", 13, null, FindBrush("MutedBrush"), new Thickness(0, 0, 0, 12), true));
+        }
+
+        if (root.TryGetProperty("findings", out var findings) && findings.ValueKind == JsonValueKind.Array && findings.GetArrayLength() > 0)
+        {
+            foreach (var finding in findings.EnumerateArray())
+            {
+                _recordDetailPanel.Children.Add(module == "sensitive_word"
+                    ? BuildSensitiveFindingCard(finding)
+                    : BuildFunctionFindingCard(finding));
+            }
+        }
+        else
+        {
+            _recordDetailPanel.Children.Add(Text("未发现需要复核的问题。", 13, null, Brush(2, 122, 72), null, true));
+        }
+    }
+
+    private void RenderRuleDirectory()
+    {
+        if (_rulesDirectoryPanel == null)
+        {
+            return;
+        }
+
+        _rulesDirectoryPanel.Children.Clear();
+        _rulesDirectoryPanel.Children.Add(Text("规则目录", 18, FontWeights.Bold, FindBrush("TextBrush"), new Thickness(0, 0, 0, 6)));
+        _rulesDirectoryPanel.Children.Add(Text("按审查场景组织，快速定位规则集。", 13, null, FindBrush("MutedBrush"), new Thickness(0, 0, 0, 14), true));
+        AddRuleDirectoryItem("function_correspondence", "建设功能的对应关系检查");
+        AddRuleDirectoryItem("sensitive_word", "敏感词检查");
+    }
+
+    private void AddRuleDirectoryItem(string moduleCode, string title)
+    {
+        if (_rulesDirectoryPanel == null)
+        {
+            return;
+        }
+
+        var count = _rulesByModule.TryGetValue(moduleCode, out var rules) ? rules.Count : 0;
+        var item = RuleItem(title, $"{count} 条规则", count > 0 ? "已启用" : "未加载", count > 0 ? Brush(2, 122, 72) : Brush(181, 71, 8), moduleCode == _activeRuleModule);
+        item.MouseLeftButtonUp += (_, _) =>
+        {
+            _activeRuleModule = moduleCode;
+            RenderRuleDirectory();
+            RenderRuleModule(moduleCode);
+        };
+        _rulesDirectoryPanel.Children.Add(item);
+    }
+
+    private void RenderRuleModule(string moduleCode)
+    {
+        if (_rulesEditorPanel == null)
+        {
+            return;
+        }
+
+        _rulesEditorPanel.Children.Clear();
+        var moduleName = moduleCode == "function_correspondence" ? "建设功能的对应关系检查" : "敏感词检查";
+        var rules = _rulesByModule.TryGetValue(moduleCode, out var loadedRules) ? loadedRules : new List<RuleDisplayItem>();
+        _rulesEditorPanel.Children.Add(Text(moduleName, 18, FontWeights.Bold, FindBrush("TextBrush"), new Thickness(0, 0, 0, 6)));
+        _rulesEditorPanel.Children.Add(Text("每条规则默认勾选，开始检测时会把所选规则 ID 传给后端。", 13, null, FindBrush("MutedBrush"), new Thickness(0, 0, 0, 14), true));
+
+        var chips = new WrapPanel { Margin = new Thickness(0, 0, 0, 12) };
+        chips.Children.Add(Pill("启用中", Brush(2, 122, 72), Brush(236, 253, 243)));
+        chips.Children.Add(Pill($"{rules.Count} 条规则", Brush(37, 99, 235), Brush(239, 246, 255)));
+        chips.Children.Add(Pill(rules.FirstOrDefault()?.Source == "rule_api" ? "规则库 API" : "本地 fallback", Brush(181, 71, 8), Brush(255, 250, 235)));
+        _rulesEditorPanel.Children.Add(chips);
+
+        var checkBoxes = new List<CheckBox>();
+        var selectedRuleIds = _ruleCheckBoxesByModule.TryGetValue(moduleCode, out var existingCheckBoxes)
+            ? existingCheckBoxes
+                .Where(item => item.IsChecked == true)
+                .Select(item => item.Tag?.ToString())
+                .Where(item => !string.IsNullOrWhiteSpace(item))
+                .Cast<string>()
+                .ToHashSet()
+            : null;
+        foreach (var rule in rules)
+        {
+            var checkBox = new CheckBox
+            {
+                Content = string.IsNullOrWhiteSpace(rule.RuleCategory) ? rule.RuleName : $"{rule.RuleName}（{rule.RuleCategory}）",
+                IsChecked = selectedRuleIds == null || selectedRuleIds.Contains(rule.RuleId),
+                Tag = rule.RuleId,
+                FontWeight = FontWeights.SemiBold,
+                Margin = new Thickness(0, 0, 0, 4)
+            };
+            checkBoxes.Add(checkBox);
+            _rulesEditorPanel.Children.Add(checkBox);
+            if (!string.IsNullOrWhiteSpace(rule.RuleDetail))
+            {
+                _rulesEditorPanel.Children.Add(Text(rule.RuleDetail, 12, null, FindBrush("MutedBrush"), new Thickness(22, 0, 0, 8), true));
+            }
+        }
+
+        if (checkBoxes.Count == 0)
+        {
+            _rulesEditorPanel.Children.Add(Text("未读取到该模块规则，请确认后端规则接口或本地 Excel fallback。", 13, null, Brush(181, 71, 8), null, true));
+        }
+
+        _ruleCheckBoxesByModule[moduleCode] = checkBoxes;
+        if (_ruleStatsTextBlock != null)
+        {
+            _ruleStatsTextBlock.Text = _rulesByModule.Values.Sum(item => item.Count).ToString();
+        }
     }
 
     private async Task<JsonDocument> UploadAndRunCheckAsync(CheckItem item, string reportPath)
