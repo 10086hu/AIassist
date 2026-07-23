@@ -18,6 +18,9 @@ public partial class MainWindow : Window
 
     private readonly List<CheckBox> _checkBoxes = new();
     private readonly Dictionary<string, List<CheckBox>> _ruleCheckBoxesByModule = new();
+    private readonly StackPanel RulesListPanel = new();
+    private readonly StackPanel ResultsSummaryPanel = new();
+    private readonly StackPanel ResultsListPanel = new();
     private Grid? _contentHost;
     private Grid? _reportPage;
     private UIElement? _recordsPage;

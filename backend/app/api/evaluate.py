@@ -306,17 +306,20 @@ def _check_result_to_list_item(row: CheckResult) -> dict[str, Any]:
         "risk_level": row.severity,
         "summary": summary,
         "created_at": row.created_at.isoformat() if row.created_at else "",
-        "findings_count": _findings_count(result),
+        "findings_count": _display_findings_count(row.module, result),
     }
 
 
 def _check_result_to_detail(row: CheckResult) -> dict[str, Any]:
     payload = _load_reference_payload(row)
     result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+    findings = result.get("findings") or []
+    if row.module == "function_correspondence" and isinstance(findings, list) and len(findings) > 50:
+        findings = findings[:50]
     return {
         **_check_result_to_list_item(row),
         "result": result,
-        "findings": result.get("findings") or [],
+        "findings": findings,
     }
 
 
@@ -334,14 +337,26 @@ def _result_summary(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def _findings_count(result: dict[str, Any]) -> int:
+    findings = result.get("findings")
+    if isinstance(findings, list):
+        return len(findings)
+
     summary = _result_summary(result)
     for key in ("displayed_findings_count", "merged_findings_count", "total_findings"):
         try:
             return int(summary.get(key) or 0)
         except (TypeError, ValueError):
             continue
-    findings = result.get("findings")
-    return len(findings) if isinstance(findings, list) else 0
+    return 0
+
+
+def _display_findings_count(module: str, result: dict[str, Any]) -> int:
+    count = _findings_count(result)
+    if module == "function_correspondence":
+        return min(count, 50)
+    if module == "sensitive_word":
+        return min(count, 100)
+    return count
 
 
 def _module_display_name(module: str) -> str:
