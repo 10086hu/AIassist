@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
+import os
 import re
 from typing import Any, Callable, Dict, Optional, Sequence
 
@@ -18,6 +19,7 @@ from app.modules.sensitive_word.sensitive_word_checker import (
     load_rules_from_api as load_sensitive_word_rules_from_api,
     load_rules_from_xlsx as load_sensitive_word_rules_from_xlsx,
 )
+from app.services.llm_client import get_llm_model, review_finding_with_llm
 
 
 RuleRunner = Callable[[Optional[str]], Dict[str, Any]]
@@ -38,13 +40,13 @@ def run_function_correspondence_check(
             rules_xlsx_path=rule_config["rules_xlsx_path"],
             rule_api_base=rule_api_base,
             project_level=project_level,
-            use_llm=use_llm,
-            deepseek_api_key=settings.deepseek_api_key or None,
+            use_llm=False,
+            deepseek_api_key=None,
             selected_rule_ids=selected_rule_ids,
         )
 
     raw = _run_with_rule_api_fallback(runner, rule_config)
-    return _normalize_function_correspondence_result(raw)
+    return _normalize_function_correspondence_result(raw, use_llm=use_llm)
 
 
 def run_sensitive_word_check(
@@ -62,13 +64,13 @@ def run_sensitive_word_check(
             rules_xlsx_path=rule_config["rules_xlsx_path"],
             rule_api_url=rule_api_url,
             rule_api_keyword="敏感词",
-            use_llm=use_llm,
+            use_llm=False,
             project_level=project_level,
             selected_rule_ids=selected_rule_ids,
         )
 
     raw = _run_with_rule_api_fallback(runner, rule_config)
-    return _normalize_sensitive_word_result(raw)
+    return _normalize_sensitive_word_result(raw, use_llm=use_llm)
 
 
 def list_check_rules(module: str, rule_source: Optional[str] = "api") -> Dict[str, Any]:
@@ -230,10 +232,17 @@ def _with_rule_source_meta(
     return result
 
 
-def _normalize_function_correspondence_result(raw: Dict[str, Any]) -> Dict[str, Any]:
+def _normalize_function_correspondence_result(raw: Dict[str, Any], use_llm: bool = False) -> Dict[str, Any]:
     raw_findings = list(raw.get("findings") or [])
     findings = _merge_function_findings(raw_findings)
     displayed_findings = findings[:50]
+    llm_meta = _apply_llm_reviews(
+        module_code="function_correspondence",
+        findings=displayed_findings,
+        rules=raw.get("rules_used") or [],
+        enabled=use_llm,
+        limit=20,
+    )
 
     summary = dict(raw.get("summary") or {})
     summary["raw_findings_count"] = len(raw_findings)
@@ -241,6 +250,7 @@ def _normalize_function_correspondence_result(raw: Dict[str, Any]) -> Dict[str, 
     summary["displayed_findings_count"] = len(displayed_findings)
     summary["risk_summary"] = dict(Counter(item.get("risk_level") for item in displayed_findings if item.get("risk_level")))
     summary["total_findings"] = len(displayed_findings)
+    summary.update(llm_meta)
     summary["rule_source"] = raw.get("_rule_source")
     if raw.get("_rule_api_error"):
         summary["rule_api_error"] = raw["_rule_api_error"]
@@ -256,16 +266,24 @@ def _normalize_function_correspondence_result(raw: Dict[str, Any]) -> Dict[str, 
     }
 
 
-def _normalize_sensitive_word_result(raw: Dict[str, Any]) -> Dict[str, Any]:
+def _normalize_sensitive_word_result(raw: Dict[str, Any], use_llm: bool = False) -> Dict[str, Any]:
     raw_findings = list(raw.get("findings", []))
     findings = _merge_sensitive_findings(raw_findings)
     displayed_findings = findings[:100]
+    llm_meta = _apply_llm_reviews(
+        module_code="sensitive_word",
+        findings=displayed_findings,
+        rules=raw.get("rules") or [],
+        enabled=use_llm,
+        limit=30,
+    )
 
     risk_summary = dict(raw.get("summary") or {})
     risk_summary["raw_findings_count"] = len(raw_findings)
     risk_summary["merged_findings_count"] = len(findings)
     risk_summary["displayed_findings_count"] = len(displayed_findings)
     risk_summary["total_findings"] = len(displayed_findings)
+    risk_summary.update(llm_meta)
     risk_summary["rule_source"] = raw.get("_rule_source")
     if raw.get("_rule_api_error"):
         risk_summary["rule_api_error"] = raw["_rule_api_error"]
@@ -311,6 +329,77 @@ def _uses_api_rules(result: Dict[str, Any]) -> bool:
         if isinstance(rules, list):
             return any(isinstance(rule, dict) and rule.get("source") == "api" for rule in rules)
     return False
+
+
+def _apply_llm_reviews(
+    module_code: str,
+    findings: list[dict[str, Any]],
+    rules: list[dict[str, Any]],
+    enabled: bool,
+    limit: int,
+) -> dict[str, Any]:
+    model = get_llm_model()
+    if not enabled:
+        return {
+            "llm_enabled": False,
+            "llm_model": model,
+            "llm_reviewed_count": 0,
+            "llm_error_count": 0,
+        }
+
+    if not os.getenv("DEEPSEEK_API_KEY"):
+        return {
+            "llm_enabled": False,
+            "llm_model": model,
+            "llm_reviewed_count": 0,
+            "llm_error_count": 0,
+            "llm_reason": "missing_api_key",
+        }
+
+    rule_by_id = {
+        str(rule.get("rule_id") or ""): rule
+        for rule in rules
+        if isinstance(rule, dict)
+    }
+    candidates = sorted(findings, key=_llm_candidate_sort_key)[:limit]
+    reviewed_count = 0
+    error_count = 0
+    for finding in candidates:
+        rule = rule_by_id.get(str(finding.get("rule_id") or ""), {})
+        review = review_finding_with_llm(
+            module_code=module_code,
+            rule=rule,
+            finding=finding,
+            context=_finding_context(finding),
+        )
+        finding["llm_review"] = review
+        if review.get("risk_level_suggestion"):
+            finding["llm_risk_level_suggestion"] = review["risk_level_suggestion"]
+        if review.get("llm_available") is False:
+            error_count += 1
+        else:
+            reviewed_count += 1
+
+    return {
+        "llm_enabled": True,
+        "llm_model": model,
+        "llm_reviewed_count": reviewed_count,
+        "llm_error_count": error_count,
+    }
+
+
+def _llm_candidate_sort_key(finding: dict[str, Any]) -> tuple[int, int]:
+    return (
+        _risk_rank(str(finding.get("risk_level") or "")),
+        -int(finding.get("merged_count") or 1),
+    )
+
+
+def _finding_context(finding: dict[str, Any]) -> str:
+    examples = finding.get("evidence_examples") or finding.get("context_examples") or []
+    if isinstance(examples, list) and examples:
+        return "\n".join(str(item) for item in examples[:3])
+    return str(finding.get("evidence") or finding.get("context") or finding.get("source_section") or "")
 
 
 def _rule_matches_module(rule: Dict[str, Any], module_code: str) -> bool:

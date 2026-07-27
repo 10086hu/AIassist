@@ -44,6 +44,7 @@ public partial class MainWindow : Window
     private TextBlock? _attachmentCompletenessTextBlock;
     private TextBlock? _tableCompletenessTextBlock;
     private TextBlock? _chapterCompletenessTextBlock;
+    private CheckBox? _llmReviewCheckBox;
     private bool _isCompletenessChecked;
     private bool _isChecking;
 
@@ -207,6 +208,13 @@ public partial class MainWindow : Window
         tags.Children.Add(Pill("材料基础", Brush(2, 122, 72), Brush(236, 253, 243)));
         tags.Children.Add(Pill("结果可查看", Brush(181, 71, 8), Brush(255, 250, 235)));
         left.Children.Add(tags);
+        _llmReviewCheckBox = new CheckBox
+        {
+            Content = "启用大模型辅助复核",
+            IsChecked = false,
+            Margin = new Thickness(0, 0, 0, 12)
+        };
+        left.Children.Add(_llmReviewCheckBox);
         var runButton = Button("执行完整性检查", true);
         runButton.Click += OnRunCompletenessCheckClicked;
         left.Children.Add(ActionRow(runButton, CompletenessResultButton()));
@@ -1218,6 +1226,14 @@ public partial class MainWindow : Window
         if (root.TryGetProperty("summary", out var summary) && summary.ValueKind == JsonValueKind.Object)
         {
             _recordDetailPanel.Children.Add(Text($"摘要：{JsonObjectToText(summary)}", 13, null, FindBrush("MutedBrush"), new Thickness(0, 0, 0, 12), true));
+            var llmEnabled = GetString(summary, "llm_enabled");
+            var llmModel = GetString(summary, "llm_model");
+            var llmReviewed = GetInt(summary, "llm_reviewed_count");
+            if (!string.IsNullOrWhiteSpace(llmEnabled) || !string.IsNullOrWhiteSpace(llmModel) || llmReviewed > 0)
+            {
+                var llmReason = GetString(summary, "llm_reason");
+                _recordDetailPanel.Children.Add(Text($"大模型复核：{llmEnabled}｜模型：{llmModel}｜复核数量：{llmReviewed}{(string.IsNullOrWhiteSpace(llmReason) ? "" : $"｜{llmReason}")}", 13, null, FindBrush("MutedBrush"), new Thickness(0, 0, 0, 12), true));
+            }
         }
 
         if (root.TryGetProperty("findings", out var findings) && findings.ValueKind == JsonValueKind.Array && findings.GetArrayLength() > 0)
@@ -1392,7 +1408,7 @@ public partial class MainWindow : Window
         form.Add(new StringContent(string.Empty, Encoding.UTF8), "department");
         form.Add(new StringContent("api", Encoding.UTF8), "rule_source");
         form.Add(new StringContent(ProjectLevelForModule(item.ModuleCode), Encoding.UTF8), "project_level");
-        form.Add(new StringContent("false", Encoding.UTF8), "use_llm");
+        form.Add(new StringContent((_llmReviewCheckBox?.IsChecked == true).ToString().ToLowerInvariant(), Encoding.UTF8), "use_llm");
         form.Add(new StringContent(string.Join(",", SelectedRuleIdsForModule(item.ModuleCode)), Encoding.UTF8), "selected_rule_ids");
 
         using var response = await BackendClient.PostAsync(EndpointForModule(item.ModuleCode), form);
@@ -1480,6 +1496,7 @@ public partial class MainWindow : Window
         stack.Children.Add(Text($"原因：{GetString(finding, "reason")}", 13, null, FindBrush("TextBrush"), new Thickness(0, 5, 0, 0), true));
         stack.Children.Add(Text($"建议：{GetString(finding, "suggestion")}", 13, null, FindBrush("TextBrush"), new Thickness(0, 3, 0, 0), true));
         stack.Children.Add(Text($"依据：{evidence}", 12, null, FindBrush("MutedBrush"), new Thickness(0, 3, 0, 0), true));
+        AddLlmReviewText(stack, finding);
         return new Border { Background = Brush(248, 250, 252), BorderBrush = Brush(234, 236, 240), BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), Padding = new Thickness(12), Margin = new Thickness(0, 0, 0, 10), Child = stack };
     }
 
@@ -1490,7 +1507,30 @@ public partial class MainWindow : Window
         stack.Children.Add(Text($"场景：{GetString(finding, "scene_type")}    章节：{GetString(finding, "section")}", 13, null, FindBrush("TextBrush"), new Thickness(0, 5, 0, 0), true));
         stack.Children.Add(Text($"上下文：{GetString(finding, "context")}", 13, null, FindBrush("TextBrush"), new Thickness(0, 3, 0, 0), true));
         stack.Children.Add(Text($"建议：{GetString(finding, "suggestion")}", 13, null, FindBrush("TextBrush"), new Thickness(0, 3, 0, 0), true));
+        AddLlmReviewText(stack, finding);
         return new Border { Background = Brush(248, 250, 252), BorderBrush = Brush(234, 236, 240), BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), Padding = new Thickness(12), Margin = new Thickness(0, 0, 0, 10), Child = stack };
+    }
+
+    private void AddLlmReviewText(StackPanel stack, JsonElement finding)
+    {
+        if (!finding.TryGetProperty("llm_review", out var review) || review.ValueKind != JsonValueKind.Object)
+        {
+            return;
+        }
+
+        var judgement = GetString(review, "judgement");
+        var risk = FirstNonEmpty(GetString(finding, "llm_risk_level_suggestion"), GetString(review, "risk_level_suggestion"));
+        var reason = GetString(review, "reason");
+        var rewrite = GetString(review, "rewrite_suggestion");
+        stack.Children.Add(Text($"大模型复核：{judgement}｜风险建议：{risk}", 12, FontWeights.SemiBold, Brush(37, 99, 235), new Thickness(0, 6, 0, 0), true));
+        if (!string.IsNullOrWhiteSpace(reason))
+        {
+            stack.Children.Add(Text($"复核理由：{reason}", 12, null, FindBrush("MutedBrush"), new Thickness(0, 3, 0, 0), true));
+        }
+        if (!string.IsNullOrWhiteSpace(rewrite))
+        {
+            stack.Children.Add(Text($"改写建议：{rewrite}", 12, null, FindBrush("MutedBrush"), new Thickness(0, 3, 0, 0), true));
+        }
     }
 
     private static string BuildRiskSummaryText(JsonElement summary)
