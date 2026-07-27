@@ -241,7 +241,7 @@ def _normalize_function_correspondence_result(raw: Dict[str, Any], use_llm: bool
         findings=displayed_findings,
         rules=raw.get("rules_used") or [],
         enabled=use_llm,
-        limit=20,
+        limit=5,
     )
 
     summary = dict(raw.get("summary") or {})
@@ -275,7 +275,7 @@ def _normalize_sensitive_word_result(raw: Dict[str, Any], use_llm: bool = False)
         findings=displayed_findings,
         rules=raw.get("rules") or [],
         enabled=use_llm,
-        limit=30,
+        limit=8,
     )
 
     risk_summary = dict(raw.get("summary") or {})
@@ -345,6 +345,7 @@ def _apply_llm_reviews(
             "llm_model": model,
             "llm_reviewed_count": 0,
             "llm_error_count": 0,
+            "llm_display_mode": "rule_text",
         }
 
     if not os.getenv("DEEPSEEK_API_KEY"):
@@ -354,6 +355,8 @@ def _apply_llm_reviews(
             "llm_reviewed_count": 0,
             "llm_error_count": 0,
             "llm_reason": "missing_api_key",
+            "llm_error": "missing_api_key",
+            "llm_display_mode": "rule_text",
         }
 
     rule_by_id = {
@@ -361,9 +364,13 @@ def _apply_llm_reviews(
         for rule in rules
         if isinstance(rule, dict)
     }
-    candidates = sorted(findings, key=_llm_candidate_sort_key)[:limit]
+    candidates = sorted(
+        [finding for finding in findings if _should_llm_review(module_code, finding)],
+        key=_llm_candidate_sort_key,
+    )[:limit]
     reviewed_count = 0
     error_count = 0
+    errors: list[str] = []
     for finding in candidates:
         rule = rule_by_id.get(str(finding.get("rule_id") or ""), {})
         review = review_finding_with_llm(
@@ -371,21 +378,38 @@ def _apply_llm_reviews(
             rule=rule,
             finding=finding,
             context=_finding_context(finding),
+            timeout=12,
         )
         finding["llm_review"] = review
         if review.get("risk_level_suggestion"):
             finding["llm_risk_level_suggestion"] = review["risk_level_suggestion"]
         if review.get("llm_available") is False:
             error_count += 1
+            error = str(review.get("llm_error_type") or review.get("llm_error") or "llm_call_failed")
+            if error not in errors:
+                errors.append(error)
         else:
             reviewed_count += 1
 
-    return {
+    meta = {
         "llm_enabled": True,
         "llm_model": model,
         "llm_reviewed_count": reviewed_count,
         "llm_error_count": error_count,
+        "llm_display_mode": "llm_refined_text",
     }
+    if errors:
+        meta["llm_error"] = ", ".join(errors[:3])
+    return meta
+
+
+def _should_llm_review(module_code: str, finding: dict[str, Any]) -> bool:
+    risk_level = str(finding.get("risk_level") or "")
+    if module_code == "function_correspondence":
+        return risk_level in {"高", "中"}
+    if module_code == "sensitive_word":
+        return True
+    return True
 
 
 def _llm_candidate_sort_key(finding: dict[str, Any]) -> tuple[int, int]:

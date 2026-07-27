@@ -14,7 +14,7 @@ namespace AiReportDesktop;
 public partial class MainWindow : Window
 {
     private const string BackendBaseUrl = "http://127.0.0.1:8000/api";
-    private static readonly HttpClient BackendClient = new() { Timeout = TimeSpan.FromSeconds(120) };
+    private static readonly HttpClient BackendClient = new() { Timeout = TimeSpan.FromSeconds(180) };
 
     private readonly List<CheckBox> _checkBoxes = new();
     private readonly Dictionary<string, List<CheckBox>> _ruleCheckBoxesByModule = new();
@@ -402,7 +402,7 @@ public partial class MainWindow : Window
 
         _recordDetailPanel = new StackPanel();
         ResetRecordDetail();
-        var detailScroller = new ScrollViewer { VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Content = _recordDetailPanel };
+        var detailScroller = new ScrollViewer { VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled, Content = _recordDetailPanel };
         var detailCard = Card(detailScroller, new Thickness(16), new Thickness(0));
         Grid.SetColumn(detailCard, 1);
         body.Children.Add(detailCard);
@@ -1229,10 +1229,11 @@ public partial class MainWindow : Window
             var llmEnabled = GetString(summary, "llm_enabled");
             var llmModel = GetString(summary, "llm_model");
             var llmReviewed = GetInt(summary, "llm_reviewed_count");
+            var llmErrors = GetInt(summary, "llm_error_count");
             if (!string.IsNullOrWhiteSpace(llmEnabled) || !string.IsNullOrWhiteSpace(llmModel) || llmReviewed > 0)
             {
-                var llmReason = GetString(summary, "llm_reason");
-                _recordDetailPanel.Children.Add(Text($"大模型复核：{llmEnabled}｜模型：{llmModel}｜复核数量：{llmReviewed}{(string.IsNullOrWhiteSpace(llmReason) ? "" : $"｜{llmReason}")}", 13, null, FindBrush("MutedBrush"), new Thickness(0, 0, 0, 12), true));
+                var llmReason = FirstNonEmpty(GetString(summary, "llm_error"), GetString(summary, "llm_reason"));
+                _recordDetailPanel.Children.Add(Text($"大模型复核：{llmEnabled}｜模型：{llmModel}｜复核数量：{llmReviewed}｜错误数量：{llmErrors}{(string.IsNullOrWhiteSpace(llmReason) ? "" : $"｜{llmReason}")}", 13, null, FindBrush("MutedBrush"), new Thickness(0, 0, 0, 12), true));
             }
         }
 
@@ -1490,11 +1491,14 @@ public partial class MainWindow : Window
     private Border BuildFunctionFindingCard(JsonElement finding)
     {
         var title = FirstNonEmpty(GetString(finding, "issue_type"), GetString(finding, "description"), "问题项");
-        var evidence = FirstNonEmpty(GetString(finding, "evidence"), GetString(finding, "source_section"), "无");
+        var reason = FirstNonEmpty(GetLlmReviewString(finding, "user_reason"), GetString(finding, "reason"), "无");
+        var suggestion = FirstNonEmpty(GetLlmReviewString(finding, "user_suggestion"), GetString(finding, "suggestion"), "无");
+        var evidence = FirstNonEmpty(GetLlmReviewString(finding, "user_basis"), GetString(finding, "evidence"), GetString(finding, "source_section"), "无");
         var stack = new StackPanel();
         stack.Children.Add(Text($"{GetString(finding, "risk_level")}｜{title}", 14, FontWeights.SemiBold, Brush(181, 71, 8), null, true));
-        stack.Children.Add(Text($"原因：{GetString(finding, "reason")}", 13, null, FindBrush("TextBrush"), new Thickness(0, 5, 0, 0), true));
-        stack.Children.Add(Text($"建议：{GetString(finding, "suggestion")}", 13, null, FindBrush("TextBrush"), new Thickness(0, 3, 0, 0), true));
+        AddLlmBadge(stack, finding);
+        stack.Children.Add(Text($"原因：{reason}", 13, null, FindBrush("TextBrush"), new Thickness(0, 5, 0, 0), true));
+        stack.Children.Add(Text($"建议：{suggestion}", 13, null, FindBrush("TextBrush"), new Thickness(0, 3, 0, 0), true));
         stack.Children.Add(Text($"依据：{evidence}", 12, null, FindBrush("MutedBrush"), new Thickness(0, 3, 0, 0), true));
         AddLlmReviewText(stack, finding);
         return new Border { Background = Brush(248, 250, 252), BorderBrush = Brush(234, 236, 240), BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), Padding = new Thickness(12), Margin = new Thickness(0, 0, 0, 10), Child = stack };
@@ -1502,13 +1506,28 @@ public partial class MainWindow : Window
 
     private Border BuildSensitiveFindingCard(JsonElement finding)
     {
+        var reason = FirstNonEmpty(GetLlmReviewString(finding, "user_reason"), GetString(finding, "context"), "无");
+        var suggestion = FirstNonEmpty(GetLlmReviewString(finding, "user_suggestion"), GetString(finding, "suggestion"), "无");
+        var basis = FirstNonEmpty(GetLlmReviewString(finding, "user_basis"), GetString(finding, "section"), GetString(finding, "matched_rule"), "无");
         var stack = new StackPanel();
         stack.Children.Add(Text($"{GetString(finding, "risk_level")}｜命中：{GetString(finding, "hit_text")}", 14, FontWeights.SemiBold, Brush(181, 71, 8), null, true));
         stack.Children.Add(Text($"场景：{GetString(finding, "scene_type")}    章节：{GetString(finding, "section")}", 13, null, FindBrush("TextBrush"), new Thickness(0, 5, 0, 0), true));
-        stack.Children.Add(Text($"上下文：{GetString(finding, "context")}", 13, null, FindBrush("TextBrush"), new Thickness(0, 3, 0, 0), true));
-        stack.Children.Add(Text($"建议：{GetString(finding, "suggestion")}", 13, null, FindBrush("TextBrush"), new Thickness(0, 3, 0, 0), true));
+        AddLlmBadge(stack, finding);
+        stack.Children.Add(Text($"原因：{reason}", 13, null, FindBrush("TextBrush"), new Thickness(0, 3, 0, 0), true));
+        stack.Children.Add(Text($"建议：{suggestion}", 13, null, FindBrush("TextBrush"), new Thickness(0, 3, 0, 0), true));
+        stack.Children.Add(Text($"依据：{basis}", 12, null, FindBrush("MutedBrush"), new Thickness(0, 3, 0, 0), true));
         AddLlmReviewText(stack, finding);
         return new Border { Background = Brush(248, 250, 252), BorderBrush = Brush(234, 236, 240), BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), Padding = new Thickness(12), Margin = new Thickness(0, 0, 0, 10), Child = stack };
+    }
+
+    private void AddLlmBadge(StackPanel stack, JsonElement finding)
+    {
+        if (!HasLlmRefinedText(finding))
+        {
+            return;
+        }
+
+        stack.Children.Add(Text("大模型辅助整理", 12, FontWeights.SemiBold, Brush(37, 99, 235), new Thickness(0, 5, 0, 0), true));
     }
 
     private void AddLlmReviewText(StackPanel stack, JsonElement finding)
@@ -1520,8 +1539,8 @@ public partial class MainWindow : Window
 
         var judgement = GetString(review, "judgement");
         var risk = FirstNonEmpty(GetString(finding, "llm_risk_level_suggestion"), GetString(review, "risk_level_suggestion"));
-        var reason = GetString(review, "reason");
-        var rewrite = GetString(review, "rewrite_suggestion");
+        var reason = FirstNonEmpty(GetString(review, "user_reason"), GetString(review, "reason"));
+        var rewrite = FirstNonEmpty(GetString(review, "user_suggestion"), GetString(review, "rewrite_suggestion"));
         stack.Children.Add(Text($"大模型复核：{judgement}｜风险建议：{risk}", 12, FontWeights.SemiBold, Brush(37, 99, 235), new Thickness(0, 6, 0, 0), true));
         if (!string.IsNullOrWhiteSpace(reason))
         {
@@ -1531,6 +1550,23 @@ public partial class MainWindow : Window
         {
             stack.Children.Add(Text($"改写建议：{rewrite}", 12, null, FindBrush("MutedBrush"), new Thickness(0, 3, 0, 0), true));
         }
+    }
+
+    private static bool HasLlmRefinedText(JsonElement finding) =>
+        !string.IsNullOrWhiteSpace(GetLlmReviewString(finding, "user_reason"))
+        || !string.IsNullOrWhiteSpace(GetLlmReviewString(finding, "user_suggestion"))
+        || !string.IsNullOrWhiteSpace(GetLlmReviewString(finding, "user_basis"));
+
+    private static string GetLlmReviewString(JsonElement finding, string propertyName)
+    {
+        if (finding.ValueKind == JsonValueKind.Object
+            && finding.TryGetProperty("llm_review", out var review)
+            && review.ValueKind == JsonValueKind.Object)
+        {
+            return GetString(review, propertyName);
+        }
+
+        return string.Empty;
     }
 
     private static string BuildRiskSummaryText(JsonElement summary)

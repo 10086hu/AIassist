@@ -4,7 +4,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
 from app.db.models import CheckResult, Project
@@ -19,6 +19,7 @@ from app.services.check_service import (
     run_function_correspondence_check,
     run_sensitive_word_check,
 )
+from app.services.llm_client import get_llm_status, ping_llm
 
 
 router = APIRouter()
@@ -34,6 +35,17 @@ def evaluate_rules(module: str, rule_source: str = "api") -> dict[str, Any]:
         return list_check_rules(module=module, rule_source=rule_source)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/llm/status")
+def evaluate_llm_status() -> dict[str, Any]:
+    return get_llm_status()
+
+
+@router.post("/llm/ping")
+def evaluate_llm_ping(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    text = str(payload.get("text") or "请用 JSON 返回一次连通性测试结果。")
+    return ping_llm(text)
 
 
 @router.get("/results")
