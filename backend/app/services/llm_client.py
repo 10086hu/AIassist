@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import urllib.error
 import urllib.request
@@ -61,12 +62,16 @@ def ping_llm(text: str, timeout: int = DEFAULT_TIMEOUT_SECONDS) -> dict[str, Any
             timeout=timeout,
             max_tokens=180,
         )
-        return {
+        result = {
             "success": True,
             "configured": True,
             "model": model,
-            "result": payload,
         }
+        if payload.get("_raw_text"):
+            result["content"] = payload["_raw_text"]
+        else:
+            result["result"] = payload
+        return result
     except Exception as exc:
         return {
             "success": False,
@@ -104,7 +109,7 @@ def review_finding_with_llm(
             timeout=timeout,
             max_tokens=700,
         )
-        normalized = _normalize_review(payload, model)
+        normalized = _normalize_review(payload, model, finding, context or "")
         normalized["enabled"] = True
         normalized["llm_available"] = True
         return normalized
@@ -183,12 +188,40 @@ def _post_chat_completion(
     with urllib.request.urlopen(request, timeout=timeout) as response:
         data = json.loads(response.read().decode("utf-8"))
 
-    content = data["choices"][0]["message"]["content"]
-    return _parse_json_content(content)
+    content = extract_message_content(data)
+    return _parse_model_content(content)
 
 
-def _parse_json_content(content: str) -> dict[str, Any]:
-    text = content.strip()
+def extract_message_content(response: Any) -> str:
+    choices = _get_response_value(response, "choices")
+    if not choices:
+        raise ValueError("llm_response_missing_choices")
+
+    first_choice = choices[0] if isinstance(choices, (list, tuple)) else _get_response_value(choices, 0)
+    message = _get_response_value(first_choice, "message")
+    if message is None:
+        raise ValueError("llm_response_missing_message")
+
+    content = _get_response_value(message, "content")
+    if content is None:
+        raise ValueError("llm_response_missing_content")
+
+    return str(content)
+
+
+def _get_response_value(value: Any, key: Any) -> Any:
+    if isinstance(value, dict):
+        return value.get(key)
+    if isinstance(key, int):
+        try:
+            return value[key]
+        except (TypeError, IndexError, KeyError):
+            return None
+    return getattr(value, key, None)
+
+
+def _parse_model_content(content: str) -> dict[str, Any]:
+    text = _strip_think_blocks(content)
     if text.startswith("```"):
         text = text.strip("`")
         if text.lower().startswith("json"):
@@ -199,26 +232,34 @@ def _parse_json_content(content: str) -> dict[str, Any]:
         start = text.find("{")
         end = text.rfind("}")
         if start < 0 or end <= start:
-            raise
+            return {"content": text, "_raw_text": text}
         parsed = json.loads(text[start : end + 1])
     if not isinstance(parsed, dict):
-        raise ValueError("llm_response_not_object")
+        return {"content": text, "_raw_text": text}
     return parsed
 
 
-def _normalize_review(payload: dict[str, Any], model: str) -> dict[str, Any]:
-    user_reason = _short_text(payload.get("user_reason") or payload.get("reason") or "")
+def _strip_think_blocks(content: str) -> str:
+    return re.sub(r"<think>.*?</think>", "", content or "", flags=re.IGNORECASE | re.DOTALL).strip()
+
+
+def _normalize_review(payload: dict[str, Any], model: str, finding: dict[str, Any], context: str) -> dict[str, Any]:
+    raw_text = _short_text(payload.get("_raw_text") or payload.get("content") or "")
+    fallback_suggestion = str(finding.get("suggestion") or "")
+    fallback_basis = str(finding.get("evidence") or finding.get("source_section") or context or "")
+    user_reason = _short_text(payload.get("user_reason") or payload.get("reason") or raw_text)
     user_suggestion = _short_text(
         payload.get("user_suggestion")
         or payload.get("rewrite_suggestion")
         or payload.get("suggestion")
-        or ""
+        or _extract_suggestion_from_text(raw_text)
+        or fallback_suggestion
     )
-    user_basis = _short_text(payload.get("user_basis") or payload.get("basis") or payload.get("evidence_basis") or "")
+    user_basis = _short_text(payload.get("user_basis") or payload.get("basis") or payload.get("evidence_basis") or fallback_basis)
     return {
         "enabled": True,
         "model": model,
-        "judgement": _string_value(payload.get("judgement") if payload.get("judgement") is not None else payload.get("is_valid")),
+        "judgement": _string_value(payload.get("judgement") if payload.get("judgement") is not None else payload.get("is_valid")) or ("模型返回自然语言复核意见" if raw_text else ""),
         "risk_level_suggestion": _string_value(payload.get("risk_level_suggestion") or payload.get("risk_level")),
         "user_reason": user_reason,
         "user_suggestion": user_suggestion,
@@ -229,6 +270,13 @@ def _normalize_review(payload: dict[str, Any], model: str) -> dict[str, Any]:
         "need_human_review": payload.get("need_human_review"),
         "scene_type": payload.get("scene_type"),
     }
+
+
+def _extract_suggestion_from_text(text: str) -> str:
+    if not text:
+        return ""
+    match = re.search(r"(建议|修改建议|处理建议)[:：]\s*(.+)", text)
+    return match.group(2).strip() if match else ""
 
 
 def _build_prompt(module_code: str, rule: dict[str, Any], finding: dict[str, Any], context: str) -> str:
@@ -293,9 +341,10 @@ def _safe_error_message(exc: Exception) -> str:
         return f"http_{exc.code}"
     if isinstance(exc, urllib.error.URLError):
         return f"url_error:{exc.reason.__class__.__name__}"
-    if isinstance(exc, TimeoutError | socket.timeout):
+    if isinstance(exc, (TimeoutError, socket.timeout)):
         return "timeout"
-    return exc.__class__.__name__
+    message = str(exc)
+    return f"{exc.__class__.__name__}: {message}" if message else exc.__class__.__name__
 
 
 def _error_type(exc: Exception) -> str:
@@ -303,7 +352,7 @@ def _error_type(exc: Exception) -> str:
         return f"http_{exc.code}"
     if isinstance(exc, urllib.error.URLError):
         return "url_error"
-    if isinstance(exc, TimeoutError | socket.timeout):
+    if isinstance(exc, (TimeoutError, socket.timeout)):
         return "timeout"
     return exc.__class__.__name__
 
