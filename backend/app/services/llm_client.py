@@ -12,6 +12,19 @@ from typing import Any
 DEFAULT_MODEL = "deepseek-v4-flash"
 DEFAULT_API_BASE_URL = "https://api.deepseek.com"
 DEFAULT_TIMEOUT_SECONDS = 12
+TRANSPORT = "openai_chat_completions"
+
+
+class LlmProviderError(Exception):
+    def __init__(self, detail: dict[str, Any]) -> None:
+        self.detail = detail
+        super().__init__(str(detail))
+
+
+class MissingContentError(ValueError):
+    def __init__(self, debug: dict[str, Any]) -> None:
+        self.debug = debug
+        super().__init__("llm_response_missing_content")
 
 
 def get_llm_model() -> str:
@@ -66,20 +79,28 @@ def ping_llm(text: str, timeout: int = DEFAULT_TIMEOUT_SECONDS) -> dict[str, Any
             "success": True,
             "configured": True,
             "model": model,
+            "transport": TRANSPORT,
         }
         if payload.get("_raw_text"):
             result["content"] = payload["_raw_text"]
         else:
             result["result"] = payload
+            result["content"] = json.dumps(payload, ensure_ascii=False)
         return result
     except Exception as exc:
-        return {
+        result = {
             "success": False,
             "configured": True,
             "model": model,
             "error_type": _error_type(exc),
             "error": _safe_error_message(exc),
+            "transport": TRANSPORT,
         }
+        if isinstance(exc, LlmProviderError):
+            result["error_detail"] = exc.detail
+        if isinstance(exc, MissingContentError):
+            result.update(exc.debug)
+        return result
 
 
 def review_finding_with_llm(
@@ -188,25 +209,36 @@ def _post_chat_completion(
     with urllib.request.urlopen(request, timeout=timeout) as response:
         data = json.loads(response.read().decode("utf-8"))
 
+    provider_error = _provider_error_detail(data)
+    if provider_error:
+        raise LlmProviderError(provider_error)
+
     content = extract_message_content(data)
     return _parse_model_content(content)
 
 
 def extract_message_content(response: Any) -> str:
+    for key in ("output_text", "content"):
+        content = _get_response_value(response, key)
+        if _has_text(content):
+            return str(content)
+
     choices = _get_response_value(response, "choices")
     if not choices:
         raise ValueError("llm_response_missing_choices")
 
     first_choice = choices[0] if isinstance(choices, (list, tuple)) else _get_response_value(choices, 0)
-    message = _get_response_value(first_choice, "message")
-    if message is None:
-        raise ValueError("llm_response_missing_message")
+    for path in (
+        ("message", "content"),
+        ("message", "reasoning_content"),
+        ("delta", "content"),
+        ("text",),
+    ):
+        content = _get_nested_response_value(first_choice, path)
+        if _has_text(content):
+            return str(content)
 
-    content = _get_response_value(message, "content")
-    if content is None:
-        raise ValueError("llm_response_missing_content")
-
-    return str(content)
+    raise MissingContentError(_missing_content_debug(response, first_choice))
 
 
 def _get_response_value(value: Any, key: Any) -> Any:
@@ -220,8 +252,24 @@ def _get_response_value(value: Any, key: Any) -> Any:
     return getattr(value, key, None)
 
 
+def _get_nested_response_value(value: Any, path: tuple[Any, ...]) -> Any:
+    current = value
+    for key in path:
+        current = _get_response_value(current, key)
+        if current is None:
+            return None
+    return current
+
+
+def _has_text(value: Any) -> bool:
+    return value is not None and str(value).strip() != ""
+
+
 def _parse_model_content(content: str) -> dict[str, Any]:
-    text = _strip_think_blocks(content)
+    raw_text = str(content or "")
+    text = _strip_think_blocks(raw_text)
+    if not text and raw_text.strip():
+        text = _short_text(raw_text.strip(), 300)
     if text.startswith("```"):
         text = text.strip("`")
         if text.lower().startswith("json"):
@@ -241,6 +289,42 @@ def _parse_model_content(content: str) -> dict[str, Any]:
 
 def _strip_think_blocks(content: str) -> str:
     return re.sub(r"<think>.*?</think>", "", content or "", flags=re.IGNORECASE | re.DOTALL).strip()
+
+
+def _provider_error_detail(response: Any) -> dict[str, Any]:
+    error = _get_response_value(response, "error")
+    if not error:
+        return {}
+    return {
+        key: _short_text(_get_response_value(error, key), 300)
+        for key in ("message", "type", "code")
+        if _has_text(_get_response_value(error, key))
+    } or {"message": _short_text(error, 300)}
+
+
+def _missing_content_debug(response: Any, first_choice: Any) -> dict[str, Any]:
+    message = _get_response_value(first_choice, "message")
+    return {
+        "response_keys": _response_keys(response),
+        "choice_keys": _response_keys(first_choice),
+        "message_keys": _response_keys(message),
+        "raw_preview": _short_text(_safe_json_preview(response), 300),
+    }
+
+
+def _response_keys(value: Any) -> list[str]:
+    if isinstance(value, dict):
+        return [str(key) for key in value.keys()]
+    if value is None:
+        return []
+    return [key for key in ("choices", "message", "delta", "content", "reasoning_content", "text", "output_text", "error") if hasattr(value, key)]
+
+
+def _safe_json_preview(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)
+    except TypeError:
+        return str(value)
 
 
 def _normalize_review(payload: dict[str, Any], model: str, finding: dict[str, Any], context: str) -> dict[str, Any]:
@@ -337,6 +421,10 @@ def _build_prompt(module_code: str, rule: dict[str, Any], finding: dict[str, Any
 
 
 def _safe_error_message(exc: Exception) -> str:
+    if isinstance(exc, LlmProviderError):
+        return "provider_error"
+    if isinstance(exc, MissingContentError):
+        return "ValueError: llm_response_missing_content"
     if isinstance(exc, urllib.error.HTTPError):
         return f"http_{exc.code}"
     if isinstance(exc, urllib.error.URLError):
@@ -348,6 +436,8 @@ def _safe_error_message(exc: Exception) -> str:
 
 
 def _error_type(exc: Exception) -> str:
+    if isinstance(exc, LlmProviderError):
+        return "provider_error"
     if isinstance(exc, urllib.error.HTTPError):
         return f"http_{exc.code}"
     if isinstance(exc, urllib.error.URLError):
