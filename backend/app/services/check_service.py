@@ -20,6 +20,7 @@ from app.modules.sensitive_word.sensitive_word_checker import (
     load_rules_from_xlsx as load_sensitive_word_rules_from_xlsx,
 )
 from app.services.llm_client import get_llm_model, review_finding_with_llm
+from app.services.result_refiner import document_metrics, refine_findings
 
 
 RuleRunner = Callable[[Optional[str]], Dict[str, Any]]
@@ -46,7 +47,7 @@ def run_function_correspondence_check(
         )
 
     raw = _run_with_rule_api_fallback(runner, rule_config)
-    return _normalize_function_correspondence_result(raw, use_llm=use_llm)
+    return _normalize_function_correspondence_result(raw, report_file_path=report_file_path, use_llm=use_llm)
 
 
 def run_sensitive_word_check(
@@ -70,7 +71,7 @@ def run_sensitive_word_check(
         )
 
     raw = _run_with_rule_api_fallback(runner, rule_config)
-    return _normalize_sensitive_word_result(raw, use_llm=use_llm)
+    return _normalize_sensitive_word_result(raw, report_file_path=report_file_path, use_llm=use_llm)
 
 
 def list_check_rules(module: str, rule_source: Optional[str] = "api") -> Dict[str, Any]:
@@ -232,24 +233,25 @@ def _with_rule_source_meta(
     return result
 
 
-def _normalize_function_correspondence_result(raw: Dict[str, Any], use_llm: bool = False) -> Dict[str, Any]:
+def _normalize_function_correspondence_result(raw: Dict[str, Any], report_file_path: str, use_llm: bool = False) -> Dict[str, Any]:
     raw_findings = list(raw.get("findings") or [])
     findings = _merge_function_findings(raw_findings)
     displayed_findings = findings[:50]
-    llm_meta = _apply_llm_reviews(
+    refined_findings, llm_meta = refine_findings(
         module_code="function_correspondence",
         findings=displayed_findings,
         rules=raw.get("rules_used") or [],
-        enabled=use_llm,
-        limit=5,
+        use_llm=use_llm,
     )
 
     summary = dict(raw.get("summary") or {})
+    metrics = document_metrics(report_file_path)
     summary["raw_findings_count"] = len(raw_findings)
     summary["merged_findings_count"] = len(findings)
-    summary["displayed_findings_count"] = len(displayed_findings)
-    summary["risk_summary"] = dict(Counter(item.get("risk_level") for item in displayed_findings if item.get("risk_level")))
-    summary["total_findings"] = len(displayed_findings)
+    summary["displayed_findings_count"] = len(refined_findings)
+    summary["risk_summary"] = dict(Counter(item.get("risk_level") for item in refined_findings if item.get("risk_level")))
+    summary["total_findings"] = len(refined_findings)
+    summary.update(metrics)
     summary.update(llm_meta)
     summary["rule_source"] = raw.get("_rule_source")
     if raw.get("_rule_api_error"):
@@ -260,41 +262,42 @@ def _normalize_function_correspondence_result(raw: Dict[str, Any], use_llm: bool
         "module_name": raw.get("module_name", "建设功能的对应关系检查"),
         "status": raw.get("status", "完成"),
         "summary": summary,
-        "findings": displayed_findings,
+        "findings": refined_findings,
         "rules_used": raw.get("rules_used", []),
         "elapsed_seconds": raw.get("elapsed_seconds", 0),
     }
 
 
-def _normalize_sensitive_word_result(raw: Dict[str, Any], use_llm: bool = False) -> Dict[str, Any]:
+def _normalize_sensitive_word_result(raw: Dict[str, Any], report_file_path: str, use_llm: bool = False) -> Dict[str, Any]:
     raw_findings = list(raw.get("findings", []))
     findings = _merge_sensitive_findings(raw_findings)
     displayed_findings = findings[:100]
-    llm_meta = _apply_llm_reviews(
+    refined_findings, llm_meta = refine_findings(
         module_code="sensitive_word",
         findings=displayed_findings,
         rules=raw.get("rules") or [],
-        enabled=use_llm,
-        limit=8,
+        use_llm=use_llm,
     )
 
     risk_summary = dict(raw.get("summary") or {})
+    metrics = document_metrics(report_file_path)
     risk_summary["raw_findings_count"] = len(raw_findings)
     risk_summary["merged_findings_count"] = len(findings)
-    risk_summary["displayed_findings_count"] = len(displayed_findings)
-    risk_summary["total_findings"] = len(displayed_findings)
+    risk_summary["displayed_findings_count"] = len(refined_findings)
+    risk_summary["total_findings"] = len(refined_findings)
+    risk_summary.update(metrics)
     risk_summary.update(llm_meta)
     risk_summary["rule_source"] = raw.get("_rule_source")
     if raw.get("_rule_api_error"):
         risk_summary["rule_api_error"] = raw["_rule_api_error"]
 
-    suggestions = _collect_suggestions(displayed_findings)
+    suggestions = _collect_suggestions(refined_findings)
 
     return {
         "module_code": "sensitive_word",
         "module_name": raw.get("module_name", "敏感词检查"),
-        "status": "通过" if not displayed_findings else "发现问题",
-        "findings": displayed_findings,
+        "status": "通过" if not refined_findings else "发现问题",
+        "findings": refined_findings,
         "risk_summary": risk_summary,
         "suggestions": suggestions,
         "elapsed_seconds": raw.get("elapsed_seconds", 0),

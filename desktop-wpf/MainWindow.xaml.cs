@@ -14,7 +14,7 @@ namespace AiReportDesktop;
 public partial class MainWindow : Window
 {
     private const string BackendBaseUrl = "http://127.0.0.1:8000/api";
-    private static readonly HttpClient BackendClient = new() { Timeout = TimeSpan.FromSeconds(180) };
+    private static readonly HttpClient BackendClient = new() { Timeout = TimeSpan.FromSeconds(120) };
 
     private readonly List<CheckBox> _checkBoxes = new();
     private readonly Dictionary<string, List<CheckBox>> _ruleCheckBoxesByModule = new();
@@ -926,17 +926,15 @@ public partial class MainWindow : Window
                 AddResultNotice($"已跳过 {skippedCount} 个尚未接入后端的检测项。");
             }
 
-            for (var index = 0; index < runnableItems.Count; index++)
+            foreach (var item in runnableItems)
             {
-                var item = runnableItems[index];
-                StatusTextBlock.Text = $"正在执行 {item.Title}（{index + 1}/{runnableItems.Count}）...";
                 await LoadRulesForModuleAsync(item.ModuleCode);
-                using var result = await UploadAndRunCheckAsync(item, reportPath);
-                RenderCheckResult(result);
             }
 
-            await LoadRecordsAsync();
-            StatusTextBlock.Text = $"检测完成：已执行 {runnableItems.Count} 项，请到“审查记录”查看结果。";
+            StatusTextBlock.Text = "正在创建后台检测任务...";
+            var taskId = await CreateEvaluateTaskAsync(runnableItems, reportPath);
+            AddResultNotice("检测任务已创建，正在后台审查……");
+            await PollEvaluateTaskAsync(taskId);
         }
         catch (HttpRequestException exc)
         {
@@ -1212,11 +1210,13 @@ public partial class MainWindow : Window
         _activeRecordId = id;
         var module = GetString(root, "module");
         var moduleName = GetString(root, "module_name");
+        var projectName = FirstNonEmpty(GetString(root, "project_name"), GetString(root, "report_name"), "未命名报告");
         var risk = GetString(root, "risk_level");
         var count = GetInt(root, "findings_count");
 
-        _recordDetailPanel.Children.Add(Text(moduleName, 18, FontWeights.Bold, FindBrush("TextBrush"), null, true));
-        _recordDetailPanel.Children.Add(Text($"风险等级：{risk}｜问题数量：{count}", 13, null, FindBrush("MutedBrush"), new Thickness(0, 6, 0, 10), true));
+        _recordDetailPanel.Children.Add(Text(projectName, 18, FontWeights.Bold, FindBrush("TextBrush"), null, true));
+        _recordDetailPanel.Children.Add(Text($"检查模块：{moduleName}", 13, FontWeights.SemiBold, FindBrush("TextBrush"), new Thickness(0, 6, 0, 0), true));
+        _recordDetailPanel.Children.Add(Text($"风险等级：{risk}｜问题数量：{count}", 13, null, FindBrush("MutedBrush"), new Thickness(0, 4, 0, 8), true));
 
         var deleteButton = Button("删除当前记录", false);
         deleteButton.Margin = new Thickness(0, 0, 0, 12);
@@ -1225,16 +1225,7 @@ public partial class MainWindow : Window
 
         if (root.TryGetProperty("summary", out var summary) && summary.ValueKind == JsonValueKind.Object)
         {
-            _recordDetailPanel.Children.Add(Text($"摘要：{JsonObjectToText(summary)}", 13, null, FindBrush("MutedBrush"), new Thickness(0, 0, 0, 12), true));
-            var llmEnabled = GetString(summary, "llm_enabled");
-            var llmModel = GetString(summary, "llm_model");
-            var llmReviewed = GetInt(summary, "llm_reviewed_count");
-            var llmErrors = GetInt(summary, "llm_error_count");
-            if (!string.IsNullOrWhiteSpace(llmEnabled) || !string.IsNullOrWhiteSpace(llmModel) || llmReviewed > 0)
-            {
-                var llmReason = FirstNonEmpty(GetString(summary, "llm_error"), GetString(summary, "llm_reason"));
-                _recordDetailPanel.Children.Add(Text($"大模型复核：{llmEnabled}｜模型：{llmModel}｜复核数量：{llmReviewed}｜错误数量：{llmErrors}{(string.IsNullOrWhiteSpace(llmReason) ? "" : $"｜{llmReason}")}", 13, null, FindBrush("MutedBrush"), new Thickness(0, 0, 0, 12), true));
-            }
+            _recordDetailPanel.Children.Add(Text($"大模型状态：{LlmStatusText(summary)}", 13, null, FindBrush("MutedBrush"), new Thickness(0, 0, 0, 12), true));
         }
 
         if (root.TryGetProperty("findings", out var findings) && findings.ValueKind == JsonValueKind.Array && findings.GetArrayLength() > 0)
@@ -1250,6 +1241,15 @@ public partial class MainWindow : Window
         {
             _recordDetailPanel.Children.Add(Text("未发现需要复核的问题。", 13, null, Brush(2, 122, 72), null, true));
         }
+
+        var expander = new Expander
+        {
+            Header = "查看技术详情 / 原始 JSON",
+            IsExpanded = false,
+            Margin = new Thickness(0, 8, 0, 0),
+            Content = Text(root.GetRawText(), 12, null, FindBrush("MutedBrush"), new Thickness(0, 8, 0, 0), true)
+        };
+        _recordDetailPanel.Children.Add(expander);
     }
 
     private async Task DeleteRecordAsync(string resultId)
@@ -1397,6 +1397,103 @@ public partial class MainWindow : Window
         }
     }
 
+    private async Task<string> CreateEvaluateTaskAsync(IReadOnlyCollection<CheckItem> items, string reportPath)
+    {
+        await using var stream = File.OpenRead(reportPath);
+        using var form = new MultipartFormDataContent();
+        using var fileContent = new StreamContent(stream);
+        fileContent.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+
+        var modules = string.Join(",", items.Select(item => item.ModuleCode));
+        var selectedRules = items.ToDictionary(
+            item => item.ModuleCode,
+            item => SelectedRuleIdsForModule(item.ModuleCode).ToArray());
+
+        form.Add(fileContent, "file", Path.GetFileName(reportPath));
+        form.Add(new StringContent(Path.GetFileNameWithoutExtension(reportPath), Encoding.UTF8), "project_name");
+        form.Add(new StringContent(string.Empty, Encoding.UTF8), "department");
+        form.Add(new StringContent(modules, Encoding.UTF8), "modules");
+        form.Add(new StringContent("api", Encoding.UTF8), "rule_source");
+        form.Add(new StringContent((_llmReviewCheckBox?.IsChecked == true).ToString().ToLowerInvariant(), Encoding.UTF8), "use_llm");
+        form.Add(new StringContent(JsonSerializer.Serialize(selectedRules), Encoding.UTF8), "selected_rule_ids");
+
+        using var response = await BackendClient.PostAsync($"{BackendBaseUrl}/evaluate/tasks", form);
+        var responseBody = await response.Content.ReadAsStringAsync();
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new InvalidOperationException($"创建检测任务失败：{ExtractErrorMessage(responseBody)}");
+        }
+
+        using var document = JsonDocument.Parse(responseBody);
+        var taskId = GetString(document.RootElement, "task_id");
+        if (string.IsNullOrWhiteSpace(taskId))
+        {
+            throw new InvalidOperationException("后端未返回检测任务编号。");
+        }
+
+        return taskId;
+    }
+
+    private async Task PollEvaluateTaskAsync(string taskId)
+    {
+        for (var attempt = 0; attempt < 1800; attempt++)
+        {
+            await Task.Delay(TimeSpan.FromSeconds(2));
+            using var response = await BackendClient.GetAsync($"{BackendBaseUrl}/evaluate/tasks/{taskId}");
+            var responseBody = await response.Content.ReadAsStringAsync();
+            if (!response.IsSuccessStatusCode)
+            {
+                throw new InvalidOperationException($"查询检测任务失败：{ExtractErrorMessage(responseBody)}");
+            }
+
+            using var document = JsonDocument.Parse(responseBody);
+            var root = document.RootElement;
+            var status = GetString(root, "status");
+            var stage = GetString(root, "stage");
+            var message = FirstNonEmpty(GetString(root, "message"), "正在后台审查");
+            var progress = GetInt(root, "progress");
+            StatusTextBlock.Text = $"{TaskStatusText(status)}：{message}（{progress}%）";
+
+            if (status is "queued" or "running")
+            {
+                continue;
+            }
+
+            await LoadRecordsAsync();
+            if (status == "completed")
+            {
+                StatusTextBlock.Text = "检测完成，请在“审查记录”查看结果。";
+                AddResultNotice("检测完成，请在“审查记录”查看企业可读审查意见。");
+                return;
+            }
+
+            if (status == "partial")
+            {
+                StatusTextBlock.Text = "检测完成：部分大模型整理超时，已返回规则审查结果。";
+                AddResultNotice("检测完成，部分大模型整理超时；请在“审查记录”查看已生成的审查意见。");
+                return;
+            }
+
+            var error = GetString(root, "error");
+            StatusTextBlock.Text = "检测失败。";
+            AddResultNotice($"检测失败：{FirstNonEmpty(error, message)}");
+            return;
+        }
+
+        StatusTextBlock.Text = "检测仍在后台执行，请稍后刷新审查记录。";
+        AddResultNotice("检测任务仍在后台执行，请稍后进入“审查记录”刷新查看。");
+    }
+
+    private static string TaskStatusText(string status) => status switch
+    {
+        "queued" => "等待检测",
+        "running" => "正在检测",
+        "completed" => "检测完成",
+        "partial" => "部分完成",
+        "failed" => "检测失败",
+        _ => "检测任务"
+    };
+
     private async Task<JsonDocument> UploadAndRunCheckAsync(CheckItem item, string reportPath)
     {
         await using var stream = File.OpenRead(reportPath);
@@ -1490,34 +1587,46 @@ public partial class MainWindow : Window
 
     private Border BuildFunctionFindingCard(JsonElement finding)
     {
-        var title = FirstNonEmpty(GetString(finding, "issue_type"), GetString(finding, "description"), "问题项");
-        var reason = FirstNonEmpty(GetLlmReviewString(finding, "user_reason"), GetString(finding, "reason"), "无");
-        var suggestion = FirstNonEmpty(GetLlmReviewString(finding, "user_suggestion"), GetString(finding, "suggestion"), "无");
-        var evidence = FirstNonEmpty(GetLlmReviewString(finding, "user_basis"), GetString(finding, "evidence"), GetString(finding, "source_section"), "无");
-        var stack = new StackPanel();
-        stack.Children.Add(Text($"{GetString(finding, "risk_level")}｜{title}", 14, FontWeights.SemiBold, Brush(181, 71, 8), null, true));
-        AddLlmBadge(stack, finding);
-        stack.Children.Add(Text($"原因：{reason}", 13, null, FindBrush("TextBrush"), new Thickness(0, 5, 0, 0), true));
-        stack.Children.Add(Text($"建议：{suggestion}", 13, null, FindBrush("TextBrush"), new Thickness(0, 3, 0, 0), true));
-        stack.Children.Add(Text($"依据：{evidence}", 12, null, FindBrush("MutedBrush"), new Thickness(0, 3, 0, 0), true));
-        AddLlmReviewText(stack, finding);
-        return new Border { Background = Brush(248, 250, 252), BorderBrush = Brush(234, 236, 240), BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), Padding = new Thickness(12), Margin = new Thickness(0, 0, 0, 10), Child = stack };
+        return BuildBusinessFindingCard(finding);
     }
 
     private Border BuildSensitiveFindingCard(JsonElement finding)
     {
-        var reason = FirstNonEmpty(GetLlmReviewString(finding, "user_reason"), GetString(finding, "context"), "无");
-        var suggestion = FirstNonEmpty(GetLlmReviewString(finding, "user_suggestion"), GetString(finding, "suggestion"), "无");
-        var basis = FirstNonEmpty(GetLlmReviewString(finding, "user_basis"), GetString(finding, "section"), GetString(finding, "matched_rule"), "无");
+        return BuildBusinessFindingCard(finding);
+    }
+
+    private Border BuildBusinessFindingCard(JsonElement finding)
+    {
+        var title = FirstNonEmpty(GetString(finding, "display_title"), GetString(finding, "issue_type"), GetString(finding, "description"), GetString(finding, "hit_text"), "问题项");
+        var opinion = FirstNonEmpty(GetString(finding, "review_opinion"), GetLlmReviewString(finding, "user_reason"), GetString(finding, "reason"));
+        var evidence = FirstNonEmpty(GetString(finding, "evidence_summary"), GetLlmReviewString(finding, "user_basis"), GetString(finding, "evidence"), GetString(finding, "context"), GetString(finding, "source_section"));
+        var advice = FirstNonEmpty(GetString(finding, "revision_advice"), GetLlmReviewString(finding, "user_suggestion"), GetString(finding, "suggestion"));
+        var rule = FirstNonEmpty(GetString(finding, "rule_basis"), GetString(finding, "rule_name"), GetString(finding, "matched_rule"));
+        var mergedCount = GetInt(finding, "merged_count");
+        var llmRefined = GetBool(finding, "llm_refined");
         var stack = new StackPanel();
-        stack.Children.Add(Text($"{GetString(finding, "risk_level")}｜命中：{GetString(finding, "hit_text")}", 14, FontWeights.SemiBold, Brush(181, 71, 8), null, true));
-        stack.Children.Add(Text($"场景：{GetString(finding, "scene_type")}    章节：{GetString(finding, "section")}", 13, null, FindBrush("TextBrush"), new Thickness(0, 5, 0, 0), true));
-        AddLlmBadge(stack, finding);
-        stack.Children.Add(Text($"原因：{reason}", 13, null, FindBrush("TextBrush"), new Thickness(0, 3, 0, 0), true));
-        stack.Children.Add(Text($"建议：{suggestion}", 13, null, FindBrush("TextBrush"), new Thickness(0, 3, 0, 0), true));
-        stack.Children.Add(Text($"依据：{basis}", 12, null, FindBrush("MutedBrush"), new Thickness(0, 3, 0, 0), true));
-        AddLlmReviewText(stack, finding);
+        stack.Children.Add(Text(title, 15, FontWeights.SemiBold, FindBrush("TextBrush"), null, true));
+        stack.Children.Add(Text($"风险等级：{GetString(finding, "risk_level")}", 13, FontWeights.SemiBold, Brush(181, 71, 8), new Thickness(0, 5, 0, 0), true));
+        stack.Children.Add(Text(llmRefined ? "AI辅助整理" : "规则审查结果", 12, FontWeights.SemiBold, llmRefined ? Brush(37, 99, 235) : Brush(102, 112, 133), new Thickness(0, 5, 0, 0), true));
+        AddTextIf(stack, "审查意见", opinion, FindBrush("TextBrush"));
+        AddTextIf(stack, "文档依据", evidence, FindBrush("MutedBrush"));
+        AddTextIf(stack, "修改建议", advice, FindBrush("TextBrush"));
+        AddTextIf(stack, "涉及规则", rule, FindBrush("MutedBrush"));
+        if (mergedCount > 1)
+        {
+            stack.Children.Add(Text($"同类问题数量：{mergedCount}", 12, null, FindBrush("MutedBrush"), new Thickness(0, 3, 0, 0), true));
+        }
         return new Border { Background = Brush(248, 250, 252), BorderBrush = Brush(234, 236, 240), BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), Padding = new Thickness(12), Margin = new Thickness(0, 0, 0, 10), Child = stack };
+    }
+
+    private void AddTextIf(StackPanel stack, string label, string value, Brush brush)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return;
+        }
+
+        stack.Children.Add(Text($"{label}：{value}", 13, null, brush, new Thickness(0, 5, 0, 0), true));
     }
 
     private void AddLlmBadge(StackPanel stack, JsonElement finding)
@@ -1589,6 +1698,36 @@ public partial class MainWindow : Window
         return "风险汇总：无";
     }
 
+    private static string LlmStatusText(JsonElement summary)
+    {
+        var status = GetString(summary, "llm_status");
+        var model = GetString(summary, "llm_model");
+        var reviewed = GetInt(summary, "llm_reviewed_count");
+        var errors = GetInt(summary, "llm_error_count");
+        var label = status switch
+        {
+            "completed" => "已整理",
+            "partial" => "部分整理",
+            "timeout" => "整理超时，显示规则结果",
+            "disabled" => "未启用",
+            _ => string.IsNullOrWhiteSpace(status) ? "未启用" : status
+        };
+        var parts = new List<string> { label };
+        if (!string.IsNullOrWhiteSpace(model))
+        {
+            parts.Add($"模型：{model}");
+        }
+        if (reviewed > 0)
+        {
+            parts.Add($"已整理：{reviewed}");
+        }
+        if (errors > 0)
+        {
+            parts.Add($"异常：{errors}");
+        }
+        return string.Join("｜", parts);
+    }
+
     private static string JsonObjectToText(JsonElement element)
     {
         if (element.ValueKind != JsonValueKind.Object)
@@ -1641,6 +1780,27 @@ public partial class MainWindow : Window
         }
 
         return 0;
+    }
+
+    private static bool GetBool(JsonElement element, string propertyName)
+    {
+        if (element.ValueKind == JsonValueKind.Object && element.TryGetProperty(propertyName, out var value))
+        {
+            if (value.ValueKind == JsonValueKind.True)
+            {
+                return true;
+            }
+            if (value.ValueKind == JsonValueKind.False)
+            {
+                return false;
+            }
+            if (bool.TryParse(value.ToString(), out var result))
+            {
+                return result;
+            }
+        }
+
+        return false;
     }
 
     private static double GetDouble(JsonElement element, string propertyName)
