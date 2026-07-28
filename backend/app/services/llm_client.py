@@ -27,6 +27,12 @@ class MissingContentError(ValueError):
         super().__init__("llm_response_missing_content")
 
 
+class ExtractedContent:
+    def __init__(self, content: str, source: str) -> None:
+        self.content = content
+        self.source = source
+
+
 def get_llm_model() -> str:
     model = os.getenv("DEEPSEEK_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
     if model.lower() == "deepseek-v4-flash":
@@ -80,6 +86,7 @@ def ping_llm(text: str, timeout: int = DEFAULT_TIMEOUT_SECONDS) -> dict[str, Any
             "configured": True,
             "model": model,
             "transport": TRANSPORT,
+            "content_source": str(payload.get("_content_source") or "unknown"),
         }
         if payload.get("_raw_text"):
             result["content"] = payload["_raw_text"]
@@ -213,15 +220,21 @@ def _post_chat_completion(
     if provider_error:
         raise LlmProviderError(provider_error)
 
-    content = extract_message_content(data)
-    return _parse_model_content(content)
+    extracted = _extract_message_content(data)
+    parsed = _parse_model_content(extracted.content)
+    parsed["_content_source"] = extracted.source
+    return parsed
 
 
 def extract_message_content(response: Any) -> str:
+    return _extract_message_content(response).content
+
+
+def _extract_message_content(response: Any) -> ExtractedContent:
     for key in ("output_text", "content"):
         content = _get_response_value(response, key)
         if _has_text(content):
-            return str(content)
+            return ExtractedContent(_safe_content_text(content), key)
 
     choices = _get_response_value(response, "choices")
     if not choices:
@@ -230,13 +243,15 @@ def extract_message_content(response: Any) -> str:
     first_choice = choices[0] if isinstance(choices, (list, tuple)) else _get_response_value(choices, 0)
     for path in (
         ("message", "content"),
+        ("message", "reasoning"),
         ("message", "reasoning_content"),
+        ("message", "refusal"),
         ("delta", "content"),
         ("text",),
     ):
         content = _get_nested_response_value(first_choice, path)
         if _has_text(content):
-            return str(content)
+            return ExtractedContent(_safe_content_text(content), ".".join(str(item) for item in path))
 
     raise MissingContentError(_missing_content_debug(response, first_choice))
 
@@ -263,6 +278,14 @@ def _get_nested_response_value(value: Any, path: tuple[Any, ...]) -> Any:
 
 def _has_text(value: Any) -> bool:
     return value is not None and str(value).strip() != ""
+
+
+def _safe_content_text(value: Any) -> str:
+    raw_text = str(value)
+    stripped = _strip_think_blocks(raw_text)
+    if stripped:
+        return stripped
+    return _short_text(raw_text.strip(), 500)
 
 
 def _parse_model_content(content: str) -> dict[str, Any]:
@@ -308,7 +331,7 @@ def _missing_content_debug(response: Any, first_choice: Any) -> dict[str, Any]:
         "response_keys": _response_keys(response),
         "choice_keys": _response_keys(first_choice),
         "message_keys": _response_keys(message),
-        "raw_preview": _short_text(_safe_json_preview(response), 300),
+        "raw_preview": _short_text(_safe_json_preview(response), 500),
     }
 
 
@@ -317,7 +340,7 @@ def _response_keys(value: Any) -> list[str]:
         return [str(key) for key in value.keys()]
     if value is None:
         return []
-    return [key for key in ("choices", "message", "delta", "content", "reasoning_content", "text", "output_text", "error") if hasattr(value, key)]
+    return [key for key in ("choices", "message", "delta", "content", "reasoning", "reasoning_content", "refusal", "text", "output_text", "error") if hasattr(value, key)]
 
 
 def _safe_json_preview(value: Any) -> str:
