@@ -1225,7 +1225,11 @@ public partial class MainWindow : Window
 
         if (root.TryGetProperty("summary", out var summary) && summary.ValueKind == JsonValueKind.Object)
         {
-            _recordDetailPanel.Children.Add(Text($"大模型状态：{LlmStatusText(summary)}", 13, null, FindBrush("MutedBrush"), new Thickness(0, 0, 0, 12), true));
+            var llmModelText = LlmModelText(summary);
+            if (!string.IsNullOrWhiteSpace(llmModelText))
+            {
+                _recordDetailPanel.Children.Add(Text(llmModelText, 13, null, FindBrush("MutedBrush"), new Thickness(0, 0, 0, 12), true));
+            }
         }
 
         if (root.TryGetProperty("findings", out var findings) && findings.ValueKind == JsonValueKind.Array && findings.GetArrayLength() > 0)
@@ -1698,34 +1702,10 @@ public partial class MainWindow : Window
         return "风险汇总：无";
     }
 
-    private static string LlmStatusText(JsonElement summary)
+    private static string LlmModelText(JsonElement summary)
     {
-        var status = GetString(summary, "llm_status");
         var model = GetString(summary, "llm_model");
-        var reviewed = GetInt(summary, "llm_reviewed_count");
-        var errors = GetInt(summary, "llm_error_count");
-        var label = status switch
-        {
-            "completed" => "已整理",
-            "partial" => "部分整理",
-            "timeout" => "整理超时，显示规则结果",
-            "disabled" => "未启用",
-            _ => string.IsNullOrWhiteSpace(status) ? "未启用" : status
-        };
-        var parts = new List<string> { label };
-        if (!string.IsNullOrWhiteSpace(model))
-        {
-            parts.Add($"模型：{model}");
-        }
-        if (reviewed > 0)
-        {
-            parts.Add($"已整理：{reviewed}");
-        }
-        if (errors > 0)
-        {
-            parts.Add($"异常：{errors}");
-        }
-        return string.Join("｜", parts);
+        return string.IsNullOrWhiteSpace(model) ? string.Empty : $"模型：{model}";
     }
 
     private static string JsonObjectToText(JsonElement element)
