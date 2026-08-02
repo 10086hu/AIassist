@@ -1,15 +1,24 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
 from typing import List
+
+
+def _default_database_url() -> str:
+    data_dir = os.getenv("AIASSIST_DATA_DIR")
+    if not data_dir:
+        data_dir = str(Path(tempfile.gettempdir()) / "AIassist")
+    return f"sqlite:///{(Path(data_dir) / 'app.db').as_posix()}"
 
 
 @dataclass(frozen=True)
 class Settings:
     app_env: str = os.getenv("APP_ENV", "dev")
-    database_url: str = os.getenv("DATABASE_URL", "sqlite:///./data/app.db")
+    database_url: str = os.getenv("DATABASE_URL", _default_database_url())
     cors_origins_raw: str = os.getenv(
         "CORS_ORIGINS",
         "http://localhost:5173,http://127.0.0.1:5173",
@@ -20,6 +29,10 @@ class Settings:
     deepseek_api_key: str = os.getenv("DEEPSEEK_API_KEY", "")
     deepseek_api_url: str = os.getenv("DEEPSEEK_API_URL", "https://api.deepseek.com/v1")
     deepseek_model: str = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+    rule_api_base_url: str = os.getenv(
+        "RULE_API_BASE_URL",
+        "https://decree-tapering-that.ngrok-free.dev/rules",
+    )
 
     @property
     def cors_origins(self) -> List[str]:
