@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -53,3 +53,22 @@ class DuplicateInternalResponse(BaseModel):
     imported_count: int
     threshold: float
     pairs: List[DuplicatePairOut]
+
+
+class ResourceCheckFindingOut(BaseModel):
+    rule_code: str
+    rule_name: str
+    resource_name: str
+    severity: str
+    result_label: str
+    reason: str
+    suggestion: Optional[str] = None
+    source_quantities: Dict[str, float] = Field(default_factory=dict)
+    row_indexes: List[int] = Field(default_factory=list)
+
+
+class ResourceCheckResponse(BaseModel):
+    project: ProjectOut
+    imported_count: int
+    checked_rule_count: int
+    findings: List[ResourceCheckFindingOut]
