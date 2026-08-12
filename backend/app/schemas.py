@@ -46,6 +46,14 @@ class DuplicatePairOut(BaseModel):
     severity: str
     reason: str
     suggestion: Optional[str] = None
+    comparison_type: str = "internal"
+    item_report_name: Optional[str] = None
+    related_report_name: Optional[str] = None
+    item_stage: Optional[str] = None
+    related_stage: Optional[str] = None
+    item_source: Optional[str] = None
+    related_source: Optional[str] = None
+    model_name: Optional[str] = None
 
 
 class DuplicateInternalResponse(BaseModel):
@@ -53,6 +61,9 @@ class DuplicateInternalResponse(BaseModel):
     imported_count: int
     threshold: float
     pairs: List[DuplicatePairOut]
+    history_imported_count: int = 0
+    internal_pairs: List[DuplicatePairOut] = Field(default_factory=list)
+    cross_pairs: List[DuplicatePairOut] = Field(default_factory=list)
 
 
 class ResourceCheckFindingOut(BaseModel):

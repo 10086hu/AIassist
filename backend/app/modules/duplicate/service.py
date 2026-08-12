@@ -24,6 +24,33 @@ class CandidatePair:
     similarity: float
 
 
+@dataclass(frozen=True)
+class ReportCandidatePair:
+    left: "ReportPoint"
+    right: "ReportPoint"
+    similarity: float
+
+
+@dataclass(frozen=True)
+class ReportPoint:
+    point_id: str
+    name: str
+    description: str
+    category: Optional[str]
+    row_index: int
+    report_name: str
+    stage: str
+    source: str
+
+
+@dataclass(frozen=True)
+class ParsedReport:
+    report_name: str
+    stage: str
+    source: str
+    points: list[ParsedFunctionPoint]
+
+
 def run_internal_duplicate_check(
     db: Session,
     content: bytes,
@@ -60,6 +87,130 @@ def run_duplicate_check_from_document(
     # 3. 复用现有流程处理功能点
     return _process_function_points(
         db, extracted_points, project_id, project_name, department
+    )
+
+
+def run_duplicate_compare_check(
+    db: Session,
+    current_content: bytes,
+    current_filename: str,
+    history_files: list[tuple[bytes, str]],
+    project_id: Optional[str],
+    project_name: str,
+    department: Optional[str],
+    current_stage: str = "本期",
+    history_stages: Optional[list[str]] = None,
+) -> DuplicateInternalResponse:
+    """对当前可研报告进行内部查重，并与往期报告进行跨报告重复建设检查。"""
+    current_points = _parse_points_from_file(current_content, current_filename, project_name)
+    if not current_points:
+        raise ValueError("当前可研报告未找到任何功能点")
+    if not history_files:
+        raise ValueError("请至少上传一个往期可研报告或历史功能点清单")
+
+    project = _get_or_create_project(db, project_id, project_name, department)
+    _replace_current_function_points(db, project.id, current_points)
+    db.flush()
+
+    current_report = ParsedReport(
+        report_name=current_filename,
+        stage=current_stage or "本期",
+        source="current",
+        points=current_points,
+    )
+    history_reports: list[ParsedReport] = []
+    for index, (content, filename) in enumerate(history_files):
+        stage = (
+            history_stages[index]
+            if history_stages and index < len(history_stages) and history_stages[index].strip()
+            else f"往期{index + 1}"
+        )
+        points = _parse_points_from_file(content, filename, f"{project_name} {stage}")
+        if points:
+            history_reports.append(
+                ParsedReport(
+                    report_name=filename,
+                    stage=stage,
+                    source="history",
+                    points=points,
+                )
+            )
+
+    if not history_reports:
+        raise ValueError("往期文件未提取到任何功能点")
+
+    current_refs = _report_points_from_parsed(current_report)
+    history_refs = [
+        point
+        for report in history_reports
+        for point in _report_points_from_parsed(report)
+    ]
+
+    internal_pairs = _judge_report_pairs(
+        _find_report_candidate_pairs(current_refs),
+        project_id=project.id,
+        comparison_type="internal",
+        context_builder=lambda left, right: f"两项均来自当前报告《{left.report_name}》（{left.stage}）。",
+    )
+    cross_pairs = _judge_report_pairs(
+        _find_cross_report_candidate_pairs(current_refs, history_refs),
+        project_id=project.id,
+        comparison_type="cross_report",
+        context_builder=lambda left, right: (
+            f"功能点1来自当前报告《{left.report_name}》（{left.stage}），"
+            f"功能点2来自往期报告《{right.report_name}》（{right.stage}）。"
+            "请重点判断是否属于本期重复申报、边界不清，或只是合理的阶段延续。"
+        ),
+    )
+
+    db.execute(
+        delete(CheckResult).where(
+            CheckResult.project_id == project.id,
+            CheckResult.module == "duplicate",
+            CheckResult.check_subtype.in_(("internal_dedup", "cross_report_dedup")),
+        )
+    )
+    for pair in internal_pairs + cross_pairs:
+        db.add(
+            CheckResult(
+                project_id=project.id,
+                module="duplicate",
+                check_subtype="cross_report_dedup" if pair.comparison_type == "cross_report" else "internal_dedup",
+                item_id=pair.item_id,
+                related_item_id=pair.related_item_id,
+                severity=pair.severity,
+                score=round(pair.similarity * 100, 2),
+                result_label=pair.result_label,
+                reason=pair.reason,
+                suggestion=pair.suggestion,
+                model_name=pair.model_name or "deepseek",
+                reference_data=json.dumps(
+                    {
+                        "comparison_type": pair.comparison_type,
+                        "similarity": pair.similarity,
+                        "item_report_name": pair.item_report_name,
+                        "related_report_name": pair.related_report_name,
+                        "item_stage": pair.item_stage,
+                        "related_stage": pair.related_stage,
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+        )
+
+    project.status = "evaluated"
+    db.commit()
+    db.refresh(project)
+
+    all_pairs = internal_pairs + cross_pairs
+    return DuplicateInternalResponse(
+        project=ProjectOut.model_validate(project),
+        imported_count=len(current_refs),
+        history_imported_count=len(history_refs),
+        threshold=settings.duplicate_high_similarity_threshold,
+        pairs=all_pairs,
+        internal_pairs=internal_pairs,
+        cross_pairs=cross_pairs,
     )
 
 
@@ -210,3 +361,115 @@ def _find_candidate_pairs(points: list[FunctionPoint]) -> list[CandidatePair]:
                 )
 
     return sorted(candidates, key=lambda item: item.similarity, reverse=True)
+
+
+def _parse_points_from_file(content: bytes, filename: str, project_context: str) -> list[ParsedFunctionPoint]:
+    lower = filename.lower()
+    if lower.endswith((".xlsx", ".csv")):
+        return parse_function_points(content, filename)
+    if lower.endswith((".docx", ".pdf")):
+        return extract_function_points(parse_document(content, filename), project_context=project_context)
+    raise ValueError(f"不支持的文件格式: {filename}")
+
+
+def _report_points_from_parsed(report: ParsedReport) -> list[ReportPoint]:
+    refs: list[ReportPoint] = []
+    for point in report.points:
+        source_text = f"{report.source}:{report.report_name}:{point.row_index}:{point.name}:{point.description}"
+        refs.append(
+            ReportPoint(
+                point_id=text_hash(source_text),
+                name=point.name,
+                description=point.description,
+                category=point.category,
+                row_index=point.row_index,
+                report_name=report.report_name,
+                stage=report.stage,
+                source=report.source,
+            )
+        )
+    return refs
+
+
+def _find_report_candidate_pairs(points: list[ReportPoint]) -> list[ReportCandidatePair]:
+    candidates: list[ReportCandidatePair] = []
+    for left_index in range(len(points)):
+        for right_index in range(left_index + 1, len(points)):
+            similarity = _report_point_similarity(points[left_index], points[right_index])
+            if similarity >= settings.duplicate_high_similarity_threshold:
+                candidates.append(
+                    ReportCandidatePair(
+                        left=points[left_index],
+                        right=points[right_index],
+                        similarity=similarity,
+                    )
+                )
+    return sorted(candidates, key=lambda item: item.similarity, reverse=True)
+
+
+def _find_cross_report_candidate_pairs(
+    current_points: list[ReportPoint],
+    history_points: list[ReportPoint],
+) -> list[ReportCandidatePair]:
+    candidates: list[ReportCandidatePair] = []
+    for current in current_points:
+        for history in history_points:
+            similarity = _report_point_similarity(current, history)
+            if similarity >= settings.duplicate_high_similarity_threshold:
+                candidates.append(
+                    ReportCandidatePair(
+                        left=current,
+                        right=history,
+                        similarity=similarity,
+                    )
+                )
+    return sorted(candidates, key=lambda item: item.similarity, reverse=True)
+
+
+def _report_point_similarity(left: ReportPoint, right: ReportPoint) -> float:
+    return duplicate_similarity_score(
+        f"{left.name} {left.description}",
+        f"{right.name} {right.description}",
+    )
+
+
+def _judge_report_pairs(
+    candidates: list[ReportCandidatePair],
+    project_id: str,
+    comparison_type: str,
+    context_builder,
+) -> list[DuplicatePairOut]:
+    pairs: list[DuplicatePairOut] = []
+    for candidate in candidates:
+        judgement = judge_pair_with_llm(
+            candidate.left.name,
+            candidate.left.description,
+            candidate.right.name,
+            candidate.right.description,
+            candidate.similarity,
+            context=context_builder(candidate.left, candidate.right),
+        )
+        if judgement.label == "无关":
+            continue
+        pairs.append(
+            DuplicatePairOut(
+                item_id=candidate.left.point_id,
+                related_item_id=candidate.right.point_id,
+                item_name=candidate.left.name,
+                related_item_name=candidate.right.name,
+                similarity=round(candidate.similarity, 4),
+                result_label=judgement.label,
+                severity=judgement.severity,
+                reason=judgement.reason,
+                suggestion=judgement.suggestion,
+                comparison_type=comparison_type,
+                item_report_name=candidate.left.report_name,
+                related_report_name=candidate.right.report_name,
+                item_stage=candidate.left.stage,
+                related_stage=candidate.right.stage,
+                item_source=candidate.left.source,
+                related_source=candidate.right.source,
+                model_name=judgement.model_name,
+            )
+        )
+    return pairs

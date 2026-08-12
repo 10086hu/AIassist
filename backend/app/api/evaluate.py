@@ -19,6 +19,7 @@ from app.modules.data_rules.service import (
     run_data_rules_check_from_document,
 )
 from app.modules.duplicate.service import (
+    run_duplicate_compare_check,
     run_duplicate_check_from_document,
     run_internal_duplicate_check,
 )
@@ -194,6 +195,57 @@ async def evaluate_duplicate_internal(
         return _run_duplicate_module(db, content, filename, project_id, project_name, department)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/duplicate/compare")
+async def evaluate_duplicate_compare(
+    current_file: UploadFile = File(...),
+    history_files: list[UploadFile] = File(default=[]),
+    project_id: str | None = Form(default=None),
+    project_name: str = Form(default="未命名可研项目"),
+    department: str | None = Form(default=None),
+    current_stage: str = Form(default="本期"),
+    history_stages: str | None = Form(default=None),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    current_filename = current_file.filename or ""
+    current_content = await _read_upload(current_file, DUPLICATE_EXTENSIONS)
+    history_payloads: list[tuple[bytes, str]] = []
+    for file in history_files:
+        filename = file.filename or ""
+        history_payloads.append((await _read_upload(file, DUPLICATE_EXTENSIONS), filename))
+
+    try:
+        raw = run_duplicate_compare_check(
+            db=db,
+            current_content=current_content,
+            current_filename=current_filename,
+            history_files=history_payloads,
+            project_id=project_id,
+            project_name=project_name,
+            department=department,
+            current_stage=current_stage,
+            history_stages=_parse_history_stages(history_stages),
+        )
+        normalized = _normalize_duplicate_result(raw)
+        project = db.get(Project, raw.project.id)
+        if project is not None:
+            _store_check_result(
+                db=db,
+                project=project,
+                module="duplicate",
+                result=normalized,
+                severity=_highest_result_severity(normalized),
+                suggestion=_first_finding_value(normalized.get("findings") or [], "revision_advice"),
+            )
+            db.commit()
+        return normalized
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"重复建设跨报告检查失败：{exc}") from exc
 
 
 @router.post("/content-consistency/document")
@@ -965,6 +1017,18 @@ def _parse_selected_rule_ids(value: str | None) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def _parse_history_stages(value: str | None) -> list[str]:
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return [item.strip() for item in value.split(",") if item.strip()]
+    if isinstance(parsed, list):
+        return [str(item).strip() for item in parsed if str(item).strip()]
+    return []
+
+
 def _parse_selected_rule_ids_by_module(value: str | None) -> dict[str, list[str]]:
     if not value:
         return {}
@@ -1051,26 +1115,57 @@ def _normalize_function_or_sensitive_result(result: dict[str, Any], module: str)
 def _normalize_duplicate_result(result: DuplicateInternalResponse) -> dict[str, Any]:
     data = result.model_dump(mode="json")
     pairs = data.get("pairs") or []
-    findings = [
-        {
-            "display_title": f"{pair.get('item_name', '')} ↔ {pair.get('related_item_name', '')}".strip(" ↔"),
-            "risk_level": _normalize_issue_degree(pair.get("severity") or pair.get("result_label") or "需人工确认"),
-            "review_opinion": pair.get("reason") or pair.get("result_label") or "疑似重复建设，请复核。",
-            "evidence_summary": f"相似度：{float(pair.get('similarity') or 0):.2%}",
-            "revision_advice": pair.get("suggestion") or "请核对两个功能点是否存在建设内容、服务对象或实现范围重复。",
-            "rule_basis": "内部功能点相似性与大模型复核",
-            "merged_count": 1,
-        }
-        for pair in pairs
-    ]
+    findings = []
+    for pair in pairs:
+        comparison_type = str(pair.get("comparison_type") or "internal")
+        is_cross = comparison_type == "cross_report"
+        prefix = "与往期报告重复" if is_cross else "本报告内部重复"
+        left_report = str(pair.get("item_report_name") or "当前报告")
+        right_report = str(pair.get("related_report_name") or ("往期报告" if is_cross else "当前报告"))
+        evidence_parts = [f"相似度：{float(pair.get('similarity') or 0):.2%}"]
+        if is_cross:
+            evidence_parts.append(f"当前：{left_report}")
+            evidence_parts.append(f"往期：{right_report}")
+        findings.append(
+            {
+                "display_title": f"【{prefix}】{pair.get('item_name', '')} ↔ {pair.get('related_item_name', '')}".strip(" ↔"),
+                "risk_level": _normalize_issue_degree(pair.get("severity") or pair.get("result_label") or "需人工确认"),
+                "review_opinion": pair.get("reason") or pair.get("result_label") or "疑似重复建设，请复核。",
+                "evidence_summary": "；".join(evidence_parts),
+                "revision_advice": pair.get("suggestion") or "请核对两个功能点是否存在建设内容、服务对象或实现范围重复。",
+                "rule_basis": "功能点相似度预筛与大模型语义复核",
+                "source_section": prefix,
+                "comparison_type": comparison_type,
+                "item_report_name": left_report,
+                "related_report_name": right_report,
+                "item_stage": pair.get("item_stage") or "",
+                "related_stage": pair.get("related_stage") or "",
+                "llm_refined": pair.get("model_name") == "deepseek",
+                "model_name": pair.get("model_name") or "",
+                "merged_count": 1,
+            }
+        )
+    internal_count = len(data.get("internal_pairs") or [pair for pair in pairs if (pair.get("comparison_type") or "internal") == "internal"])
+    cross_count = len(data.get("cross_pairs") or [pair for pair in pairs if pair.get("comparison_type") == "cross_report"])
+    summary = _summary_from_findings(
+        findings,
+        imported_count=data.get("imported_count", 0),
+        history_imported_count=data.get("history_imported_count", 0),
+        internal_duplicate_count=internal_count,
+        cross_report_duplicate_count=cross_count,
+    )
+    summary["llm_model"] = _first_text([pair.get("model_name") for pair in pairs if pair.get("model_name")]) or "deepseek"
     return {
         "module_code": "duplicate",
         "module_name": _module_display_name("duplicate"),
         "status": "completed",
         "imported_count": data.get("imported_count", 0),
+        "history_imported_count": data.get("history_imported_count", 0),
         "threshold": data.get("threshold", 0),
-        "summary": _summary_from_findings(findings, imported_count=data.get("imported_count", 0)),
+        "summary": summary,
         "findings": findings,
+        "internal_pairs": data.get("internal_pairs") or [],
+        "cross_pairs": data.get("cross_pairs") or [],
         "raw_result": data,
     }
 

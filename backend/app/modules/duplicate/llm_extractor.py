@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import List, Optional
 
 import requests
 
 from app.core.config import settings
+from app.core.llm_json import parse_json_object_from_text
 from app.modules.duplicate.document_parser import DocumentContent
 from app.modules.duplicate.excel_parser import ParsedFunctionPoint
 
@@ -91,8 +93,16 @@ def _extract_from_text(
 
     try:
         response = _call_deepseek_api(prompt)
-        points = _parse_extraction_response(response)
-        return points
+        try:
+            return _parse_extraction_response(response)
+        except ValueError:
+            retry_prompt = (
+                prompt
+                + "\n\n"
+                + "The previous response could not be parsed. Return only one JSON object with a top-level function_points array."
+            )
+            response = _call_deepseek_api(retry_prompt)
+            return _parse_extraction_response(response)
     except Exception as e:
         logger.error(f"从文本提取功能点失败: {e}")
         raise ValueError(f"LLM 提取失败: {e}") from e
@@ -163,37 +173,42 @@ def _call_deepseek_api(prompt: str) -> str:
     }
     payload = {
         "model": settings.deepseek_model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.3,
-        "max_tokens": 2000,
+        "messages": [
+            {
+                "role": "system",
+                "content": "你是政府信息化项目可研报告功能点抽取助手。只输出合法 JSON，不输出推理过程、Markdown 或解释文字。",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.1,
+        "max_tokens": settings.duplicate_llm_max_tokens,
+        "response_format": {"type": "json_object"},
     }
 
-    response = requests.post(url, headers=headers, json=payload, timeout=60)
+    timeout = settings.duplicate_llm_timeout_seconds
+    response = requests.post(url, headers=headers, json=payload, timeout=timeout)
+    if response.status_code in {400, 422}:
+        payload.pop("response_format", None)
+        response = requests.post(url, headers=headers, json=payload, timeout=timeout)
     response.raise_for_status()
 
     data = response.json()
-    content = data["choices"][0]["message"]["content"]
-    return content.strip()
+    return _extract_message_text(data)
 
 
 def _parse_extraction_response(response: str) -> List[ParsedFunctionPoint]:
     """解析 LLM 响应中的功能点"""
     try:
-        # 尝试提取 JSON
-        json_str = response
-        if "```json" in response:
-            json_str = response.split("```json")[1].split("```")[0]
-        elif "```" in response:
-            json_str = response.split("```")[1].split("```")[0]
-
-        data = json.loads(json_str)
+        data = parse_json_object_from_text(_strip_think_blocks(response))
         function_points = data.get("function_points", [])
 
         parsed_points: List[ParsedFunctionPoint] = []
         for idx, item in enumerate(function_points, 1):
-            name = item.get("name", "").strip()
-            description = item.get("description", "").strip()
-            category = item.get("category", "").strip()
+            if not isinstance(item, dict):
+                continue
+            name = _text_value(item.get("name"), "")
+            description = _text_value(item.get("description"), "")
+            category = _text_value(item.get("category"), "")
 
             if name:  # 只有名称非空才有效
                 parsed_points.append(
@@ -206,6 +221,28 @@ def _parse_extraction_response(response: str) -> List[ParsedFunctionPoint]:
                 )
 
         return parsed_points
-    except (json.JSONDecodeError, KeyError, IndexError) as e:
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as e:
         logger.error(f"解析 LLM 响应失败: {e}, 响应内容: {response[:500]}")
         raise ValueError(f"无法解析 LLM 响应") from e
+
+
+def _extract_message_text(data: dict) -> str:
+    choices = data.get("choices") or []
+    if not choices:
+        raise ValueError("LLM response missing choices")
+    message = (choices[0] or {}).get("message") or {}
+    value = message.get("content")
+    if value is not None and str(value).strip():
+        return str(value).strip()
+    finish_reason = (choices[0] or {}).get("finish_reason")
+    raise ValueError(f"LLM response missing final content, finish_reason={finish_reason}")
+
+
+def _strip_think_blocks(text: str) -> str:
+    return re.sub(r"<think>.*?</think>", "", text or "", flags=re.IGNORECASE | re.DOTALL).strip()
+
+
+def _text_value(value: object, default: str) -> str:
+    if value is None:
+        return default
+    return str(value).strip() or default

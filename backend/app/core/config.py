@@ -25,6 +25,8 @@ class Settings:
     )
     duplicate_similarity_threshold: float = float(os.getenv("DUPLICATE_SIMILARITY_THRESHOLD", "0.62"))
     duplicate_high_similarity_threshold: float = float(os.getenv("DUPLICATE_HIGH_SIMILARITY_THRESHOLD", "0.45"))
+    duplicate_llm_timeout_seconds: int = int(os.getenv("DUPLICATE_LLM_TIMEOUT_SECONDS", "180"))
+    duplicate_llm_max_tokens: int = int(os.getenv("DUPLICATE_LLM_MAX_TOKENS", "6000"))
     embedding_dim: int = int(os.getenv("EMBEDDING_DIM", "384"))
     deepseek_api_key: str = os.getenv("DEEPSEEK_API_KEY", "")
     deepseek_api_url: str = os.getenv("DEEPSEEK_API_URL", "https://api.deepseek.com/v1")

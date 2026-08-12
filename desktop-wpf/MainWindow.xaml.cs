@@ -1046,15 +1046,45 @@ public partial class MainWindow : Window
                 AddResultNotice($"已跳过 {skippedCount} 个尚未接入后端的检测项。");
             }
 
-            foreach (var item in runnableItems)
+            var duplicateHistoryFiles = AskDuplicateHistoryFiles(runnableItems);
+            if (duplicateHistoryFiles == null)
+            {
+                StatusTextBlock.Text = "已取消检测。";
+                return;
+            }
+
+            var taskItems = runnableItems.ToList();
+            var duplicateItem = taskItems.FirstOrDefault(item => item.ModuleCode == "duplicate");
+            if (duplicateItem != null && duplicateHistoryFiles.Count > 0)
+            {
+                taskItems.Remove(duplicateItem);
+            }
+
+            foreach (var item in taskItems)
             {
                 await LoadRulesForModuleAsync(item.ModuleCode);
             }
 
-            StatusTextBlock.Text = "正在创建后台检测任务...";
-            var taskId = await CreateEvaluateTaskAsync(runnableItems, reportPath);
-            AddResultNotice("检测任务已创建，正在后台审查……");
-            await PollEvaluateTaskAsync(taskId);
+            if (duplicateItem != null && duplicateHistoryFiles.Count > 0)
+            {
+                StatusTextBlock.Text = "正在执行重复建设跨报告比对...";
+                var duplicateResult = await UploadAndRunDuplicateCompareAsync(reportPath, duplicateHistoryFiles);
+                RenderCheckResult(duplicateResult);
+                AddResultNotice("重复建设检查已完成：已完成当前报告内部和往期报告跨报告比对。");
+                await LoadRecordsAsync();
+            }
+
+            if (taskItems.Count > 0)
+            {
+                StatusTextBlock.Text = "正在创建后台检测任务...";
+                var taskId = await CreateEvaluateTaskAsync(taskItems, reportPath);
+                AddResultNotice("检测任务已创建，正在后台审查……");
+                await PollEvaluateTaskAsync(taskId);
+            }
+            else if (duplicateItem != null && duplicateHistoryFiles.Count > 0)
+            {
+                StatusTextBlock.Text = "检测完成，请在“审查记录”查看结果。";
+            }
         }
         catch (HttpRequestException exc)
         {
@@ -1100,6 +1130,46 @@ public partial class MainWindow : Window
 
     private static string ProjectLevelForModule(string moduleCode) =>
         moduleCode == "function_correspondence" ? "市级项目" : "通用";
+
+    private List<string>? AskDuplicateHistoryFiles(IReadOnlyCollection<CheckItem> runnableItems)
+    {
+        if (!runnableItems.Any(item => item.ModuleCode == "duplicate"))
+        {
+            return new List<string>();
+        }
+
+        var answer = MessageBox.Show(
+            this,
+            "本次重复建设检查是否有对应的往期可研报告、历史批复报告或历史功能点清单需要一起比对？",
+            "重复建设检查",
+            MessageBoxButton.YesNoCancel,
+            MessageBoxImage.Question);
+
+        if (answer == MessageBoxResult.Cancel)
+        {
+            return null;
+        }
+
+        if (answer == MessageBoxResult.No)
+        {
+            return new List<string>();
+        }
+
+        var dialog = new OpenFileDialog
+        {
+            Title = "选择往期可研报告或历史功能点清单",
+            Filter = "可研报告/功能点清单|*.docx;*.pdf;*.xlsx;*.csv|Word 文档|*.docx|PDF 文件|*.pdf|Excel/CSV 清单|*.xlsx;*.csv|所有文件|*.*",
+            Multiselect = true
+        };
+
+        if (dialog.ShowDialog(this) != true || dialog.FileNames.Length == 0)
+        {
+            MessageBox.Show(this, "未选择往期文件，本次取消重复建设检查。", "缺少往期文件", MessageBoxButton.OK, MessageBoxImage.Information);
+            return null;
+        }
+
+        return dialog.FileNames.Where(File.Exists).ToList();
+    }
 
     private async Task<bool> IsBackendAvailableAsync()
     {
@@ -1783,6 +1853,48 @@ public partial class MainWindow : Window
         }
 
         return JsonDocument.Parse(responseBody);
+    }
+
+    private async Task<JsonDocument> UploadAndRunDuplicateCompareAsync(string currentReportPath, IReadOnlyCollection<string> historyPaths)
+    {
+        await using var currentStream = File.OpenRead(currentReportPath);
+        using var form = new MultipartFormDataContent();
+        using var currentContent = new StreamContent(currentStream);
+        currentContent.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+
+        form.Add(currentContent, "current_file", Path.GetFileName(currentReportPath));
+        form.Add(new StringContent(Path.GetFileNameWithoutExtension(currentReportPath), Encoding.UTF8), "project_name");
+        form.Add(new StringContent(string.Empty, Encoding.UTF8), "department");
+        form.Add(new StringContent("本期", Encoding.UTF8), "current_stage");
+
+        var streams = new List<FileStream>();
+        try
+        {
+            foreach (var path in historyPaths)
+            {
+                var stream = File.OpenRead(path);
+                streams.Add(stream);
+                var content = new StreamContent(stream);
+                content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+                form.Add(content, "history_files", Path.GetFileName(path));
+            }
+
+            using var response = await BackendClient.PostAsync($"{BackendBaseUrl}/evaluate/duplicate/compare", form);
+            var responseBody = await response.Content.ReadAsStringAsync();
+            if (!response.IsSuccessStatusCode)
+            {
+                throw new InvalidOperationException($"重复建设跨报告比对失败：{ExtractErrorMessage(responseBody)}");
+            }
+
+            return JsonDocument.Parse(responseBody);
+        }
+        finally
+        {
+            foreach (var stream in streams)
+            {
+                await stream.DisposeAsync();
+            }
+        }
     }
 
     private IEnumerable<string> SelectedRuleIdsForModule(string moduleCode)

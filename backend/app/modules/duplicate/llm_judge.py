@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
+from typing import Any, Optional
 
 import requests
 
 from app.core.config import settings
+from app.core.llm_json import parse_json_object_from_text
 from app.modules.duplicate.embeddings import lexical_overlap, normalize_text
 
 
@@ -28,6 +31,7 @@ def judge_pair_with_llm(
     right_name: str,
     right_description: str,
     similarity: float,
+    context: str = "",
 ) -> LLMJudgement:
     """调用 DeepSeek 大模型进行重复判定"""
     if not settings.deepseek_api_key:
@@ -37,7 +41,8 @@ def judge_pair_with_llm(
     prompt = _build_judge_prompt(
         left_name, left_description,
         right_name, right_description,
-        similarity
+        similarity,
+        context,
     )
 
     try:
@@ -54,7 +59,9 @@ def _build_judge_prompt(
     right_name: str,
     right_description: str,
     similarity: float,
+    context: str = "",
 ) -> str:
+    context_text = f"\n【报告关系】\n{context}\n" if context.strip() else ""
     return f"""你是政府信息化项目可研评审专家。请比较以下两个功能点是否重复建设。
 
 【功能点1】
@@ -67,13 +74,15 @@ def _build_judge_prompt(
 
 【参考信息】
 语义相似度: {similarity:.2f}
+{context_text}
 
 判定口径：
 1. 重复：目标对象、业务流程、核心能力基本相同，只是措辞不同。
 2. 高度相似：属于同一业务域，能力有明显重叠，但存在上下级、前后置或范围差异。
 3. 无关：业务目标或核心能力不同。
 
-请按以下 JSON 格式输出你的判定结果，不要包含其他内容：
+请按以下 JSON 格式输出你的判定结果，不要包含其他内容。
+reason 控制在 80 个汉字以内，suggestion 控制在 80 个汉字以内：
 {{
     "label": "重复|高度相似|无关",
     "reason": "判定理由",
@@ -92,38 +101,37 @@ def _call_deepseek_api(prompt: str) -> str:
         "model": settings.deepseek_model,
         "messages": [
             {
+                "role": "system",
+                "content": "你是政府信息化项目可研重复建设审查助手。只输出合法 JSON，不输出推理过程、Markdown 或解释文字。",
+            },
+            {
                 "role": "user",
                 "content": prompt,
             }
         ],
-        "temperature": 0.3,
-        "max_tokens": 500,
+        "temperature": 0.1,
+        "max_tokens": min(settings.duplicate_llm_max_tokens, 4096),
+        "response_format": {"type": "json_object"},
     }
 
-    response = requests.post(url, headers=headers, json=payload, timeout=30)
+    timeout = settings.duplicate_llm_timeout_seconds
+    response = requests.post(url, headers=headers, json=payload, timeout=timeout)
+    if response.status_code in {400, 422}:
+        payload.pop("response_format", None)
+        response = requests.post(url, headers=headers, json=payload, timeout=timeout)
     response.raise_for_status()
 
     data = response.json()
-    content = data["choices"][0]["message"]["content"]
-    return content.strip()
+    return _extract_message_text(data)
 
 
 def _parse_llm_response(response: str) -> LLMJudgement:
     """解析 LLM 响应"""
     try:
-        json_str = response
-        if "```json" in response:
-            json_str = response.split("```json")[1].split("```")[0]
-        elif "```" in response:
-            json_str = response.split("```")[1].split("```")[0]
-
-        data = json.loads(json_str)
-        label = data.get("label", "无关").strip()
-        reason = data.get("reason", "").strip()
-        suggestion = data.get("suggestion", "").strip()
-
-        if label not in ("重复", "高度相似", "无关"):
-            label = "无关"
+        data = parse_json_object_from_text(_strip_think_blocks(response))
+        label = _normalize_label(_text_value(data.get("label"), "无关"))
+        reason = _text_value(data.get("reason"), "")
+        suggestion = _text_value(data.get("suggestion"), "")
 
         severity_map = {
             "重复": "risk",
@@ -138,9 +146,42 @@ def _parse_llm_response(response: str) -> LLMJudgement:
             suggestion=suggestion or None,
             model_name="deepseek",
         )
-    except (json.JSONDecodeError, KeyError, IndexError) as e:
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as e:
         logger.error(f"Failed to parse LLM response: {e}, response: {response}")
         raise ValueError(f"Invalid LLM response format") from e
+
+
+def _extract_message_text(data: dict[str, Any]) -> str:
+    choices = data.get("choices") or []
+    if not choices:
+        raise ValueError("LLM response missing choices")
+    message = (choices[0] or {}).get("message") or {}
+    value = message.get("content")
+    if value is not None and str(value).strip():
+        return str(value).strip()
+    finish_reason = (choices[0] or {}).get("finish_reason")
+    raise ValueError(f"LLM response missing final content, finish_reason={finish_reason}")
+
+
+def _strip_think_blocks(text: str) -> str:
+    return re.sub(r"<think>.*?</think>", "", text or "", flags=re.IGNORECASE | re.DOTALL).strip()
+
+
+def _text_value(value: Any, default: str) -> str:
+    if value is None:
+        return default
+    return str(value).strip() or default
+
+
+def _normalize_label(value: str) -> str:
+    text = value.strip()
+    if text in {"重复", "完全重复", "疑似重复"}:
+        return "重复"
+    if text in {"高度相似", "部分重复", "阶段延续", "需人工确认", "相似"}:
+        return "高度相似"
+    if text in {"无关", "不重复", "相似但不重复"}:
+        return "无关"
+    return "无关"
 
 
 def _fallback_judge(
