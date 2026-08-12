@@ -224,3 +224,12 @@ dotnet build desktop-wpf\AiReportDesktop.csproj
 4. 给 `/duplicate/compare` 增加自动化测试用例，覆盖 Word、PDF、Excel/CSV 混合输入。
 5. 继续完善未完成的价格、安全、信创相关模块。
 
+## 九、当前 Git 分支
+
+已为本次重复建设检查模块相关改动新建并切换到分支：
+
+```text
+duplicate-check-completion
+```
+
+
