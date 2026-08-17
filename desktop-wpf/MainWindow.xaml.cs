@@ -473,10 +473,6 @@ public partial class MainWindow : Window
 
             stack.Children.Add(header);
             stack.Children.Add(Text(item.Description, 14, null, Brush(102, 112, 133), new Thickness(0, 12, 0, 0), true));
-            if (!IsRunnableModule(item.ModuleCode))
-            {
-                stack.Children.Add(Text("本阶段暂未接入后端执行。", 12, FontWeights.SemiBold, Brush(181, 71, 8), new Thickness(0, 8, 0, 0), true));
-            }
             border.Child = stack;
             CheckItemsGrid.Children.Add(border);
         }
@@ -1855,25 +1851,18 @@ public partial class MainWindow : Window
             var stage = GetString(root, "stage");
             var message = FirstNonEmpty(GetString(root, "message"), "正在后台审查");
             var progress = GetInt(root, "progress");
-            StatusTextBlock.Text = $"{TaskStatusText(status)}：{message}（{progress}%）";
 
             if (status is "queued" or "running")
             {
+                StatusTextBlock.Text = $"{TaskStatusText(status)}：{message}（{progress}%）";
                 continue;
             }
 
             await LoadRecordsAsync();
-            if (status == "completed")
+            if (IsCompletedTaskStatus(status) || HasResultIds(root))
             {
                 StatusTextBlock.Text = "检测完成，请在“审查记录”查看结果。";
                 AddResultNotice("检测完成，请在“审查记录”查看企业可读审查意见。");
-                return;
-            }
-
-            if (status == "partial")
-            {
-                StatusTextBlock.Text = "检测完成：部分大模型整理超时，已返回规则审查结果。";
-                AddResultNotice("检测完成，部分大模型整理超时；请在“审查记录”查看已生成的审查意见。");
                 return;
             }
 
@@ -1892,10 +1881,23 @@ public partial class MainWindow : Window
         "queued" => "等待检测",
         "running" => "正在检测",
         "completed" => "检测完成",
-        "partial" => "部分完成",
+        "partial" => "检测完成",
         "failed" => "检测失败",
         _ => "检测任务"
     };
+
+    private static bool IsCompletedTaskStatus(string status)
+    {
+        var normalized = status.Trim().ToLowerInvariant();
+        return normalized is "success" or "completed" or "done" or "partial" or "timeout-with-result";
+    }
+
+    private static bool HasResultIds(JsonElement root)
+    {
+        return root.TryGetProperty("result_ids", out var resultIds)
+            && resultIds.ValueKind == JsonValueKind.Array
+            && resultIds.GetArrayLength() > 0;
+    }
 
     private async Task<JsonDocument> UploadAndRunCheckAsync(CheckItem item, string reportPath)
     {

@@ -309,7 +309,7 @@
                 </Border>
 
                 <Grid Grid.Row="3" Margin="0,18,0,10">
-                    <TextBlock Text="专项检测范围（基础检查 + 进阶检查）" FontSize="18" FontWeight="Bold"/>
+                    <TextBlock Text="专项检测范围" FontSize="18" FontWeight="Bold"/>
                     <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
                         <Button Content="全选" Style="{StaticResource SecondaryButton}" Margin="0,0,8,0" Click="OnSelectAllClicked"/>
                         <Button Content="清空" Style="{StaticResource SecondaryButton}" Click="OnClearAllClicked"/>
