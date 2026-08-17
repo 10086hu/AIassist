@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -11,7 +12,7 @@ from app.core.config import settings
 from app.db.models import CheckResult, FunctionPoint, Project
 from app.modules.duplicate.embeddings import duplicate_similarity_score, text_hash
 from app.modules.duplicate.excel_parser import ParsedFunctionPoint, parse_function_points
-from app.modules.duplicate.document_parser import parse_document
+from app.modules.duplicate.document_parser import DocumentContent, parse_document
 from app.modules.duplicate.llm_extractor import extract_function_points
 from app.modules.duplicate.llm_judge import judge_pair_with_llm
 from app.schemas import DuplicateInternalResponse, DuplicatePairOut, ProjectOut
@@ -368,8 +369,83 @@ def _parse_points_from_file(content: bytes, filename: str, project_context: str)
     if lower.endswith((".xlsx", ".csv")):
         return parse_function_points(content, filename)
     if lower.endswith((".docx", ".pdf")):
-        return extract_function_points(parse_document(content, filename), project_context=project_context)
+        return _parse_document_function_points(
+            parse_document(content, filename),
+            project_context=project_context,
+        )
     raise ValueError(f"不支持的文件格式: {filename}")
+
+
+def _parse_document_function_points(
+    doc_content: DocumentContent,
+    project_context: str,
+) -> list[ParsedFunctionPoint]:
+    section_points = _extract_function_sections(doc_content)
+    if len(section_points) >= 3:
+        return section_points
+    return extract_function_points(doc_content, project_context=project_context)
+
+
+def _extract_function_sections(doc_content: DocumentContent) -> list[ParsedFunctionPoint]:
+    points: list[ParsedFunctionPoint] = []
+    for section in doc_content.sections:
+        name = _clean_function_section_title(section.title)
+        if not name or not _looks_like_function_section(name, section.content):
+            continue
+        points.append(
+            ParsedFunctionPoint(
+                row_index=len(points) + 1,
+                name=name,
+                description=_compact_description(section.content),
+                category="文档功能章节",
+            )
+        )
+    return points
+
+
+def _clean_function_section_title(title: str) -> str:
+    text = re.sub(r"\s+", " ", title or "").strip()
+    text = re.sub(r"^\d+(?:\.\d+)*\s*", "", text)
+    text = re.sub(r"^[一二三四五六七八九十]+[、.]\s*", "", text)
+    return text.strip()
+
+
+def _looks_like_function_section(title: str, content: str) -> bool:
+    if not title or len(title) > 40:
+        return False
+    excluded = (
+        "项目概况",
+        "现状问题",
+        "建设必要性",
+        "建设目标",
+        "主要功能点清单",
+        "实施计划",
+        "投资估算",
+        "实施情况",
+    )
+    if any(word in title for word in excluded):
+        return False
+    text = f"{title}\n{content}"
+    return any(word in text for word in ("建设", "提供", "功能点", "能力", "模块", "平台", "服务"))
+
+
+def _compact_description(content: str) -> str:
+    return re.sub(r"\s+", " ", content or "").strip()[:800]
+
+
+def run_duplicate_check_from_document(
+    db: Session,
+    content: bytes,
+    filename: str,
+    project_id: Optional[str],
+    project_name: str,
+    department: Optional[str],
+) -> DuplicateInternalResponse:
+    doc_content = parse_document(content, filename)
+    parsed_points = _parse_document_function_points(doc_content, project_name)
+    return _process_function_points(
+        db, parsed_points, project_id, project_name, department
+    )
 
 
 def _report_points_from_parsed(report: ParsedReport) -> list[ReportPoint]:

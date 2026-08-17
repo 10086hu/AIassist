@@ -64,6 +64,11 @@ def _parse_docx(content: bytes, filename: str) -> DocumentContent:
             current_section_content.append(text)
             raw_text_parts.append(text)
 
+    table_text_parts = _extract_docx_table_text(doc)
+    if table_text_parts:
+        raw_text_parts.extend(table_text_parts)
+        current_section_content.extend(table_text_parts)
+
     # 保存最后一个章节
     if current_section_content:
         section_text = "\n".join(current_section_content)
@@ -79,6 +84,20 @@ def _parse_docx(content: bytes, filename: str) -> DocumentContent:
         sections=sections,
         filename=filename,
     )
+
+
+def _extract_docx_table_text(doc: Document) -> list[str]:
+    rows: list[str] = []
+    for table in doc.tables:
+        for row in table.rows:
+            values = [
+                cell.text.strip().replace("\n", " ")
+                for cell in row.cells
+                if cell.text and cell.text.strip()
+            ]
+            if values:
+                rows.append(" | ".join(values))
+    return rows
 
 
 def _parse_pdf(content: bytes, filename: str) -> DocumentContent:

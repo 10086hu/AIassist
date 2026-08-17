@@ -14,7 +14,7 @@ namespace AiReportDesktop;
 public partial class MainWindow : Window
 {
     private const string BackendBaseUrl = "http://127.0.0.1:8000/api";
-    private static readonly HttpClient BackendClient = new() { Timeout = TimeSpan.FromSeconds(120) };
+    private static readonly HttpClient BackendClient = new() { Timeout = TimeSpan.FromMinutes(10) };
 
     private readonly List<CheckBox> _checkBoxes = new();
     private readonly Dictionary<string, List<CheckBox>> _ruleCheckBoxesByModule = new();
@@ -47,6 +47,9 @@ public partial class MainWindow : Window
     private CheckBox? _llmReviewCheckBox;
     private bool _isCompletenessChecked;
     private bool _isChecking;
+    private List<string> _duplicateHistoryFiles = new();
+    private bool _duplicateHistoryChoiceCaptured;
+    private bool _isUpdatingDuplicateSelection;
 
     private readonly CheckItem[] _checkItems =
     {
@@ -486,10 +489,53 @@ public partial class MainWindow : Window
 
     private async void OnCheckItemSelectionChanged(object sender, RoutedEventArgs e)
     {
-        if (sender is CheckBox { Tag: CheckItem item } && HasBackendRuleApi(item.ModuleCode))
+        if (sender is not CheckBox { Tag: CheckItem item } checkBox)
+        {
+            return;
+        }
+
+        if (item.ModuleCode == "duplicate")
+        {
+            HandleDuplicateSelectionChanged(checkBox);
+        }
+
+        if (HasBackendRuleApi(item.ModuleCode))
         {
             await LoadRulesForModuleAsync(item.ModuleCode);
         }
+    }
+
+    private void HandleDuplicateSelectionChanged(CheckBox checkBox)
+    {
+        if (_isUpdatingDuplicateSelection)
+        {
+            return;
+        }
+
+        if (checkBox.IsChecked != true)
+        {
+            _duplicateHistoryFiles = new List<string>();
+            _duplicateHistoryChoiceCaptured = false;
+            return;
+        }
+
+        var historyFiles = AskDuplicateHistoryFiles();
+        if (historyFiles == null)
+        {
+            _duplicateHistoryFiles = new List<string>();
+            _duplicateHistoryChoiceCaptured = false;
+            _isUpdatingDuplicateSelection = true;
+            checkBox.IsChecked = false;
+            _isUpdatingDuplicateSelection = false;
+            StatusTextBlock.Text = "已取消重复建设检查。";
+            return;
+        }
+
+        _duplicateHistoryFiles = historyFiles;
+        _duplicateHistoryChoiceCaptured = true;
+        StatusTextBlock.Text = historyFiles.Count > 0
+            ? $"重复建设检查已选择 {historyFiles.Count} 个往期文件，开始检测时将执行跨报告比对。"
+            : "重复建设检查将仅执行当前报告内部重复功能点检查。";
     }
 
     private Grid BuildRecordsPage()
@@ -1046,7 +1092,7 @@ public partial class MainWindow : Window
                 AddResultNotice($"已跳过 {skippedCount} 个尚未接入后端的检测项。");
             }
 
-            var duplicateHistoryFiles = AskDuplicateHistoryFiles(runnableItems);
+            var duplicateHistoryFiles = ResolveDuplicateHistoryFiles(runnableItems);
             if (duplicateHistoryFiles == null)
             {
                 StatusTextBlock.Text = "已取消检测。";
@@ -1131,13 +1177,30 @@ public partial class MainWindow : Window
     private static string ProjectLevelForModule(string moduleCode) =>
         moduleCode == "function_correspondence" ? "市级项目" : "通用";
 
-    private List<string>? AskDuplicateHistoryFiles(IReadOnlyCollection<CheckItem> runnableItems)
+    private List<string>? ResolveDuplicateHistoryFiles(IReadOnlyCollection<CheckItem> runnableItems)
     {
         if (!runnableItems.Any(item => item.ModuleCode == "duplicate"))
         {
             return new List<string>();
         }
 
+        if (_duplicateHistoryChoiceCaptured)
+        {
+            return _duplicateHistoryFiles;
+        }
+
+        var historyFiles = AskDuplicateHistoryFiles();
+        if (historyFiles != null)
+        {
+            _duplicateHistoryFiles = historyFiles;
+            _duplicateHistoryChoiceCaptured = true;
+        }
+
+        return historyFiles;
+    }
+
+    private List<string>? AskDuplicateHistoryFiles()
+    {
         var answer = MessageBox.Show(
             this,
             "本次重复建设检查是否有对应的往期可研报告、历史批复报告或历史功能点清单需要一起比对？",
@@ -1533,11 +1596,15 @@ public partial class MainWindow : Window
             }
         }
 
-        if (TryRenderMergedRuleFindings(_recordDetailPanel, resultRoot, module))
+        if (module == "duplicate" && TryRenderDuplicateFindings(_recordDetailPanel, resultRoot))
+        {
+            // 重复建设结果按内部重复和跨报告重复分组展示。
+        }
+        else if (TryRenderMergedRuleFindings(_recordDetailPanel, resultRoot, module))
         {
             // 已合并展示小规则 findings，不再重复渲染顶层 findings。
         }
-        else if (root.TryGetProperty("findings", out var findings) && findings.ValueKind == JsonValueKind.Array && findings.GetArrayLength() > 0)
+        else if (resultRoot.TryGetProperty("findings", out var findings) && findings.ValueKind == JsonValueKind.Array && findings.GetArrayLength() > 0)
         {
             foreach (var finding in findings.EnumerateArray())
             {
@@ -1951,7 +2018,11 @@ public partial class MainWindow : Window
         stack.Children.Add(Text(moduleName, 16, FontWeights.Bold, FindBrush("TextBrush")));
         stack.Children.Add(Text($"状态：{status}    问题数量：{findingCount}    耗时：{elapsed:0.###} 秒", 13, null, FindBrush("MutedBrush"), new Thickness(0, 5, 0, 10), true));
 
-        if (TryRenderMergedRuleFindings(stack, root, moduleCode))
+        if (moduleCode == "duplicate" && TryRenderDuplicateFindings(stack, root))
+        {
+            // 重复建设结果按内部重复和跨报告重复分组展示。
+        }
+        else if (TryRenderMergedRuleFindings(stack, root, moduleCode))
         {
             // 已合并展示小规则 findings，不再重复渲染顶层 findings。
         }
@@ -2009,6 +2080,53 @@ public partial class MainWindow : Window
         }
 
         return true;
+    }
+
+    private bool TryRenderDuplicateFindings(Panel target, JsonElement root)
+    {
+        if (!root.TryGetProperty("findings", out var findings)
+            || findings.ValueKind != JsonValueKind.Array)
+        {
+            return false;
+        }
+
+        var internalFindings = new List<JsonElement>();
+        var crossFindings = new List<JsonElement>();
+        foreach (var finding in findings.EnumerateArray())
+        {
+            var comparisonType = GetString(finding, "comparison_type");
+            if (comparisonType == "cross_report")
+            {
+                crossFindings.Add(finding);
+            }
+            else
+            {
+                internalFindings.Add(finding);
+            }
+        }
+
+        RenderDuplicateFindingGroup(target, "本报告内部重复", internalFindings, "未发现本报告内部重复功能点。");
+        RenderDuplicateFindingGroup(target, "与往期报告重复", crossFindings, "未发现与往期报告重复的功能点。");
+        return true;
+    }
+
+    private void RenderDuplicateFindingGroup(
+        Panel target,
+        string title,
+        IReadOnlyCollection<JsonElement> findings,
+        string emptyText)
+    {
+        target.Children.Add(Text($"{title}（{findings.Count}）", 15, FontWeights.Bold, FindBrush("TextBrush"), new Thickness(0, 10, 0, 8), true));
+        if (findings.Count == 0)
+        {
+            target.Children.Add(Text(emptyText, 13, null, FindBrush("MutedBrush"), new Thickness(0, 0, 0, 10), true));
+            return;
+        }
+
+        foreach (var finding in findings)
+        {
+            target.Children.Add(BuildFunctionFindingCard(finding));
+        }
     }
 
     private Border BuildFunctionFindingCard(JsonElement finding)
