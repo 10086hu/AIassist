@@ -354,6 +354,8 @@ def _normalize_review(payload: dict[str, Any], model: str, finding: dict[str, An
     raw_text = _short_text(payload.get("_raw_text") or payload.get("content") or "")
     fallback_suggestion = str(finding.get("suggestion") or "")
     fallback_basis = str(finding.get("evidence") or finding.get("source_section") or context or "")
+    display_title = _short_text(payload.get("display_title") or payload.get("title") or payload.get("issue_title"), 80)
+    feature_label = _short_text(payload.get("feature_label") or payload.get("item_label"), 80)
     user_reason = _short_text(payload.get("user_reason") or payload.get("reason") or raw_text)
     user_suggestion = _short_text(
         payload.get("user_suggestion")
@@ -366,11 +368,15 @@ def _normalize_review(payload: dict[str, Any], model: str, finding: dict[str, An
     return {
         "enabled": True,
         "model": model,
+        "display_title": display_title,
+        "feature_label": feature_label,
         "judgement": _string_value(payload.get("judgement") if payload.get("judgement") is not None else payload.get("is_valid")) or ("模型返回自然语言复核意见" if raw_text else ""),
         "risk_level_suggestion": _string_value(payload.get("risk_level_suggestion") or payload.get("risk_level")),
         "user_reason": user_reason,
         "user_suggestion": user_suggestion,
         "user_basis": user_basis,
+        "evidence_summary": _short_text(payload.get("evidence_summary") or user_basis),
+        "revision_advice": _short_text(payload.get("revision_advice") or user_suggestion),
         "reason": user_reason,
         "rewrite_suggestion": user_suggestion,
         "confidence": payload.get("confidence"),
@@ -405,6 +411,37 @@ def _build_prompt(module_code: str, rule: dict[str, Any], finding: dict[str, Any
             "输出JSON字段": {
                 "judgement": "是否真实构成敏感风险",
                 "scene_type": "拟采用/现状描述/政策引用/历史系统描述/需人工确认",
+                "risk_level_suggestion": "高/中/低/需人工确认/通过",
+                "user_reason": "用户可读原因",
+                "user_suggestion": "用户可执行修改建议",
+                "user_basis": "规则、章节、上下文或证据依据概括",
+                "need_human_review": True,
+                "confidence": 0.8,
+            },
+        }
+    elif module_code == "content_consistency":
+        payload = {
+            "任务": "建设内容一致性第十条结果语义复核，并整理成类似其他小规则的简洁问题结果",
+            "规则名称": finding.get("rule_name") or rule.get("rule_name"),
+            "规则描述": rule.get("rule_detail") or finding.get("rule_detail"),
+            "疑似功能点": finding.get("item") or finding.get("feature"),
+            "原始功能点": finding.get("raw_item"),
+            "问题标题": finding.get("description"),
+            "原始原因": finding.get("reason"),
+            "原始建议": finding.get("suggestion"),
+            "证据片段": finding.get("evidence") or finding.get("evidence_examples") or context,
+            "所在章节": finding.get("source_section"),
+            "当前风险等级": finding.get("risk_level"),
+            "要求": [
+                "先判断疑似功能点是否为具体建设功能；如果原始功能点包含逗号、顿号或“数据中台-”等父级前缀，只提炼最短的具体功能点名称。",
+                "display_title 要像其他小规则一样简洁，不要罗列多个前缀或整段原文；优先使用“功能点对应说明不足：具体功能点”。",
+                "复核是否确实缺少需求分析、建设内容、功能点设计或投资概算之间的对应说明，不要覆盖规则检查结论。",
+                "user_reason、user_suggestion、user_basis 每项控制在60到120字。",
+            ],
+            "输出JSON字段": {
+                "display_title": "功能点对应说明不足：具体功能点",
+                "feature_label": "最短具体功能点名称",
+                "judgement": "是否确实存在建设内容一致性问题",
                 "risk_level_suggestion": "高/中/低/需人工确认/通过",
                 "user_reason": "用户可读原因",
                 "user_suggestion": "用户可执行修改建议",

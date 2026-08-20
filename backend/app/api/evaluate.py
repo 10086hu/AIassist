@@ -835,14 +835,14 @@ def _build_content_consistency_rule_result(
         )
         consistency_result = _normalize_document_rule_result(
             consistency_raw,
-            "function_correspondence",
+            "content_consistency",
             use_llm=use_llm,
         )
         consistency_findings = [dict(item) for item in consistency_result.get("findings") or []]
         for finding in consistency_findings:
             finding["rule_id"] = rule_id
             finding["rule_name"] = rule_name
-            finding["display_title"] = rule_name
+            finding["display_title"] = finding.get("display_title") or finding.get("issue_type") or rule_name
             finding["rule_basis"] = rule_name
             finding["source"] = "content_consistency"
             finding["risk_level"] = _normalize_issue_degree(finding.get("risk_level") or "需人工确认")
@@ -1191,12 +1191,23 @@ def _normalize_document_rule_result(result: dict[str, Any], module: str, use_llm
         if not issues and not rule_result.get("passed", False):
             issues = [{"message": rule_result.get("summary") or "该规则需要人工复核"}]
         for issue in issues:
+            issue_type = issue.get("issue_type") or rule_result.get("issue_type")
+            item = issue.get("item")
+            evidence = issue.get("evidence")
             findings.append(
                 {
-                    "display_title": rule_name,
+                    "display_title": issue_type or rule_name,
+                    "issue_type": issue_type,
+                    "item": item,
+                    "raw_item": issue.get("raw_item"),
+                    "feature": item or issue.get("feature"),
                     "risk_level": _normalize_issue_degree(issue.get("severity") or rule_result.get("severity") or "需人工确认"),
                     "review_opinion": issue.get("message") or rule_result.get("summary") or "规则检查发现需复核事项。",
-                    "evidence_summary": issue.get("evidence") or issue.get("section") or "",
+                    "evidence_summary": (
+                        f"系统在“{issue.get('section') or module}”中识别到该功能点对应关系不足；原始条目已保留在证据明细。"
+                        if item and evidence
+                        else evidence or issue.get("section") or ""
+                    ),
                     "revision_advice": _first_text(suggestions) or "请根据规则要求补充说明、核对数据或调整相关章节表述。",
                     "rule_basis": rule_name,
                     "rule_id": rule_id,

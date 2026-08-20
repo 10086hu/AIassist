@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from typing import Any
 
@@ -176,6 +177,26 @@ def _template_refine(module_code: str, finding: dict[str, Any]) -> dict[str, Any
             finding.get("revision_advice"),
             "请核对安全服务、PaaS、密码服务、服务器、操作系统、数据库服务器和数据库等资源数量是否一致。",
         )
+    elif module_code == "content_consistency":
+        feature = _content_feature_name(finding)
+        missing_targets = _missing_target_summary(finding.get("review_opinion"))
+        display_title = _content_consistency_title(finding, feature)
+        if feature and feature != "相关功能点":
+            missing_text = f"但缺少{missing_targets}中的对应说明，" if missing_targets else "但对应说明不完整，"
+            review_opinion = f"“{feature}”已在报告部分章节出现，{missing_text}需要复核补充。"
+        else:
+            review_opinion = _first_text(
+                finding.get("review_opinion"),
+                "规则检查发现需求、建设内容、功能设计或投资概算之间的对应关系需复核。",
+            )
+        evidence_summary = _first_text(
+            finding.get("evidence_summary"),
+            f"系统依据“{source_section}”及相关证据片段形成该项判断。",
+        )
+        revision_advice = _first_text(
+            finding.get("revision_advice"),
+            "请补充该功能点在需求来源、建设内容、功能设计和投资概算之间的对应关系说明。",
+        )
     elif module_code == "sensitive_word":
         hit_text = _first_text(finding.get("hit_text"), raw_issue_type)
         scene = _first_text(finding.get("scene_type"), "需结合上下文核验")
@@ -192,14 +213,23 @@ def _template_refine(module_code: str, finding: dict[str, Any]) -> dict[str, Any
     else:
         feature = _feature_name(finding)
         display_title = _function_title(raw_issue_type)
-        review_opinion = (
-            f"报告中提到了“{feature}”，但在建设内容、业务需求或投资预算中未看到充分对应说明，"
-            "可能导致建设必要性和投入合理性支撑不足。"
+        review_opinion = _first_text(
+            finding.get("review_opinion"),
+            (
+                f"报告中提到了“{feature}”，但在建设内容、业务需求或投资预算中未看到充分对应说明，"
+                "可能导致建设必要性和投入合理性支撑不足。"
+            ),
         )
-        evidence_summary = f"系统在“{source_section}”中发现相关功能表述，但未在前后章节识别到充分的需求来源或预算支撑。"
-        revision_advice = (
-            "建议在业务需求分析或建设内容章节中补充该功能点的建设依据、应用场景、服务对象和预期成效；"
-            "如涉及预算，应同步说明其与投资项的对应关系。"
+        evidence_summary = _first_text(
+            finding.get("evidence_summary"),
+            f"系统在“{source_section}”中发现相关功能表述，但未在前后章节识别到充分的需求来源或预算支撑。",
+        )
+        revision_advice = _first_text(
+            finding.get("revision_advice"),
+            (
+                "建议在业务需求分析或建设内容章节中补充该功能点的建设依据、应用场景、服务对象和预期成效；"
+                "如涉及预算，应同步说明其与投资项的对应关系。"
+            ),
         )
 
     return {
@@ -222,6 +252,11 @@ def _llm_group_payload(finding: dict[str, Any]) -> dict[str, Any]:
     return {
         "description": finding.get("display_title"),
         "issue_type": finding.get("raw_issue_type"),
+        "reason": finding.get("review_opinion"),
+        "evidence": finding.get("evidence_summary"),
+        "item": finding.get("item"),
+        "raw_item": finding.get("raw_item"),
+        "feature": finding.get("feature"),
         "risk_level": finding.get("risk_level"),
         "rule_name": finding.get("rule_basis"),
         "source_section": finding.get("source_section"),
@@ -233,7 +268,19 @@ def _llm_group_payload(finding: dict[str, Any]) -> dict[str, Any]:
 
 def _llm_group_context(finding: dict[str, Any]) -> str:
     examples = finding.get("evidence_examples") or []
-    text = "\n".join(str(item) for item in examples[:3])
+    parts = [
+        finding.get("review_opinion"),
+        finding.get("evidence_summary"),
+        *examples[:3],
+    ]
+    seen: set[str] = set()
+    values: list[str] = []
+    for item in parts:
+        text = str(item or "").strip()
+        if text and text not in seen:
+            values.append(text)
+            seen.add(text)
+    text = "\n".join(values)
     return _truncate(text, 800)
 
 
@@ -251,6 +298,9 @@ def _apply_llm_review_to_business_finding(finding: dict[str, Any], review: dict[
         finding["revision_advice"] = _truncate(advice, 260)
     if basis:
         finding["evidence_summary"] = _truncate(basis, 260)
+    feature_label = _first_text(review.get("feature_label"), review.get("item_label"))
+    if feature_label:
+        finding["item"] = _truncate(feature_label, 80)
     if review.get("risk_level_suggestion"):
         finding["llm_risk_level_suggestion"] = review["risk_level_suggestion"]
     finding["llm_refined"] = True
@@ -282,7 +332,13 @@ def _evidence_examples(finding: dict[str, Any]) -> list[str]:
 
 
 def _feature_name(finding: dict[str, Any]) -> str:
-    text = _first_text(finding.get("description"), finding.get("feature"), finding.get("issue_type"), "相关功能点")
+    text = _first_text(
+        finding.get("description"),
+        finding.get("feature"),
+        finding.get("item"),
+        finding.get("issue_type"),
+        "相关功能点",
+    )
     for marker in ("“", "【"):
         if marker in text:
             end_marker = "”" if marker == "“" else "】"
@@ -302,6 +358,56 @@ def _function_title(issue_type: str) -> str:
     if "建设内容" in text:
         return "功能表述与建设内容对应不足"
     return "建设功能对应关系需补充说明"
+
+
+def _content_feature_name(finding: dict[str, Any]) -> str:
+    text = _feature_name(finding)
+    list_parts = [
+        part.strip()
+        for part in re.split(r"[，,、；;]+", text)
+        if part.strip()
+    ]
+    if list_parts:
+        text = list_parts[0]
+    hierarchy_parts = [
+        part.strip()
+        for part in re.split(r"[-－—_/]+", text)
+        if part.strip()
+    ]
+    if len(hierarchy_parts) >= 2 and _is_generic_parent_label(hierarchy_parts[0]):
+        text = hierarchy_parts[-1]
+    return _truncate(text, 32)
+
+
+def _content_consistency_title(finding: dict[str, Any], feature: str) -> str:
+    issue_type = _first_text(finding.get("issue_type"), finding.get("raw_issue_type"))
+    source_section = _first_text(finding.get("source_section"), finding.get("section"))
+    if "未识别" in _first_text(finding.get("review_opinion")):
+        return f"缺少相关章节内容：{_truncate(source_section or feature or '建设内容', 24)}"
+    if feature and feature != "相关功能点":
+        return f"功能点对应说明不足：{feature}"
+    return _first_text(issue_type, "建设内容对应关系需补充")
+
+
+def _missing_target_summary(value: Any) -> str:
+    text = str(value or "")
+    marker = "但缺少"
+    if marker not in text:
+        return ""
+    missing = text.split(marker, 1)[1]
+    missing = missing.split("中的对应说明", 1)[0]
+    return _truncate(missing.strip(" ，,。；;"), 40)
+
+
+def _is_generic_parent_label(value: str) -> bool:
+    normalized = re.sub(r"[\s　]+", "", value or "").lower()
+    return normalized.endswith(("中台", "平台", "系统", "中心")) or normalized in {
+        "数据中台",
+        "业务中台",
+        "ai中台",
+        "建设内容",
+        "项目",
+    }
 
 
 def _sensitive_title(hit_text: str, risk_level: str) -> str:

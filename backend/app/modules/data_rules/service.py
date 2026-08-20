@@ -79,8 +79,20 @@ DATA_REASONABLENESS_RULES: tuple[dict[str, Any], ...] = (
 )
 
 
+NUMBER_TEXT = r"[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
 MONEY_PATTERN = re.compile(
-    r"(?P<number>[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)\s*(?P<unit>万元|万|元)?"
+    rf"(?<![A-Za-z0-9_.])(?P<currency>人民币|RMB|¥|￥)?\s*"
+    rf"(?P<number>{NUMBER_TEXT})\s*"
+    r"(?:(?:[（(]\s*)?(?P<unit>万元|万\s*元|元|万)(?:\s*[）)])?)?"
+    r"(?!\s*(?:\+|个|台|套|块|条|项|人|次|年|月|日|天|小时|页|张|路|颗|份|类|核|票|字节|"
+    r"GB|MB|TB|KB|G|M|GHz|MHz|%|％|[A-Za-z]*B))",
+    re.IGNORECASE,
+)
+NUMBER_PATTERN = re.compile(rf"(?<![A-Za-z0-9_.])(?P<number>{NUMBER_TEXT})(?![A-Za-z0-9_.])")
+NON_MONEY_UNIT_RE = re.compile(
+    r"^\s*(?:个|台|套|块|条|项|人|次|年|月|日|天|小时|页|张|路|颗|份|类|核|"
+    r"GB|MB|TB|KB|G|M|GHz|MHz|%|％)",
+    re.IGNORECASE,
 )
 
 FINANCIAL_KEYWORDS = (
@@ -98,6 +110,51 @@ FINANCIAL_KEYWORDS = (
     "元",
 )
 
+FINANCIAL_CONTEXT_KEYWORDS = (
+    "投资",
+    "预算",
+    "概算",
+    "估算",
+    "金额",
+    "费用",
+    "经费",
+    "资金",
+    "成本",
+    "造价",
+    "单价",
+    "总价",
+    "报价",
+    "购置费",
+    "开发费",
+    "服务费",
+    "建设费",
+    "总计",
+    "合计",
+    "小计",
+)
+
+AMOUNT_COLUMN_KEYWORDS = (
+    "金额",
+    "投资",
+    "预算",
+    "概算",
+    "估算",
+    "费用",
+    "经费",
+    "资金",
+    "成本",
+    "造价",
+    "单价",
+    "总价",
+    "合价",
+    "报价",
+    "小计",
+    "合计",
+    "总计",
+    "万元",
+    "元",
+)
+
 PROJECT_TOTAL_KEYWORDS = (
     "项目总投资",
     "项目投资总额",
@@ -110,6 +167,25 @@ PROJECT_TOTAL_KEYWORDS = (
 
 DETAIL_TOTAL_KEYWORDS = ("总计", "合计")
 
+NON_AMOUNT_COLUMN_KEYWORDS = (
+    "数量",
+    "单位",
+    "规格",
+    "配置",
+    "容量",
+    "内存",
+    "硬盘",
+    "CPU",
+    "工作量",
+    "人月",
+    "服务期",
+    "建设周期",
+    "周期",
+    "月份",
+    "条数",
+    "页数",
+)
+
 INTELLIGENT_KEYWORDS = (
     "智能化",
     "智能应用",
@@ -121,7 +197,6 @@ INTELLIGENT_KEYWORDS = (
     "智能识别",
     "智能分析",
 )
-
 
 def run_data_rules_check_from_document(
     content: bytes,
@@ -197,7 +272,7 @@ def run_data_reporting_check_from_document(
 def _evaluate_budget_consistency(document: DocumentContent) -> RuleResult:
     lines = _meaningful_lines(document.raw_text)
     amount_lines = [
-        (index, line, _extract_amounts_from_line(line, document.raw_text))
+        (index, line, _extract_amounts_from_line(lines, index, document.raw_text))
         for index, line in enumerate(lines)
     ]
     amount_lines = [
@@ -283,13 +358,13 @@ def _evaluate_budget_consistency(document: DocumentContent) -> RuleResult:
         hard_fail = bool(project_totals and len(project_totals) > 1) or bool(arithmetic_issues)
         if project_totals and detail_total_candidates:
             hard_fail = True
-        status = "发现问题" if hard_fail else "需人工确认"
-        severity = "高" if hard_fail else "需人工确认"
+        status = "failed" if hard_fail else "warning"
+        severity = "risk" if hard_fail else "warning"
         passed = False
         summary = "项目预算一致性存在需复核事项。"
     else:
-        status = "通过"
-        severity = "通过"
+        status = "passed"
+        severity = "pass"
         passed = True
         summary = "未发现项目总投资、预算合计和可识别合计行之间的不一致。"
 
@@ -550,31 +625,253 @@ def _contains_any(text: str, keywords: Iterable[str]) -> bool:
     return any(keyword in text for keyword in keywords)
 
 
-def _extract_amounts_from_line(line: str, full_text: str) -> list[float]:
-    value_text = re.sub(r"^(?:表\d+行\d+|第\d+页表\d+行\d+)\t", "", line)
-    numeric_matches = list(MONEY_PATTERN.finditer(value_text))
-    looks_like_numeric_table_row = "\t" in line and len(numeric_matches) >= 2
+def _extract_amounts_from_line(lines: list[str], index: int, full_text: str) -> list[float]:
+    line = lines[index]
+    value_text = _strip_table_prefix(line)
+    explicit_matches = [
+        match
+        for match in MONEY_PATTERN.finditer(value_text)
+        if match.group("currency") or match.group("unit")
+    ]
 
-    if not _contains_any(line, FINANCIAL_KEYWORDS) and not looks_like_numeric_table_row:
+    context_text = _line_context(lines, index)
+    budget_context = _is_budget_amount_context(value_text, context_text)
+
+    amounts: list[float] = []
+    for match in explicit_matches:
+        if not _money_match_is_budget_amount(value_text, match, budget_context):
+            continue
+        unit = (match.group("unit") or "").replace(" ", "")
+        if unit == "万" and not _bare_wan_looks_like_money(value_text, match, budget_context):
+            continue
+        amount = _money_match_to_wan(match)
+        if amount is not None and _amount_is_reasonable(amount):
+            amounts.append(amount)
+
+    if budget_context:
+        amounts.extend(_extract_unitless_budget_amounts(lines, index, value_text, context_text))
+
+    return _dedupe_amounts(amounts)
+
+
+def _strip_table_prefix(line: str) -> str:
+    return re.sub(r"^(?:表\d+行\d+|第\d+页表\d+行\d+)\t", "", line)
+
+
+def _line_context(lines: list[str], index: int, window: int = 4) -> str:
+    start = max(0, index - window)
+    return "\n".join(_strip_table_prefix(line) for line in lines[start : index + 1])
+
+
+def _is_budget_amount_context(value_text: str, context_text: str) -> bool:
+    compact_context = re.sub(r"\s+", "", context_text)
+    has_financial_context = _contains_any(compact_context, FINANCIAL_CONTEXT_KEYWORDS)
+    has_local_money_unit = _has_amount_unit_text(compact_context)
+    has_amount_column = _contains_any(compact_context, AMOUNT_COLUMN_KEYWORDS)
+
+    # 单纯出现在资源清单、配置清单中的数字，即使附近有“单位”，也不能按预算金额处理。
+    if _looks_like_resource_quantity_context(value_text) and not has_financial_context:
+        return False
+
+    return has_financial_context and (has_local_money_unit or has_amount_column)
+
+
+def _has_amount_unit_text(text: str) -> bool:
+    return bool(
+        re.search(
+            r"(单位|金额|投资|预算|概算|估算|费用|经费|资金|成本|造价|总价|合计|总计).*?"
+            r"(万元|元(?![\u4e00-\u9fffA-Za-z]))",
+            text,
+        )
+    )
+
+
+def _looks_like_resource_quantity_context(text: str) -> bool:
+    return bool(
+        re.search(
+            r"(?:数量|配置|规格|容量|内存|硬盘|CPU|服务器|数据库|操作系统|交换机|防火墙|存储|"
+            r"GB|MB|TB|KB|GHz|MHz|个|台|套|块|条|核)",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _extract_unitless_budget_amounts(
+    lines: list[str],
+    index: int,
+    value_text: str,
+    context_text: str,
+) -> list[float]:
+    if not _has_local_wan_unit(context_text):
         return []
 
-    default_to_wan = bool(re.search(r"单位\s*[:：]?\s*万元|单位\s*[:：]?\s*万", full_text))
     amounts: list[float] = []
-    for match in numeric_matches:
-        raw_number = match.group("number")
-        unit = match.group("unit")
-        value = float(raw_number.replace(",", ""))
-
-        if not unit:
-            if not default_to_wan and not looks_like_numeric_table_row and value < 10:
+    table_cells = value_text.split("\t") if "\t" in value_text else []
+    if table_cells:
+        header_cells = _nearest_table_header_cells(lines, index, len(table_cells))
+        if not header_cells:
+            return []
+        for cell_index, cell in enumerate(table_cells):
+            if _cell_has_explicit_money(cell):
                 continue
-            if value < 1:
+            if not _table_cell_is_amount_column(cell_index, cell, header_cells, value_text):
                 continue
+            unit = _amount_unit_for_cell(cell_index, header_cells, context_text)
+            for match in NUMBER_PATTERN.finditer(cell):
+                if _number_has_non_money_unit(cell, match):
+                    continue
+                if _looks_like_ordinal_or_year(cell, match, cell_index):
+                    continue
+                value = float(match.group("number").replace(",", ""))
+                if unit == "元":
+                    value = value / 10000
+                if _amount_is_reasonable(value):
+                    amounts.append(round(value, 4))
+        return amounts
 
-        if unit == "元":
-            value = value / 10000
-        amounts.append(round(value, 4))
-    return amounts
+    return []
+
+
+def _has_local_wan_unit(context_text: str) -> bool:
+    compact_context = re.sub(r"\s+", "", context_text)
+    return _has_amount_unit_text(compact_context)
+
+
+def _nearest_table_header_cells(lines: list[str], index: int, cell_count: int) -> list[str]:
+    current_table = _table_id(lines[index])
+    if not current_table:
+        return []
+
+    for previous in range(index - 1, max(-1, index - 10), -1):
+        if _table_id(lines[previous]) != current_table:
+            continue
+        cells = _strip_table_prefix(lines[previous]).split("\t")
+        if len(cells) != cell_count:
+            continue
+        if _contains_any("".join(cells), (*AMOUNT_COLUMN_KEYWORDS, "数量", "单位", "规格")):
+            return cells
+    return []
+
+
+def _table_id(line: str) -> str | None:
+    match = re.match(r"^(表\d+|第\d+页表\d+)行\d+\t", line)
+    return match.group(1) if match else None
+
+
+def _cell_has_explicit_money(cell: str) -> bool:
+    return any(match.group("currency") or match.group("unit") for match in MONEY_PATTERN.finditer(cell))
+
+
+def _money_match_is_budget_amount(text: str, match: re.Match[str], budget_context: bool) -> bool:
+    if _number_has_non_money_unit(text, match):
+        return False
+
+    prefix = text[max(0, match.start() - 12) : match.start()]
+    suffix = text[match.end() : match.end() + 12]
+    local_context = prefix + suffix
+    if _looks_like_resource_quantity_context(local_context) and not _contains_any(text, FINANCIAL_CONTEXT_KEYWORDS):
+        return False
+
+    currency = bool(match.group("currency"))
+    unit = (match.group("unit") or "").replace(" ", "")
+    if unit == "万":
+        return _bare_wan_looks_like_money(text, match, budget_context)
+    if unit in {"万元", "元"}:
+        return currency or budget_context or _contains_any(text, FINANCIAL_CONTEXT_KEYWORDS)
+    return currency and not _looks_like_resource_quantity_context(local_context)
+
+
+def _table_cell_is_amount_column(
+    cell_index: int,
+    cell: str,
+    header_cells: list[str],
+    row_text: str,
+) -> bool:
+    if cell_index == 0 and re.fullmatch(r"\d+(?:\.\d+)?", cell.strip()):
+        return False
+
+    if header_cells and cell_index < len(header_cells):
+        header = header_cells[cell_index]
+        if _contains_any(header, ("数量", "规格", "配置", "单位", "容量")):
+            return False
+        if _contains_any(header, NON_AMOUNT_COLUMN_KEYWORDS):
+            return False
+        if _contains_any(header, AMOUNT_COLUMN_KEYWORDS):
+            return True
+        return False
+
+    return False
+
+
+def _amount_unit_for_cell(cell_index: int, header_cells: list[str], context_text: str) -> str:
+    header = header_cells[cell_index] if header_cells and cell_index < len(header_cells) else ""
+    compact_header = re.sub(r"\s+", "", header)
+    if "万元" in compact_header:
+        return "万元"
+    if "元" in compact_header:
+        return "元"
+
+    compact_context = re.sub(r"\s+", "", context_text)
+    if "单位:万元" in compact_context or "单位：万元" in compact_context or "（万元）" in compact_context:
+        return "万元"
+    if "单位:元" in compact_context or "单位：元" in compact_context or "（元）" in compact_context:
+        return "元"
+    return "万元"
+
+
+def _money_match_to_wan(match: re.Match[str]) -> float | None:
+    raw_number = match.group("number")
+    unit = (match.group("unit") or "").replace(" ", "")
+    value = float(raw_number.replace(",", ""))
+
+    if unit == "元":
+        value = value / 10000
+    return round(value, 4)
+
+
+def _bare_wan_looks_like_money(text: str, match: re.Match[str], budget_context: bool) -> bool:
+    suffix = text[match.end() : match.end() + 8]
+    if re.match(r"\s*(?:\+|票|条|个|台|套|块|项|人|次|年|月|日|样本|记录|数据)", suffix):
+        return False
+    if _looks_like_resource_quantity_context(text):
+        return False
+    return budget_context and _contains_any(text, ("金额", "费用", "经费", "投资", "预算", "概算", "估算", "单价", "总价", "采购", "服务费"))
+
+
+def _number_has_non_money_unit(text: str, match: re.Match[str]) -> bool:
+    suffix = text[match.end() : match.end() + 8]
+    return bool(NON_MONEY_UNIT_RE.match(suffix))
+
+
+def _looks_like_ordinal_or_year(text: str, match: re.Match[str], cell_index: int) -> bool:
+    number_text = match.group("number").replace(",", "")
+    try:
+        value = float(number_text)
+    except ValueError:
+        return True
+
+    if cell_index == 0 and value < 1000 and re.fullmatch(r"\s*" + re.escape(match.group("number")) + r"\s*", text):
+        return True
+    if value < 1:
+        return True
+    if 1900 <= value <= 2100 and re.search(r"年|年度", text):
+        return True
+    if cell_index == 0 and value < 10 and not _contains_any(text, ("合计", "总计", "小计", "金额", "费用", "投资", "预算", "概算", "估算")):
+        return True
+    return False
+
+
+def _amount_is_reasonable(amount_wan: float) -> bool:
+    return amount_wan >= 0.0001
+
+
+def _dedupe_amounts(amounts: list[float]) -> list[float]:
+    deduped: list[float] = []
+    for amount in amounts:
+        if not any(_amounts_close(amount, existing) for existing in deduped):
+            deduped.append(amount)
+    return deduped
 
 
 def _pick_representative_amount(amounts: list[float]) -> float:
@@ -629,6 +926,7 @@ def _find_total_row_arithmetic_issues(
                 )
             )
     return issues
+
 
 
 def _collect_indicator_lines(lines: list[str]) -> list[str]:
