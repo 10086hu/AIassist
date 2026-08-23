@@ -8,6 +8,8 @@ import urllib.error
 import urllib.request
 from typing import Any
 
+from app.core.llm_json import parse_json_object_from_text
+
 
 DEFAULT_MODEL = "deepseek-v4-flash"
 DEFAULT_API_BASE_URL = "https://api.deepseek.com"
@@ -138,6 +140,45 @@ def review_finding_with_llm(
             max_tokens=700,
         )
         normalized = _normalize_review(payload, model, finding, context or "")
+        normalized["enabled"] = True
+        normalized["llm_available"] = True
+        return normalized
+    except Exception as exc:
+        return {
+            "enabled": True,
+            "model": model,
+            "llm_available": False,
+            "llm_error": _safe_error_message(exc),
+            "llm_error_type": _error_type(exc),
+        }
+
+
+def review_security_document_with_llm(
+    rule: dict[str, Any],
+    packet: dict[str, Any],
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    api_key = os.getenv("DEEPSEEK_API_KEY")
+    model = get_llm_model()
+    if not api_key:
+        return {
+            "enabled": False,
+            "model": model,
+            "llm_available": False,
+            "llm_error": "missing_api_key",
+            "llm_error_type": "missing_api_key",
+        }
+
+    prompt = _build_security_prompt(rule, packet)
+    try:
+        payload = _call_deepseek(
+            prompt=prompt,
+            api_key=api_key,
+            model=model,
+            timeout=timeout,
+            max_tokens=700,
+        )
+        normalized = _normalize_security_review(payload, model, packet)
         normalized["enabled"] = True
         normalized["llm_available"] = True
         return normalized
@@ -298,13 +339,16 @@ def _parse_model_content(content: str) -> dict[str, Any]:
         if text.lower().startswith("json"):
             text = text[4:].strip()
     try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
+        parsed = parse_json_object_from_text(text)
+    except Exception:
         start = text.find("{")
         end = text.rfind("}")
         if start < 0 or end <= start:
             return {"content": text, "_raw_text": text}
-        parsed = json.loads(text[start : end + 1])
+        try:
+            parsed = parse_json_object_from_text(text[start : end + 1])
+        except Exception:
+            return {"content": text, "_raw_text": text}
     if not isinstance(parsed, dict):
         return {"content": text, "_raw_text": text}
     return parsed
@@ -450,6 +494,49 @@ def _build_prompt(module_code: str, rule: dict[str, Any], finding: dict[str, Any
                 "confidence": 0.8,
             },
         }
+    elif module_code == "security":
+        payload = {
+            "任务": "安全内容合理性 / 安全需求分析合规性审查",
+            "规则名称": finding.get("rule_name") or rule.get("rule_name"),
+            "规则描述": rule.get("rule_detail") or finding.get("rule_detail"),
+            "审查目标": "判断4.7安全需求分析是否满足要求，6.6仅作为辅助佐证",
+            "本地抽取摘要": {
+                "4.7存在": finding.get("section_4_7_present"),
+                "4.7章节标题": finding.get("section_4_7_heading"),
+                "4.7原文片段": finding.get("section_4_7_excerpt"),
+                "6.6存在": finding.get("section_6_6_present"),
+                "6.6章节标题": finding.get("section_6_6_heading"),
+                "6.6原文片段": finding.get("section_6_6_excerpt"),
+                "识别到的安全等级": {
+                    "4.7": finding.get("security_level_4_7"),
+                    "6.6": finding.get("security_level_6_6"),
+                },
+                "4.7覆盖关键词": finding.get("coverage_4_7") or [],
+                "6.6覆盖关键词": finding.get("coverage_6_6") or [],
+                "本地初判": finding.get("review_opinion"),
+            },
+            "判定要求": [
+                "以4.7为主进行判断，6.6只作为辅助佐证，不要把6.6当成主审查对象。",
+                "检查是否明确安全风险分析、信息系统安全等级定位、数据分类分级、安全防护措施和密码应用措施。",
+                "如果4.7缺少上述核心内容，直接判为不通过。",
+                "如果4.7与6.6的安全等级表述不一致，请指出冲突点。",
+                "只输出合法 JSON 对象，不要输出 Markdown 或解释文字。",
+            ],
+            "输出JSON字段": {
+                "passed": True,
+                "judgement": "通过/不通过/需人工确认",
+                "risk_level_suggestion": "通过/低/中/高/需人工确认",
+                "issue_type": "章节缺失/安全等级不一致/数据分类分级缺失/密码应用措施缺失/安全防护措施缺失/通过",
+                "user_reason": "结论原因，80到160字",
+                "user_suggestion": "修改建议，80到160字",
+                "user_basis": "依据4.7/6.6原文片段概括，80到160字",
+                "sections_used": ["4.7", "6.6"],
+                "missing_points": ["数据分类分级", "密码应用措施"],
+                "matched_points": ["安全风险分析", "安全等级定位"],
+                "need_human_review": True,
+                "confidence": 0.8,
+            },
+        }
     else:
         payload = {
             "任务": "建设功能对应关系检查结果语义复核，并整理成用户可读文本",
@@ -478,6 +565,124 @@ def _build_prompt(module_code: str, rule: dict[str, Any], finding: dict[str, Any
             },
         }
     return json.dumps(payload, ensure_ascii=False)
+
+
+def _build_security_prompt(rule: dict[str, Any], packet: dict[str, Any]) -> str:
+    payload = {
+        "任务": "安全内容合理性 / 安全需求分析合规性审查",
+        "规则名称": rule.get("rule_name"),
+        "规则类别": rule.get("rule_category"),
+        "规则描述": rule.get("rule_detail"),
+        "判断条件": "4.7安全需求分析是否满足要求",
+        "审查重点": [
+            "是否分析系统的安全风险",
+            "是否对信息系统安全等级给予准确定位",
+            "是否描述数据分类分级",
+            "是否描述所需的安全防护措施",
+            "是否描述密码应用措施",
+        ],
+        "本地抽取摘要": {
+            "4.7存在": packet.get("section_4_7_present"),
+            "4.7章节标题": packet.get("section_4_7_heading"),
+            "4.7原文片段": packet.get("section_4_7_excerpt"),
+            "6.6存在": packet.get("section_6_6_present"),
+            "6.6章节标题": packet.get("section_6_6_heading"),
+            "6.6原文片段": packet.get("section_6_6_excerpt"),
+            "识别到的安全等级": {
+                "4.7": packet.get("security_level_4_7"),
+                "6.6": packet.get("security_level_6_6"),
+            },
+            "4.7覆盖关键词": packet.get("coverage_4_7") or [],
+            "6.6覆盖关键词": packet.get("coverage_6_6") or [],
+            "本地初判": packet.get("local_reason"),
+        },
+        "输出JSON字段": {
+            "passed": True,
+            "judgement": "通过/不通过/需人工确认",
+            "risk_level_suggestion": "通过/低/中/高/需人工确认",
+            "issue_type": "章节缺失/安全等级不一致/数据分类分级缺失/密码应用措施缺失/安全防护措施缺失/通过",
+            "user_reason": "结论原因，80到160字",
+            "user_suggestion": "修改建议，80到160字",
+            "user_basis": "依据4.7/6.6原文片段概括，80到160字",
+            "sections_used": ["4.7", "6.6"],
+            "missing_points": ["数据分类分级", "密码应用措施"],
+            "matched_points": ["安全风险分析", "安全等级定位"],
+            "need_human_review": True,
+            "confidence": 0.8,
+        },
+        "判定要求": [
+            "以4.7为主进行判断，6.6只作为辅助佐证，不要把6.6当成主审查对象。",
+            "如果4.7已明确安全风险分析、安全等级定位、数据分类分级、安全防护措施和密码应用措施，可判为通过。",
+            "如果存在缺项，请明确缺少的内容并给出可执行修改建议。",
+            "只输出合法 JSON 对象，不要输出 Markdown 或解释文字。",
+        ],
+        "证据片段": {
+            "project_name": packet.get("project_name"),
+            "filename": packet.get("filename"),
+            "sections_used": packet.get("sections_used") or ["4.7", "6.6"],
+            "local_issue_type": packet.get("local_issue_type"),
+            "local_reason": packet.get("local_reason"),
+            "local_suggestion": packet.get("local_suggestion"),
+            "local_missing_points": packet.get("missing_points") or [],
+            "local_matched_points": packet.get("matched_points") or [],
+        },
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _normalize_security_review(payload: dict[str, Any], model: str, packet: dict[str, Any]) -> dict[str, Any]:
+    raw_text = _short_text(payload.get("_raw_text") or payload.get("content") or "")
+    passed_value = payload.get("passed")
+    if passed_value is None:
+        passed_value = str(payload.get("judgement") or "").strip() in {"通过", "合规", "满足要求", "pass", "passed"}
+    passed = bool(passed_value)
+
+    judgement = _string_value(payload.get("judgement") or ("通过" if passed else "不通过"))
+    risk_level = _string_value(payload.get("risk_level_suggestion") or payload.get("risk_level") or ("通过" if passed else "需人工确认"))
+    issue_type = _short_text(
+        payload.get("issue_type")
+        or payload.get("problem_type")
+        or packet.get("local_issue_type")
+        or ("通过" if passed else "需人工确认"),
+        120,
+    )
+    user_reason = _short_text(
+        payload.get("user_reason")
+        or payload.get("reason")
+        or packet.get("local_reason")
+        or raw_text,
+        240,
+    )
+    user_suggestion = _short_text(
+        payload.get("user_suggestion")
+        or payload.get("rewrite_suggestion")
+        or payload.get("suggestion")
+        or packet.get("local_suggestion"),
+        240,
+    )
+    user_basis = _short_text(
+        payload.get("user_basis")
+        or payload.get("basis")
+        or payload.get("evidence_basis")
+        or packet.get("evidence_summary"),
+        240,
+    )
+    return {
+        "passed": passed,
+        "judgement": judgement,
+        "risk_level_suggestion": risk_level,
+        "issue_type": issue_type,
+        "user_reason": user_reason,
+        "user_suggestion": user_suggestion,
+        "user_basis": user_basis,
+        "sections_used": _string_list(payload.get("sections_used") or packet.get("sections_used")),
+        "missing_points": _string_list(payload.get("missing_points") or packet.get("missing_points")),
+        "matched_points": _string_list(payload.get("matched_points") or packet.get("matched_points")),
+        "need_human_review": payload.get("need_human_review"),
+        "confidence": payload.get("confidence"),
+        "evidence_summary": _short_text(payload.get("evidence_summary") or packet.get("evidence_summary") or raw_text, 260),
+        "review_version": "security_document_review_v1",
+    }
 
 
 def _safe_error_message(exc: Exception) -> str:
@@ -513,6 +718,15 @@ def _string_value(value: Any) -> str:
     if isinstance(value, bool):
         return "是" if value else "否"
     return str(value)
+
+
+def _string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value).strip()
+    return [text] if text else []
 
 
 def _short_text(value: Any, max_chars: int = 220) -> str:

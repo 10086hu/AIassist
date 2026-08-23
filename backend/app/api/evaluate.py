@@ -4,6 +4,7 @@ import tempfile
 import threading
 import traceback
 import uuid
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,14 @@ from app.modules.duplicate.service import (
     run_internal_duplicate_check,
 )
 from app.modules.resource.service import run_resource_check_from_file
+from app.modules.price.service import (
+    import_price_benchmarks,
+    import_price_benchmarks_from_file,
+    list_price_benchmarks,
+    run_price_check_from_file,
+)
+from app.modules.price.parser import ParsedPriceDocument, parse_price_document
+from app.modules.shanghai_review.security_review import run_security_check_from_document
 from app.modules.shanghai_review.service import run_basis_check_from_document
 from app.schemas import DuplicateInternalResponse, ResourceCheckResponse
 from app.services.result_refiner import refine_findings
@@ -57,8 +66,11 @@ RUNNABLE_MODULES = {
     "duplicate",
     "function_correspondence",
     "data_reasonableness",
+    "security",
     "resource",
     "sensitive_word",
+    "price",
+    "price_reference",
 }
 CONTENT_CONSISTENCY_RULE_ID = "FUNC_CORR_006"
 CONTENT_CONSISTENCY_RULE_IDS = {"FUNC_CORR_004", "FUNC_CORR_006"}
@@ -74,8 +86,11 @@ MODULE_DISPLAY_NAMES = {
     "function_correspondence": "建设功能的对应关系检查",
     "content_consistency": "建设内容一致性检查",
     "data_reasonableness": "数据填报合理性检查",
+    "security": "安全内容的合理性",
     "resource": "资源申请合理性检查",
     "sensitive_word": "敏感词检查",
+    "price": "价格合理性",
+    "price_reference": "软硬件价格参考",
 }
 
 
@@ -288,6 +303,28 @@ async def evaluate_basis_document(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+
+@router.post("/security/document")
+async def evaluate_security_document(
+    file: UploadFile = File(...),
+    project_name: str = Form(default="未命名可研项目"),
+    use_llm: bool = Form(default=True),
+    selected_rule_ids: str | None = Form(default=None),
+) -> dict[str, Any]:
+    filename = file.filename or ""
+    content = await _read_upload(file, DOCUMENT_RULE_EXTENSIONS)
+    try:
+        raw = run_security_check_from_document(
+            content=content,
+            filename=filename,
+            project_name=project_name,
+            selected_rule_ids=_parse_selected_rule_ids(selected_rule_ids),
+            use_llm=use_llm,
+        )
+        return _normalize_security_result(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
 @router.post("/data-rules/document")
 async def evaluate_data_rules_document(
     file: UploadFile = File(...),
@@ -473,14 +510,118 @@ async def evaluate_resource(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@router.post("/{project_id}/price")
-def evaluate_price(project_id: str, db: Session = Depends(get_db)) -> dict[str, object]:
-    return {
-        "project_id": project_id,
-        "module": "price",
-        "status": "not_implemented",
-        "message": "价格合理性接口已预留，当前尚未接入执行逻辑。",
-    }
+@router.post("/price/document")
+async def evaluate_price_document(
+    file: UploadFile = File(...),
+    project_id: str | None = Form(default=None),
+    project_name: str = Form(default="未命名价格项目"),
+    department: str | None = Form(default=None),
+    project_level: str = Form(default="市级项目"),
+    selected_rule_ids: str | None = Form(default=None),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    return await _evaluate_price_document_for_module(
+        module="price",
+        file=file,
+        project_id=project_id,
+        project_name=project_name,
+        department=department,
+        project_level=project_level,
+        selected_rule_ids=selected_rule_ids,
+        db=db,
+    )
+
+
+@router.post("/price-reference/document")
+async def evaluate_price_reference_document(
+    file: UploadFile = File(...),
+    project_id: str | None = Form(default=None),
+    project_name: str = Form(default="未命名价格参考项目"),
+    department: str | None = Form(default=None),
+    project_level: str = Form(default="市级项目"),
+    selected_rule_ids: str | None = Form(default=None),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    return await _evaluate_price_document_for_module(
+        module="price_reference",
+        file=file,
+        project_id=project_id,
+        project_name=project_name,
+        department=department,
+        project_level=project_level,
+        selected_rule_ids=selected_rule_ids,
+        db=db,
+    )
+
+
+async def _evaluate_price_document_for_module(
+    module: str,
+    file: UploadFile,
+    project_id: str | None,
+    project_name: str,
+    department: str | None,
+    project_level: str,
+    selected_rule_ids: str | None,
+    db: Session,
+) -> dict[str, Any]:
+    content = await _read_upload(file, {".xlsx", ".xlsm", ".csv", ".docx", ".pdf"})
+    rule_ids = _parse_selected_rule_ids(selected_rule_ids)
+    if not rule_ids:
+        rule_ids = ["PRICE_REASON_001"] if module == "price" else ["PRICE_REF_001", "PRICE_REF_002"]
+    try:
+        result = run_price_check_from_file(
+            db=db,
+            content=content,
+            filename=file.filename or "price.xlsx",
+            project_id=project_id,
+            project_name=project_name,
+            department=department,
+            project_level=project_level,
+            selected_rule_ids=rule_ids,
+        )
+        normalized = _normalize_price_result(result, module)
+        project = db.get(Project, result["project_id"])
+        if project is not None:
+            _store_check_result(db, project, module, normalized, _highest_result_severity(normalized), _first_finding_value(normalized.get("findings") or [], "suggestion"))
+        db.commit()
+        return normalized
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"{_module_display_name(module)}检查失败：{exc}") from exc
+
+
+@router.post("/price-benchmarks/import")
+def evaluate_price_benchmark_import(payload: list[dict[str, Any]] = Body(...), db: Session = Depends(get_db)) -> dict[str, Any]:
+    try:
+        return import_price_benchmarks(db, payload)
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"价格参考数据导入失败：{exc}") from exc
+
+
+@router.post("/price-benchmarks/import-file")
+async def evaluate_price_benchmark_file_import(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    content = await _read_upload(file, {".xlsx", ".xlsm", ".csv"})
+    try:
+        return import_price_benchmarks_from_file(db, content, file.filename or "price-benchmarks.xlsx")
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"价格参考文件导入失败：{exc}") from exc
+
+
+@router.get("/price-benchmarks")
+def evaluate_price_benchmark_list(limit: int = 200, db: Session = Depends(get_db)) -> dict[str, Any]:
+    items = list_price_benchmarks(db, limit)
+    return {"items": items, "count": len(items)}
 
 
 def _set_task(task_id: str, **updates: Any) -> None:
@@ -503,6 +644,7 @@ def _run_evaluate_task(
     db = SessionLocal()
     result_ids: list[str] = []
     task_errors: list[str] = []
+    task_context: dict[str, Any] = {}
     try:
         _set_task(task_id, status="running", progress=5, stage="running", message="正在执行规则审查")
         selected_rules = _parse_selected_rule_ids_by_module(selected_rule_ids)
@@ -528,6 +670,7 @@ def _run_evaluate_task(
                     rule_source=rule_source,
                     use_llm=use_llm,
                     selected_rule_ids=selected_rules.get(module) or [],
+                    task_context=task_context,
                 )
                 summary = _result_summary(result)
                 severity = _highest_result_severity(result)
@@ -597,6 +740,7 @@ def _run_module_check(
     rule_source: str,
     use_llm: bool,
     selected_rule_ids: list[str],
+    task_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     suffix = Path(temp_path).suffix.lower()
     content = Path(temp_path).read_bytes()
@@ -629,6 +773,17 @@ def _run_module_check(
             selected_rule_ids=selected_rule_ids,
         )
         return _normalize_document_rule_result(raw, module, use_llm=use_llm)
+
+    if module == "security":
+        _ensure_extension(suffix, DOCUMENT_RULE_EXTENSIONS, module)
+        raw = run_security_check_from_document(
+            content=content,
+            filename=Path(temp_path).name,
+            project_name=project_name,
+            selected_rule_ids=selected_rule_ids,
+            use_llm=use_llm,
+        )
+        return _normalize_security_result(raw)
 
     if module == "sensitive_word":
         _ensure_extension(suffix, SENSITIVE_WORD_EXTENSIONS, module)
@@ -683,6 +838,29 @@ def _run_module_check(
             return _normalize_resource_result(raw, use_llm=use_llm)
         except Exception as exc:
             return _fallback_resource_result(raw, exc)
+
+    if module in {"price", "price_reference"}:
+        _ensure_extension(suffix, {".xlsx", ".xlsm", ".csv", ".docx", ".pdf"}, module)
+        rule_ids = selected_rule_ids
+        if not rule_ids:
+            rule_ids = ["PRICE_REASON_001"] if module == "price" else ["PRICE_REF_001", "PRICE_REF_002"]
+        parsed_document: ParsedPriceDocument | None = None
+        if task_context is not None:
+            parsed_document = task_context.get("price_document")
+            if parsed_document is None:
+                parsed_document = parse_price_document(content, Path(temp_path).name)
+                task_context["price_document"] = parsed_document
+        raw = run_price_check_from_file(
+            db=db,
+            content=content,
+            filename=Path(temp_path).name,
+            project_id=project.id,
+            project_name=project_name,
+            department=department,
+            selected_rule_ids=rule_ids,
+            parsed_document=parsed_document,
+        )
+        return _normalize_price_result(raw, module)
 
     raise ValueError(f"暂未接入检测模块：{module}")
 
@@ -1170,6 +1348,34 @@ def _normalize_duplicate_result(result: DuplicateInternalResponse) -> dict[str, 
     }
 
 
+def _normalize_price_result(result: dict[str, Any], module: str) -> dict[str, Any]:
+    findings: list[dict[str, Any]] = []
+    for finding in result.get("findings") or []:
+        item = dict(finding)
+        item.setdefault("display_title", item.get("rule_name") or _module_display_name(module))
+        item.setdefault("review_opinion", item.get("reason") or item.get("message") or "价格规则需要复核。")
+        item.setdefault("revision_advice", item.get("suggestion") or "请补充价格依据。")
+        item.setdefault("rule_basis", item.get("rule_name") or "价格规则")
+        findings.append(item)
+    summary = dict(result.get("summary") or {})
+    notices = result.get("notices") or []
+    summary["total_findings"] = len(findings)
+    summary["notice_count"] = len(notices)
+    summary["risk_summary"] = dict(Counter(item.get("risk_level") for item in findings if item.get("risk_level")))
+    return {
+        "module_code": module,
+        "module_name": _module_display_name(module),
+        "status": "发现问题" if findings else "部分完成" if notices else "通过",
+        "summary": summary,
+        "findings": findings,
+        "notices": notices,
+        "rules_used": result.get("rules_used") or [],
+        "items": result.get("items") or [],
+        "rule_results": result.get("rule_results") or [],
+        "project_id": result.get("project_id"),
+    }
+
+
 def _normalize_document_rule_result(result: dict[str, Any], module: str, use_llm: bool = False) -> dict[str, Any]:
     raw_results = result.get("results") or []
     findings: list[dict[str, Any]] = []
@@ -1242,6 +1448,47 @@ def _normalize_document_rule_result(result: dict[str, Any], module: str, use_llm
         summary["rule_results_count"] = len(rule_results)
         summary["rule_results_total_findings"] = normalized["rule_results_summary"]["total_findings"]
     return normalized
+
+
+def _normalize_security_result(result: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(result)
+    findings = []
+    for item in payload.get("findings") or []:
+        findings.append(
+            {
+                "display_title": item.get("display_title") or "安全需求分析合规性审查规则",
+                "risk_level": _normalize_issue_degree(item.get("risk_level") or "需人工确认"),
+                "review_opinion": item.get("review_opinion") or "",
+                "evidence_summary": item.get("evidence_summary") or "",
+                "revision_advice": item.get("revision_advice") or "请补充4.7安全需求分析中的安全风险分析、安全等级定位、数据分类分级、安全防护措施和密码应用措施。",
+                "rule_basis": item.get("rule_basis") or "安全需求分析合规性审查规则",
+                "rule_id": item.get("rule_id") or "SECURITY_REASON_001",
+                "rule_name": item.get("rule_name") or "安全需求分析合规性审查规则",
+                "rule_category": item.get("rule_category") or "内容合规性审查规则",
+                "source_section": item.get("source_section") or "4.7安全需求分析",
+                "evidence_examples": item.get("evidence_examples") or [],
+                "merged_count": int(item.get("merged_count") or 1),
+                "llm_refined": bool(item.get("llm_refined")),
+                "llm_review": item.get("llm_review") or {},
+                "raw_issue_type": item.get("raw_issue_type") or item.get("rule_name") or "安全内容合理性",
+            }
+        )
+
+    summary = dict(payload.get("summary") or {})
+    summary["total_findings"] = len(findings)
+    summary["risk_count"] = _summary_from_findings(findings).get("risk_count", {})
+    summary.setdefault("llm_display_mode", "security_review")
+    summary.setdefault("rule_source", "deepseek" if summary.get("llm_enabled") else "local_fallback")
+    payload.update(
+        {
+            "module_code": "security",
+            "module_name": _module_display_name("security"),
+            "status": "通过" if not findings else "发现问题",
+            "summary": summary,
+            "findings": findings,
+        }
+    )
+    return payload
 
 
 def _normalize_resource_result(result: ResourceCheckResponse, use_llm: bool = False) -> dict[str, Any]:

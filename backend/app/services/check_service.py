@@ -21,6 +21,8 @@ from app.modules.sensitive_word.sensitive_word_checker import (
 )
 from app.modules.data_rules.service import DATA_REASONABLENESS_RULES
 from app.modules.shanghai_review.service import BASIS_RULES
+from app.modules.shanghai_review.security_review import SECURITY_RULE
+from app.modules.price.service import public_price_rules
 from app.services.llm_client import get_llm_model, review_finding_with_llm
 from app.services.result_refiner import document_metrics, refine_findings
 
@@ -78,12 +80,32 @@ def run_sensitive_word_check(
 
 def list_check_rules(module: str, rule_source: Optional[str] = "api") -> Dict[str, Any]:
     module_code = module.strip().lower()
+    if module_code in {"price", "price_reference"}:
+        rules = public_price_rules()
+        if module_code == "price":
+            rules = [rule for rule in rules if rule["rule_id"] == "PRICE_REASON_001"]
+        else:
+            rules = [rule for rule in rules if rule["rule_id"] in {"PRICE_REF_001", "PRICE_REF_002"}]
+        return {
+            "module_code": module_code,
+            "module_name": "价格合理性" if module_code == "price" else "软硬件价格参考",
+            "source": "local_builtin",
+            "rules": rules,
+        }
     if module_code == "basis":
         return {
             "module_code": "basis",
             "module_name": "建设依据审查",
             "source": "local_builtin",
             "rules": [_basis_rule_to_public_dict(rule) for rule in BASIS_RULES],
+        }
+
+    if module_code == "security":
+        return {
+            "module_code": "security",
+            "module_name": "安全内容的合理性",
+            "source": "local_builtin",
+            "rules": [_local_rule_to_public_dict(SECURITY_RULE)],
         }
 
     if module_code == "data_reasonableness":

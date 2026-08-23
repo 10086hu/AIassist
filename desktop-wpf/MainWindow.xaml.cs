@@ -44,6 +44,7 @@ public partial class MainWindow : Window
     private TextBlock? _attachmentCompletenessTextBlock;
     private TextBlock? _tableCompletenessTextBlock;
     private TextBlock? _chapterCompletenessTextBlock;
+    private TextBlock? _priceBenchmarkStatusTextBlock;
     private CheckBox? _llmReviewCheckBox;
     private bool _isCompletenessChecked;
     private bool _isChecking;
@@ -148,6 +149,39 @@ public partial class MainWindow : Window
                 "三大件数量一致性校验规则",
                 "一致性校验规则",
                 "每新申请一台服务器需配一套操作系统；每申请一台数据库服务器需配一个数据库",
+                "local_builtin")
+        },
+        ["price"] = new List<RuleDisplayItem>
+        {
+            new(
+                "PRICE_REASON_001",
+                "二类费用计量计价规则",
+                "计量计价规则",
+                "依据《上海市市级数字化项目配置标准（二类费用）》核算咨询、监理、软件测试、系统集成、安全/等保及密码测评费用，并校验五项费用合计不超过项目总投资12%。适用范围：上海市市级项目。",
+                "local_builtin")
+        },
+        ["price_reference"] = new List<RuleDisplayItem>
+        {
+            new(
+                "PRICE_REF_001",
+                "应用软件开发投资估算明细规则",
+                "计量计价规则",
+                "功能人月的单价为2.5万元；针对数字化新技术应用可调整为3万元；单个功能点的工作量上限为5个人月，下限为1个人月。适用范围：市级项目。判断条件：软件开发投资估算明细表填写是否合规。",
+                "local_builtin"),
+            new(
+                "PRICE_REF_002",
+                "软硬件产品计量计价规则",
+                "计量计价规则",
+                "应符合上海市产品库价格；应符合区级产品库价格。适用范围：市级项目、区级项目。判断条件：二类费用价格是否符合产品库价格，如产品库中无价格参考，需符合政府采购价格。",
+                "local_builtin")
+        },
+        ["security"] = new List<RuleDisplayItem>
+        {
+            new(
+                "SECURITY_REASON_001",
+                "安全需求分析合规性审查规则",
+                "内容合规性审查规则",
+                "适用范围：市级项目。分析系统的安全风险，对信息系统安全等级给予准确定位，描述系统关于数据的相关安全要求，包括数据分类分级和所需的安全防护措施及密码应用措施。判断条件：4.7安全需求分析是否满足要求。",
                 "local_builtin")
         }
     };
@@ -261,6 +295,10 @@ public partial class MainWindow : Window
         else if (tag == "Rules")
         {
             _ = LoadRulesAsync();
+        }
+        else if (tag == "Settings")
+        {
+            _ = RefreshPriceBenchmarkStatusAsync();
         }
     }
 
@@ -581,7 +619,7 @@ public partial class MainWindow : Window
 
         var stats = new UniformGrid { Columns = 4, Margin = new Thickness(0, 18, 0, 0) };
         Grid.SetRow(stats, 1);
-        stats.Children.Add(StatCard("5", "规则模块", "规则库配置页当前展示", Brush(37, 99, 235)));
+        stats.Children.Add(StatCard((BuiltInRuleModules.Count + 1).ToString(), "规则模块", "规则库配置页当前展示", Brush(37, 99, 235)));
         stats.Children.Add(StatCard("全选", "默认策略", "勾选状态保存在本次会话", Brush(2, 122, 72)));
         stats.Children.Add(StatCard("API", "优先来源", "不可达时使用本地规则", Brush(181, 71, 8)));
         _ruleStatsTextBlock = Text("加载中", 30, FontWeights.Bold, Brush(52, 64, 84));
@@ -661,12 +699,20 @@ public partial class MainWindow : Window
 
         var right = new StackPanel { Margin = new Thickness(14, 0, 0, 0) };
         Grid.SetColumn(right, 1);
+        var importPriceButton = Button("导入价格参考库", false);
+        importPriceButton.Click += async (_, _) => await ImportPriceBenchmarksAsync();
+        _priceBenchmarkStatusTextBlock = Text("正在读取价格参考库...", 12, null, FindBrush("MutedBrush"), new Thickness(0, 8, 0, 0), true);
+        right.Children.Add(SettingsPanel("价格参考库", "维护软硬件产品的名称、品牌、型号、规格、单价和价格来源。", new UIElement[]
+        {
+            SettingRow("价格基准数据", "支持 Excel 或 CSV；相同来源、名称、品牌和型号会更新而不是重复新增", importPriceButton),
+            _priceBenchmarkStatusTextBlock
+        }));
         right.Children.Add(SettingsPanel("服务连接", "配置客户端访问审查服务的地址和响应策略。", new UIElement[]
         {
             SettingRow("服务地址", "当前客户端请求入口", Input("http://127.0.0.1:8000/api")),
             SettingRow("请求超时", "大文件或复杂规则审查建议使用 60 秒以上", Combo("30 秒", "60 秒", "120 秒")),
             ActionRow(Button("测试连接", false))
-        }));
+        }, new Thickness(0, 14, 0, 0)));
         right.Children.Add(SettingsPanel("安全与日志", "控制本机操作记录、脱敏和诊断信息。", new UIElement[]
         {
             SettingRow("规则变更记录", "保存规则变更人、时间和说明", Check("启用", true)),
@@ -676,6 +722,79 @@ public partial class MainWindow : Window
         body.Children.Add(right);
         page.Children.Add(body);
         return page;
+    }
+
+    private async Task RefreshPriceBenchmarkStatusAsync()
+    {
+        if (_priceBenchmarkStatusTextBlock == null)
+        {
+            return;
+        }
+
+        try
+        {
+            using var response = await BackendClient.GetAsync($"{BackendBaseUrl}/evaluate/price-benchmarks?limit=1000");
+            var responseBody = await response.Content.ReadAsStringAsync();
+            if (!response.IsSuccessStatusCode)
+            {
+                _priceBenchmarkStatusTextBlock.Text = $"价格参考库读取失败：{ExtractErrorMessage(responseBody)}";
+                return;
+            }
+
+            using var document = JsonDocument.Parse(responseBody);
+            _priceBenchmarkStatusTextBlock.Text = $"当前有效价格基准：{GetInt(document.RootElement, "count")} 条";
+        }
+        catch (Exception exc)
+        {
+            _priceBenchmarkStatusTextBlock.Text = $"价格参考库读取失败：{exc.Message}";
+        }
+    }
+
+    private async Task ImportPriceBenchmarksAsync()
+    {
+        var dialog = new OpenFileDialog
+        {
+            Title = "导入软硬件价格参考库",
+            Filter = "价格数据|*.xlsx;*.xlsm;*.csv|所有文件|*.*"
+        };
+        if (dialog.ShowDialog(this) != true)
+        {
+            return;
+        }
+
+        if (_priceBenchmarkStatusTextBlock != null)
+        {
+            _priceBenchmarkStatusTextBlock.Text = "正在导入价格参考库...";
+        }
+
+        try
+        {
+            await using var stream = File.OpenRead(dialog.FileName);
+            using var form = new MultipartFormDataContent();
+            using var fileContent = new StreamContent(stream);
+            fileContent.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+            form.Add(fileContent, "file", Path.GetFileName(dialog.FileName));
+            using var response = await BackendClient.PostAsync($"{BackendBaseUrl}/evaluate/price-benchmarks/import-file", form);
+            var responseBody = await response.Content.ReadAsStringAsync();
+            if (!response.IsSuccessStatusCode)
+            {
+                throw new InvalidOperationException(ExtractErrorMessage(responseBody));
+            }
+
+            using var document = JsonDocument.Parse(responseBody);
+            var root = document.RootElement;
+            var imported = GetInt(root, "imported");
+            var updated = GetInt(root, "updated");
+            var skipped = GetInt(root, "skipped");
+            _priceBenchmarkStatusTextBlock!.Text = $"导入完成：新增 {imported} 条，更新 {updated} 条，跳过 {skipped} 条。";
+        }
+        catch (Exception exc)
+        {
+            if (_priceBenchmarkStatusTextBlock != null)
+            {
+                _priceBenchmarkStatusTextBlock.Text = $"导入失败：{exc.Message}";
+            }
+        }
     }
     private Border BuildRuleCategories()
     {
@@ -1055,7 +1174,7 @@ public partial class MainWindow : Window
         var runnableItems = selectedItems.Where(item => IsRunnableModule(item.ModuleCode)).ToList();
         if (runnableItems.Count == 0)
         {
-            MessageBox.Show(this, "本阶段已接入“建设依据审查”“重复建设检查”“建设功能的对应关系检查”“数据填报合理性”“资源申请的合理性”和“敏感词检测”，请至少选择其中一项。", "暂无可执行检测项", MessageBoxButton.OK, MessageBoxImage.Information);
+            MessageBox.Show(this, "请选择已接入后端的检测项后重试。", "暂无可执行检测项", MessageBoxButton.OK, MessageBoxImage.Information);
             return;
         }
 
@@ -1154,10 +1273,10 @@ public partial class MainWindow : Window
     }
 
     private static bool IsRunnableModule(string moduleCode) =>
-        moduleCode is "basis" or "duplicate" or "function_correspondence" or "data_reasonableness" or "resource" or "sensitive_word";
+        moduleCode is "basis" or "duplicate" or "function_correspondence" or "data_reasonableness" or "security" or "resource" or "sensitive_word" or "price" or "price_reference";
 
     private static bool HasBackendRuleApi(string moduleCode) =>
-        moduleCode is "basis" or "function_correspondence" or "data_reasonableness" or "sensitive_word";
+        moduleCode is "basis" or "function_correspondence" or "data_reasonableness" or "security" or "resource" or "sensitive_word" or "price" or "price_reference";
 
     private static string EndpointForModule(string moduleCode) => moduleCode switch
     {
@@ -1165,13 +1284,16 @@ public partial class MainWindow : Window
         "duplicate" => $"{BackendBaseUrl}/evaluate/duplicate/internal",
         "function_correspondence" => $"{BackendBaseUrl}/evaluate/function-correspondence",
         "data_reasonableness" => $"{BackendBaseUrl}/evaluate/data-rules/document",
+        "security" => $"{BackendBaseUrl}/evaluate/security/document",
         "resource" => $"{BackendBaseUrl}/evaluate/resource",
         "sensitive_word" => $"{BackendBaseUrl}/evaluate/sensitive-word",
+        "price" => $"{BackendBaseUrl}/evaluate/price/document",
+        "price_reference" => $"{BackendBaseUrl}/evaluate/price-reference/document",
         _ => throw new InvalidOperationException($"暂未接入检测模块：{moduleCode}")
     };
 
     private static string ProjectLevelForModule(string moduleCode) =>
-        moduleCode == "function_correspondence" ? "市级项目" : "通用";
+        moduleCode is "function_correspondence" or "security" or "price" or "price_reference" ? "市级项目" : "通用";
 
     private List<string>? ResolveDuplicateHistoryFiles(IReadOnlyCollection<CheckItem> runnableItems)
     {
@@ -1592,6 +1714,8 @@ public partial class MainWindow : Window
             }
         }
 
+        RenderResultNotices(_recordDetailPanel, resultRoot);
+
         if (module == "duplicate" && TryRenderDuplicateFindings(_recordDetailPanel, resultRoot))
         {
             // 重复建设结果按内部重复和跨报告重复分组展示。
@@ -1694,6 +1818,9 @@ public partial class MainWindow : Window
         AddRuleDirectoryItem("sensitive_word", "敏感词检查");
         AddRuleDirectoryItem("data_reasonableness", "数据填报合理性检查");
         AddRuleDirectoryItem("resource", "资源申请合理性检查");
+        AddRuleDirectoryItem("price", "价格合理性");
+        AddRuleDirectoryItem("price_reference", "软硬件价格参考");
+        AddRuleDirectoryItem("security", "安全内容的合理性");
     }
 
     private void AddRuleDirectoryItem(string moduleCode, string title)
@@ -1781,6 +1908,9 @@ public partial class MainWindow : Window
         "sensitive_word" => "敏感词检查",
         "data_reasonableness" => "数据填报合理性检查",
         "resource" => "资源申请合理性检查",
+        "price" => "价格合理性",
+        "price_reference" => "软硬件价格参考",
+        "security" => "安全内容的合理性",
         _ => moduleCode
     };
 
@@ -1911,7 +2041,8 @@ public partial class MainWindow : Window
         form.Add(new StringContent(string.Empty, Encoding.UTF8), "department");
         form.Add(new StringContent("api", Encoding.UTF8), "rule_source");
         form.Add(new StringContent(ProjectLevelForModule(item.ModuleCode), Encoding.UTF8), "project_level");
-        form.Add(new StringContent((_llmReviewCheckBox?.IsChecked == true).ToString().ToLowerInvariant(), Encoding.UTF8), "use_llm");
+        var useLlm = item.ModuleCode == "security" || _llmReviewCheckBox?.IsChecked == true;
+        form.Add(new StringContent(useLlm.ToString().ToLowerInvariant(), Encoding.UTF8), "use_llm");
         form.Add(new StringContent(string.Join(",", SelectedRuleIdsForModule(item.ModuleCode)), Encoding.UTF8), "selected_rule_ids");
 
         using var response = await BackendClient.PostAsync(EndpointForModule(item.ModuleCode), form);
@@ -2019,6 +2150,7 @@ public partial class MainWindow : Window
         var stack = new StackPanel();
         stack.Children.Add(Text(moduleName, 16, FontWeights.Bold, FindBrush("TextBrush")));
         stack.Children.Add(Text($"状态：{status}    问题数量：{findingCount}    耗时：{elapsed:0.###} 秒", 13, null, FindBrush("MutedBrush"), new Thickness(0, 5, 0, 10), true));
+        RenderResultNotices(stack, root);
 
         if (moduleCode == "duplicate" && TryRenderDuplicateFindings(stack, root))
         {
@@ -2043,6 +2175,29 @@ public partial class MainWindow : Window
         }
 
         ResultsListPanel.Children.Add(Card(stack, new Thickness(14), new Thickness(0, 0, 0, 12)));
+    }
+
+    private void RenderResultNotices(Panel target, JsonElement root)
+    {
+        if (!root.TryGetProperty("notices", out var notices)
+            || notices.ValueKind != JsonValueKind.Array
+            || notices.GetArrayLength() == 0)
+        {
+            return;
+        }
+
+        foreach (var notice in notices.EnumerateArray())
+        {
+            var title = FirstNonEmpty(GetString(notice, "title"), "模块状态提示");
+            var message = GetString(notice, "message");
+            var action = GetString(notice, "action");
+            target.Children.Add(Text(title, 14, FontWeights.SemiBold, Brush(181, 71, 8), new Thickness(0, 4, 0, 2), true));
+            target.Children.Add(Text(message, 13, null, FindBrush("TextBrush"), null, true));
+            if (!string.IsNullOrWhiteSpace(action))
+            {
+                target.Children.Add(Text(action, 13, null, FindBrush("MutedBrush"), new Thickness(0, 2, 0, 10), true));
+            }
+        }
     }
 
     private bool TryRenderMergedRuleFindings(Panel target, JsonElement root, string moduleCode)
