@@ -177,26 +177,6 @@ def _template_refine(module_code: str, finding: dict[str, Any]) -> dict[str, Any
             finding.get("revision_advice"),
             "请核对安全服务、PaaS、密码服务、服务器、操作系统、数据库服务器和数据库等资源数量是否一致。",
         )
-    elif module_code == "content_consistency":
-        feature = _content_feature_name(finding)
-        missing_targets = _missing_target_summary(finding.get("review_opinion"))
-        display_title = _content_consistency_title(finding, feature)
-        if feature and feature != "相关功能点":
-            missing_text = f"但缺少{missing_targets}中的对应说明，" if missing_targets else "但对应说明不完整，"
-            review_opinion = f"“{feature}”已在报告部分章节出现，{missing_text}需要复核补充。"
-        else:
-            review_opinion = _first_text(
-                finding.get("review_opinion"),
-                "规则检查发现需求、建设内容、功能设计或投资概算之间的对应关系需复核。",
-            )
-        evidence_summary = _first_text(
-            finding.get("evidence_summary"),
-            f"系统依据“{source_section}”及相关证据片段形成该项判断。",
-        )
-        revision_advice = _first_text(
-            finding.get("revision_advice"),
-            "请补充该功能点在需求来源、建设内容、功能设计和投资概算之间的对应关系说明。",
-        )
     elif module_code == "sensitive_word":
         hit_text = _first_text(finding.get("hit_text"), raw_issue_type)
         scene = _first_text(finding.get("scene_type"), "需结合上下文核验")
@@ -358,56 +338,6 @@ def _function_title(issue_type: str) -> str:
     if "建设内容" in text:
         return "功能表述与建设内容对应不足"
     return "建设功能对应关系需补充说明"
-
-
-def _content_feature_name(finding: dict[str, Any]) -> str:
-    text = _feature_name(finding)
-    list_parts = [
-        part.strip()
-        for part in re.split(r"[，,、；;]+", text)
-        if part.strip()
-    ]
-    if list_parts:
-        text = list_parts[0]
-    hierarchy_parts = [
-        part.strip()
-        for part in re.split(r"[-－—_/]+", text)
-        if part.strip()
-    ]
-    if len(hierarchy_parts) >= 2 and _is_generic_parent_label(hierarchy_parts[0]):
-        text = hierarchy_parts[-1]
-    return _truncate(text, 32)
-
-
-def _content_consistency_title(finding: dict[str, Any], feature: str) -> str:
-    issue_type = _first_text(finding.get("issue_type"), finding.get("raw_issue_type"))
-    source_section = _first_text(finding.get("source_section"), finding.get("section"))
-    if "未识别" in _first_text(finding.get("review_opinion")):
-        return f"缺少相关章节内容：{_truncate(source_section or feature or '建设内容', 24)}"
-    if feature and feature != "相关功能点":
-        return f"功能点对应说明不足：{feature}"
-    return _first_text(issue_type, "建设内容对应关系需补充")
-
-
-def _missing_target_summary(value: Any) -> str:
-    text = str(value or "")
-    marker = "但缺少"
-    if marker not in text:
-        return ""
-    missing = text.split(marker, 1)[1]
-    missing = missing.split("中的对应说明", 1)[0]
-    return _truncate(missing.strip(" ，,。；;"), 40)
-
-
-def _is_generic_parent_label(value: str) -> bool:
-    normalized = re.sub(r"[\s　]+", "", value or "").lower()
-    return normalized.endswith(("中台", "平台", "系统", "中心")) or normalized in {
-        "数据中台",
-        "业务中台",
-        "ai中台",
-        "建设内容",
-        "项目",
-    }
 
 
 def _sensitive_title(hit_text: str, risk_level: str) -> str:

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from collections import Counter
 from dataclasses import asdict
@@ -20,6 +20,7 @@ from app.modules.sensitive_word.sensitive_word_checker import (
     load_rules_from_xlsx as load_sensitive_word_rules_from_xlsx,
 )
 from app.modules.data_rules.service import DATA_REASONABLENESS_RULES
+from app.modules.resource.rules import RULE_15_CODE, RULE_15_NAME, RULE_16_NAME
 from app.modules.shanghai_review.service import BASIS_RULES
 from app.modules.shanghai_review.security_review import SECURITY_RULE
 from app.modules.price.service import public_price_rules
@@ -115,6 +116,15 @@ def list_check_rules(module: str, rule_source: Optional[str] = "api") -> Dict[st
             "source": "local_builtin",
             "rules": [_local_rule_to_public_dict(rule) for rule in DATA_REASONABLENESS_RULES],
         }
+
+    if module_code == "resource":
+        return {
+            "module_code": "resource",
+            "module_name": "资源申请合理性检查",
+            "source": "local_builtin",
+            "rules": _resource_rules_to_public_dicts(),
+        }
+
 
     rule_config = _resolve_rule_source(rule_source, module_code)
     rule_api_url = rule_config["rule_api_url"]
@@ -380,6 +390,34 @@ def _sensitive_term_to_rule_dict(index: int, term: Any) -> Dict[str, Any]:
     }
 
 
+
+def _resource_rules_to_public_dicts() -> list[Dict[str, Any]]:
+    return [
+        {
+            "rule_id": RULE_15_CODE,
+            "rule_name": RULE_15_NAME,
+            "rule_category": "资源申请合理性检查",
+            "rule_detail": "安全服务需求表、PaaS服务清单、密码服务资源内容清单中的关联服务数量应一致。",
+            "source": "local_builtin",
+        },
+        {
+            "rule_id": "RESOURCE_REASON_002",
+            "rule_name": RULE_16_NAME,
+            "rule_category": "资源申请合理性检查",
+            "rule_detail": "每新申请一台服务器需配一套操作系统；每申请一台数据库服务器需配一个数据库",
+            "source": "local_builtin",
+        },
+        {
+            "rule_id": "MAINT_OPS_ALL",
+            "rule_name": "运维项目全规则合并检测（松江区运维项目）",
+            "rule_category": "运维项目 / 规则组合",
+            "rule_detail": "勾选后对运维项目一次执行20条运维规则，覆盖一致性、内容合规性、必要性和计量计价规则。",
+            "source": "local_builtin",
+        },
+    ]
+
+
+
 def _uses_api_rules(result: Dict[str, Any]) -> bool:
     for key in ("rules_used", "rules"):
         rules = result.get(key)
@@ -587,3 +625,4 @@ def _collect_suggestions(findings: list[dict[str, Any]]) -> list[str]:
             suggestions.append(suggestion)
             seen.add(suggestion)
     return suggestions
+

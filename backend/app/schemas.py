@@ -76,6 +76,8 @@ class ResourceCheckFindingOut(BaseModel):
     suggestion: Optional[str] = None
     source_quantities: Dict[str, float] = Field(default_factory=dict)
     row_indexes: List[int] = Field(default_factory=list)
+    evidence_examples: List[str] = Field(default_factory=list)
+    source_section: str = "资源申请清单"
 
 
 class ResourceCheckResponse(BaseModel):

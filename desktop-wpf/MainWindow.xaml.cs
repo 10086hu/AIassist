@@ -1,4 +1,4 @@
-using Microsoft.Win32;
+﻿using Microsoft.Win32;
 using System.IO;
 using System.Net.Http;
 using System.Net.Http.Headers;
@@ -103,7 +103,7 @@ public partial class MainWindow : Window
                 "全文建设依据保持一致",
                 "local_builtin"),
             new(
-                "FUNC_CORR_006",
+                "FUNC_CORR_004",
                 "建设内容一致性校验规则",
                 "一致性校验规则",
                 "功能点需在需求描述章节、建设内容章节及投资概算章节中，形成一一对应的关联关系",
@@ -134,21 +134,33 @@ public partial class MainWindow : Window
                 "数据上链内容合规性审查规则",
                 "内容合规性审查规则",
                 "按照“新建即上链”的工作原则，明确对接政务目录链的数据上链内容，主要建设内容所产生的重点数据应实现应上尽上。",
+                "local_builtin"),
+            new(
+                "DATA_REASON_024",
+                "数据治理服务内容设计合规性审查规则",
+                "内容合规性审查规则",
+                "涉及数据治理服务的项目，数据服务事项内容参照《市级数字化项目数据治理服务配置指引（试行）》开展编制",
                 "local_builtin")
         },
         ["resource"] = new List<RuleDisplayItem>
         {
             new(
-                "RESOURCE_REASON_001",
+                "R15_SECURITY_PAAS_CRYPTO_QUANTITY",
                 "安全服务需求表、PaaS服务清单、密码服务资源内容清单的关联内容一致性校验规则",
-                "一致性校验规则",
+                "资源申请合理性检查",
                 "安全服务需求表、PaaS服务清单、密码服务资源内容清单中的关联内容数据应一致",
                 "local_builtin"),
             new(
                 "RESOURCE_REASON_002",
                 "三大件数量一致性校验规则",
-                "一致性校验规则",
+                "资源申请合理性检查",
                 "每新申请一台服务器需配一套操作系统；每申请一台数据库服务器需配一个数据库",
+                "local_builtin"),
+            new(
+                "MAINT_OPS_ALL",
+                "运维项目全规则合并检测（松江区运维项目）",
+                "运维项目 / 规则组合",
+                "勾选后对运维项目一次执行20条运维规则，覆盖一致性、内容合规性、必要性和计量计价规则。",
                 "local_builtin")
         },
         ["price"] = new List<RuleDisplayItem>
@@ -1367,7 +1379,7 @@ public partial class MainWindow : Window
 
     private async Task LoadRulesAsync()
     {
-        if (!_rulesByModule.ContainsKey("function_correspondence") || !_rulesByModule.ContainsKey("sensitive_word"))
+        if (!_rulesByModule.ContainsKey("function_correspondence") || !_rulesByModule.ContainsKey("sensitive_word") || !_rulesByModule.ContainsKey("resource"))
         {
             RulesListPanel.Children.Clear();
             _ruleCheckBoxesByModule.Clear();
@@ -1375,6 +1387,7 @@ public partial class MainWindow : Window
             AddBuiltInRuleModules();
             await LoadRulesForModuleAsync("function_correspondence");
             await LoadRulesForModuleAsync("sensitive_word");
+            await LoadRulesForModuleAsync("resource");
         }
         else
         {
@@ -2501,4 +2514,6 @@ public partial class MainWindow : Window
     private static string FirstNonEmpty(params string[] values) =>
         values.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value)) ?? string.Empty;
 }
+
+
 

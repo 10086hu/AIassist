@@ -1,4 +1,4 @@
-import json
+﻿import json
 import os
 import tempfile
 import threading
@@ -14,7 +14,6 @@ from sqlalchemy.orm import Session
 
 from app.db.models import CheckResult, Project
 from app.db.session import SessionLocal, get_db
-from app.modules.content_consistency.service import run_content_consistency_check_from_document
 from app.modules.data_rules.service import (
     run_data_reporting_check_from_document,
     run_data_rules_check_from_document,
@@ -58,7 +57,6 @@ TASK_FILE_EXTENSIONS = (
     | SENSITIVE_WORD_EXTENSIONS
     | DUPLICATE_EXTENSIONS
     | BASIS_EXTENSIONS
-    | DOCUMENT_RULE_EXTENSIONS
     | RESOURCE_EXTENSIONS
 )
 RUNNABLE_MODULES = {
@@ -72,10 +70,7 @@ RUNNABLE_MODULES = {
     "price",
     "price_reference",
 }
-CONTENT_CONSISTENCY_RULE_ID = "FUNC_CORR_006"
-CONTENT_CONSISTENCY_RULE_IDS = {"FUNC_CORR_004", "FUNC_CORR_006"}
-CONTENT_CONSISTENCY_RULE_NAMES = {"建设内容一致性校验规则"}
-CONTENT_CONSISTENCY_RULE_NAME = "建设内容一致性专项校验规则"
+FUNC_CORR_004_RULE_ID = "FUNC_CORR_004"
 TASKS: dict[str, dict[str, Any]] = {}
 TASKS_LOCK = threading.Lock()
 
@@ -84,7 +79,6 @@ MODULE_DISPLAY_NAMES = {
     "basis": "建设依据审查",
     "duplicate": "重复建设检查",
     "function_correspondence": "建设功能的对应关系检查",
-    "content_consistency": "建设内容一致性检查",
     "data_reasonableness": "数据填报合理性检查",
     "security": "安全内容的合理性",
     "resource": "资源申请合理性检查",
@@ -263,26 +257,6 @@ async def evaluate_duplicate_compare(
         raise HTTPException(status_code=500, detail=f"重复建设跨报告检查失败：{exc}") from exc
 
 
-@router.post("/content-consistency/document")
-async def evaluate_content_consistency_document(
-    file: UploadFile = File(...),
-    project_name: str = Form(default="未命名可研项目"),
-    use_llm: bool = Form(default=False),
-) -> dict[str, Any]:
-    filename = file.filename or ""
-    content = await _read_upload(file, DOCUMENT_RULE_EXTENSIONS)
-    try:
-        raw = run_content_consistency_check_from_document(
-            content=content,
-            filename=filename,
-            project_name=project_name,
-        )
-        return _normalize_document_rule_result(raw, "content_consistency", use_llm=use_llm)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-
 @router.post("/basis/document")
 async def evaluate_basis_document(
     file: UploadFile = File(...),
@@ -374,6 +348,7 @@ async def evaluate_resource_upload(
     project_name: str = Form(default="未命名资源申请项目"),
     department: str | None = Form(default=None),
     use_llm: bool = Form(default=False),
+    selected_rule_ids: str | None = Form(default=None),
     db: Session = Depends(get_db),
 ) -> ResourceCheckResponse:
     filename = file.filename or ""
@@ -386,6 +361,7 @@ async def evaluate_resource_upload(
             project_id=project_id,
             project_name=project_name,
             department=department,
+            selected_rule_ids=_parse_selected_rule_ids(selected_rule_ids),
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -414,14 +390,7 @@ async def evaluate_function_correspondence(
             selected_rule_ids=selected_ids,
         )
         normalized = _normalize_function_or_sensitive_result(result, "function_correspondence")
-        normalized = _merge_content_consistency_result(
-            normalized=normalized,
-            content=Path(temp_path).read_bytes(),
-            filename=Path(temp_path).name,
-            project_name=project_name,
-            selected_rule_ids=selected_ids,
-            use_llm=use_llm,
-        )
+        normalized = _attach_function_rule_results(normalized)
         project = _get_or_create_project(db, project_id, project_name, department)
         _store_check_result(
             db=db,
@@ -755,14 +724,7 @@ def _run_module_check(
             selected_rule_ids=selected_rule_ids,
         )
         normalized = _normalize_function_or_sensitive_result(raw, module)
-        return _merge_content_consistency_result(
-            normalized=normalized,
-            content=content,
-            filename=Path(temp_path).name,
-            project_name=project_name,
-            selected_rule_ids=selected_rule_ids,
-            use_llm=use_llm,
-        )
+        return _attach_function_rule_results(normalized)
 
     if module == "basis":
         _ensure_extension(suffix, BASIS_EXTENSIONS, module)
@@ -828,6 +790,7 @@ def _run_module_check(
                 project_id=project.id,
                 project_name=project_name,
                 department=department,
+                selected_rule_ids=selected_rule_ids,
             )
         except Exception as exc:
             fallback = _resource_result_from_existing_checks(db, project.id, exc)
@@ -895,25 +858,10 @@ def _run_duplicate_module(
     raise ValueError("不支持的文件格式。重复建设检查支持：.xlsx, .csv, .docx, .pdf")
 
 
-def _merge_content_consistency_result(
-    normalized: dict[str, Any],
-    content: bytes,
-    filename: str,
-    project_name: str,
-    selected_rule_ids: list[str],
-    use_llm: bool,
-) -> dict[str, Any]:
-    """Attach five sub-rule result groups without mutating the original four-rule findings."""
+def _attach_function_rule_results(normalized: dict[str, Any]) -> dict[str, Any]:
+    """Attach per-rule result groups for the function-correspondence module."""
     original_findings = list(normalized.get("findings") or [])
     rule_results = _build_function_rule_results(normalized, original_findings)
-    rule_results.append(
-        _build_content_consistency_rule_result(
-            content=content,
-            filename=filename,
-            project_name=project_name,
-            use_llm=use_llm,
-        )
-    )
 
     normalized["findings"] = original_findings
     normalized["rule_results"] = rule_results
@@ -922,7 +870,16 @@ def _merge_content_consistency_result(
     if isinstance(summary, dict):
         summary["rule_results_count"] = len(rule_results)
         summary["rule_results_total_findings"] = normalized["rule_results_summary"]["total_findings"]
-        summary["content_consistency_status"] = rule_results[-1].get("status")
+        content_rule_result = next(
+            (
+                item
+                for item in rule_results
+                if str(item.get("rule_id") or "").strip() == FUNC_CORR_004_RULE_ID
+            ),
+            None,
+        )
+        if content_rule_result is not None:
+            summary["func_corr_004_status"] = content_rule_result.get("status")
     return normalized
 
 
@@ -941,7 +898,7 @@ def _build_function_rule_results(
         rule_id = str(rule.get("rule_id") or rule.get("id") or "").strip()
         rule_name = str(rule.get("rule_name") or rule.get("name") or "").strip()
         key = rule_id or rule_name
-        if not key or key in seen or rule_id == CONTENT_CONSISTENCY_RULE_ID:
+        if not key or key in seen:
             continue
         seen.add(key)
         matched_findings = [
@@ -984,87 +941,6 @@ def _finding_matches_rule(finding: dict[str, Any], rule_id: str, rule_name: str)
     return bool(rule_name and finding_rule_name == rule_name)
 
 
-def _build_content_consistency_rule_result(
-    content: bytes,
-    filename: str,
-    project_name: str,
-    use_llm: bool,
-) -> dict[str, Any]:
-    rule_id = CONTENT_CONSISTENCY_RULE_ID
-    rule_name = CONTENT_CONSISTENCY_RULE_NAME
-    suffix = Path(filename).suffix.lower()
-    if suffix not in DOCUMENT_RULE_EXTENSIONS:
-        return _make_rule_result(
-            rule_id=rule_id,
-            rule_name=rule_name,
-            rule_category="一致性校验规则",
-            rule_detail="检查需求描述、建设内容、数据产出和项目预算之间的功能点对应关系。",
-            source="content_consistency",
-            findings=[],
-            status="跳过",
-            message="第五条建设内容一致性专项校验仅支持 Word .docx 和 PDF .pdf 文件。",
-        )
-
-    try:
-        consistency_raw = run_content_consistency_check_from_document(
-            content=content,
-            filename=filename,
-            project_name=project_name,
-        )
-        consistency_result = _normalize_document_rule_result(
-            consistency_raw,
-            "content_consistency",
-            use_llm=use_llm,
-        )
-        consistency_findings = [dict(item) for item in consistency_result.get("findings") or []]
-        for finding in consistency_findings:
-            finding["rule_id"] = rule_id
-            finding["rule_name"] = rule_name
-            finding["display_title"] = finding.get("display_title") or finding.get("issue_type") or rule_name
-            finding["rule_basis"] = rule_name
-            finding["source"] = "content_consistency"
-            finding["risk_level"] = _normalize_issue_degree(finding.get("risk_level") or "需人工确认")
-
-        raw_results = consistency_raw.get("results") or []
-        raw_summary = _first_text([item.get("summary") for item in raw_results if isinstance(item, dict)])
-        return _make_rule_result(
-            rule_id=rule_id,
-            rule_name=rule_name,
-            rule_category="一致性校验规则",
-            rule_detail="检查需求描述、建设内容、数据产出和项目预算之间的功能点对应关系。",
-            source="content_consistency",
-            findings=consistency_findings,
-            status="发现问题" if consistency_findings else "通过",
-            message=raw_summary or "建设内容一致性专项校验完成。",
-            raw_result=consistency_raw,
-        )
-    except Exception as exc:
-        finding = {
-            "display_title": rule_name,
-            "risk_level": "需人工确认",
-            "review_opinion": f"第五条建设内容一致性专项校验执行失败：{exc}",
-            "evidence_summary": "",
-            "revision_advice": "请确认文件可解析且不是扫描件或加密文件；原四条规则结果不受影响。",
-            "rule_basis": rule_name,
-            "rule_id": rule_id,
-            "rule_name": rule_name,
-            "source_section": "建设内容一致性",
-            "evidence_examples": [],
-            "merged_count": 1,
-            "source": "content_consistency",
-        }
-        return _make_rule_result(
-            rule_id=rule_id,
-            rule_name=rule_name,
-            rule_category="一致性校验规则",
-            rule_detail="检查需求描述、建设内容、数据产出和项目预算之间的功能点对应关系。",
-            source="content_consistency",
-            findings=[finding],
-            status="执行失败",
-            message=str(exc),
-        )
-
-
 def _make_rule_result(
     rule_id: str,
     rule_name: str,
@@ -1105,50 +981,6 @@ def _summary_from_rule_results(rule_results: list[dict[str, Any]]) -> dict[str, 
     summary = _summary_from_findings(all_findings)
     summary["rule_count"] = len(rule_results)
     return summary
-
-
-def _selected_content_consistency_rule(
-    normalized: dict[str, Any],
-    selected_rule_ids: list[str],
-) -> dict[str, Any] | None:
-    selected_ids = {str(rule_id).strip() for rule_id in selected_rule_ids or [] if str(rule_id).strip()}
-    rules_used = [rule for rule in normalized.get("rules_used") or [] if isinstance(rule, dict)]
-
-    for rule in rules_used:
-        rule_id = str(rule.get("rule_id") or "").strip()
-        if rule_id in selected_ids and _is_content_consistency_rule(rule):
-            return rule
-
-    if selected_ids & CONTENT_CONSISTENCY_RULE_IDS:
-        return {
-            "rule_id": next(iter(selected_ids & CONTENT_CONSISTENCY_RULE_IDS)),
-            "rule_name": "建设内容一致性校验规则",
-        }
-
-    if not selected_ids:
-        for rule in rules_used:
-            if _is_content_consistency_rule(rule):
-                return rule
-        return {
-            "rule_id": CONTENT_CONSISTENCY_RULE_ID,
-            "rule_name": "建设内容一致性校验规则",
-        }
-
-    return None
-
-
-def _is_content_consistency_rule(rule: dict[str, Any]) -> bool:
-    rule_id = str(rule.get("rule_id") or "").strip()
-    rule_name = str(rule.get("rule_name") or "").strip()
-    rule_text = " ".join(
-        str(rule.get(key) or "")
-        for key in ("rule_name", "rule_category", "rule_detail", "judgement_condition")
-    )
-    return (
-        rule_id in CONTENT_CONSISTENCY_RULE_IDS
-        or rule_name in CONTENT_CONSISTENCY_RULE_NAMES
-        or ("建设内容一致性" in rule_text and "功能点" in rule_text)
-    )
 
 
 async def _save_upload_to_temp(file: UploadFile, allowed_extensions: set[str]) -> str:
@@ -1812,3 +1644,4 @@ def _first_text(values: Any) -> str:
         if text:
             return text
     return ""
+

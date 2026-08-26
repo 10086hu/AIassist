@@ -7,6 +7,7 @@ from sqlalchemy import delete
 from sqlalchemy.orm import Session
 
 from app.db.models import CheckResult, Project, ResourceItem
+from app.modules.maintenance.service import evaluate_maintenance_rules, is_maintenance_project_document
 from app.modules.resource.parser import ParsedResourceItem, parse_resource_items
 from app.modules.resource.rules import ResourceRuleFinding, evaluate_resource_rules
 from app.schemas import ProjectOut, ResourceCheckFindingOut, ResourceCheckResponse
@@ -25,6 +26,7 @@ def run_resource_check_from_file(
     project_id: Optional[str],
     project_name: str,
     department: Optional[str],
+    selected_rule_ids: Optional[list[str]] = None,
 ) -> ResourceCheckResponse:
     """资源申请合理性检查主流程。
 
@@ -40,9 +42,32 @@ def run_resource_check_from_file(
     # project_id 存在时复用旧项目；不存在或查不到时新建项目。
     project = _get_or_create_project(db, project_id, project_name, department)
 
+    selected = {str(item).strip() for item in selected_rule_ids or [] if str(item).strip()}
     parsed_items = parse_resource_items(content, filename)
-    if not parsed_items:
+
+    findings: list[ResourceRuleFinding] = []
+    explicit_maintenance_rules_selected = _maintenance_rules_selected(selected)
+    run_maintenance_rules = explicit_maintenance_rules_selected and is_maintenance_project_document(content, filename)
+    if parsed_items and _standard_resource_rules_selected(selected):
+        findings.extend(
+            finding
+            for finding in evaluate_resource_rules(parsed_items)
+            if _resource_finding_selected(finding, selected)
+        )
+
+    if run_maintenance_rules:
+        findings.extend(
+            evaluate_maintenance_rules(
+                content,
+                filename,
+                selected_rule_ids=selected if explicit_maintenance_rules_selected else None,
+                db=db,
+            )
+        )
+
+    if not parsed_items and _standard_resource_rules_selected(selected) and not run_maintenance_rules:
         findings = [
+            *findings,
             ResourceRuleFinding(
                 rule_code="RESOURCE_PARSE_SCOPE",
                 rule_name="资源申请清单解析",
@@ -58,18 +83,9 @@ def run_resource_check_from_file(
                 row_indexes=[],
             )
         ]
-        _replace_resource_items(db, project.id, [])
-        _replace_check_results(db, project.id, findings)
-        project.status = "evaluated"
-        db.commit()
-        db.refresh(project)
-        return _build_response(project, imported_count=0, findings=findings)
 
     # 当前实现采用“本次上传结果覆盖该项目旧资源清单”的策略。
     _replace_resource_items(db, project.id, parsed_items)
-
-    # 规则引擎只依赖 parsed_items，不直接访问数据库，便于单元测试。
-    findings = evaluate_resource_rules(parsed_items)
 
     # 删除旧检查结果并写入新结果，保证同一项目重复上传时不会产生重复记录。
     _replace_check_results(db, project.id, findings)
@@ -103,6 +119,8 @@ def _build_response(
                 suggestion=finding.suggestion,
                 source_quantities=finding.source_quantities,
                 row_indexes=finding.row_indexes,
+                evidence_examples=finding.evidence_examples,
+                source_section=finding.source_section,
             )
             for finding in findings
         ],
@@ -187,6 +205,8 @@ def _replace_check_results(db: Session, project_id: str, findings) -> None:
                         "resource_name": finding.resource_name,
                         "source_quantities": finding.source_quantities,
                         "row_indexes": finding.row_indexes,
+                        "evidence_examples": finding.evidence_examples,
+                        "source_section": finding.source_section,
                     },
                     ensure_ascii=False,
                 ),
@@ -200,3 +220,40 @@ def _is_major_item(name: str) -> bool:
 
     keywords = ("服务器", "操作系统", "数据库", "PaaS", "密码服务", "安全服务")
     return int(any(keyword.lower() in name.lower() for keyword in keywords))
+
+
+def _standard_resource_rules_selected(selected: set[str]) -> bool:
+    if not selected:
+        return True
+    aliases = {
+        # 兼容前端/Excel 直接传“规则分工”行号的场景。
+        "15",
+        "16",
+        "RESOURCE_REASON_001",
+        "RESOURCE_REASON_002",
+        "R15_SECURITY_PAAS_CRYPTO_QUANTITY",
+        "R16_SERVER_OS_QUANTITY",
+        "R16_DB_SERVER_DATABASE_QUANTITY",
+        "安全服务需求表、PaaS服务清单、密码服务资源内容清单的关联内容一致性校验规则",
+        "三大件数量一致性校验规则",
+    }
+    return bool(selected & aliases)
+
+
+def _maintenance_rules_selected(selected: set[str]) -> bool:
+    # 运维专项规则必须使用 MAINT_OPS_* 或 MAINT_OPS_ALL。
+    # 不能把纯数字行号当作运维规则，否则“16”会和规则分工第16行冲突，
+    # 导致非运维项目被运维门禁拦截，标准三大件规则不运行。
+    return any(item == "MAINT_OPS_ALL" or item.startswith("MAINT_OPS_") for item in selected)
+
+
+def _resource_finding_selected(finding: ResourceRuleFinding, selected: set[str]) -> bool:
+    if not selected:
+        return True
+    if finding.rule_code in selected or finding.rule_name in selected:
+        return True
+    if finding.rule_code == "R15_SECURITY_PAAS_CRYPTO_QUANTITY":
+        return "RESOURCE_REASON_001" in selected or "15" in selected
+    if finding.rule_code in {"R16_SERVER_OS_QUANTITY", "R16_DB_SERVER_DATABASE_QUANTITY"}:
+        return "RESOURCE_REASON_002" in selected or "16" in selected or "三大件数量一致性校验规则" in selected
+    return False
