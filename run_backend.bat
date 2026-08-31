@@ -45,6 +45,17 @@ if not exist ".venv\Scripts\python.exe" (
     call ".venv\Scripts\activate.bat"
 )
 
+python -c "import uvicorn" >nul 2>nul
+if errorlevel 1 (
+    echo [AI Assist] Installing missing backend dependencies...
+    python -m pip install -r requirements.txt
+    if errorlevel 1 (
+        echo [AI Assist] Failed to install dependencies.
+        pause
+        exit /b 1
+    )
+)
+
 echo [AI Assist] Starting FastAPI backend at http://127.0.0.1:8000
 echo [AI Assist] Database: %AIASSIST_DATA_DIR%\app.db
 echo [AI Assist] LLM base URL: %DEEPSEEK_API_BASE_URL%

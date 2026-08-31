@@ -12,7 +12,7 @@ from typing import Iterable, Optional
 # source/name/quantity/unit/spec 五个内部字段，后续规则引擎只处理标准字段。
 HEADER_ALIASES = {
     "source": {"清单", "来源", "表名", "章节", "所属章节", "资源清单", "资源来源", "表单", "类别", "分类", "所属清单", "资源类别"},
-    "name": {"资源名称", "资源类型", "服务名称", "产品名称", "名称", "项目名称", "服务内容", "内容", "安全服务名称", "资源项", "服务项", "申请内容", "软件名称", "系统名称", "数据库名称"},
+    "name": {"资源名称", "资源类型", "服务名称", "产品名称", "产品小类", "产品类别", "名称", "项目名称", "服务内容", "内容", "安全服务名称", "资源项", "服务项", "申请内容", "软件名称", "系统名称", "数据库名称"},
     "quantity": {"数量", "申请数量", "配置数量", "服务数量", "资源数量", "台数", "套数", "个数", "授权数量", "申请台数", "申请套数", "采购数量", "配套数量"},
     "unit": {"单位", "计量单位"},
     "spec": {"规格", "规格型号", "配置", "参数", "描述", "说明", "备注", "配置说明", "用途", "型号"},
@@ -22,15 +22,15 @@ HEADER_ALIASES = {
 # 解析器会把这些别名统一映射成规则引擎能识别的标准资源名称。
 DOCUMENT_RESOURCE_ALIASES = {
     "安全防病毒服务": ("安全防病毒服务", "防病毒服务", "病毒防护服务", "杀毒服务"),
-    "安全认证网关服务": ("安全认证网关服务", "认证网关服务", "安全网关服务"),
+    "安全认证网关服务": ("安全认证网关服务", "安全认证网关", "认证网关服务", "认证网关", "安全网关服务"),
     "时间戳服务": ("时间戳服务",),
-    "签名验签服务": ("签名验签服务", "电子签名服务", "验签服务"),
-    "可信密码服务（数据加解密服务）": ("可信密码服务", "数据加解密服务", "加解密服务", "加密服务", "解密服务"),
+    "签名验签服务": ("签名验签服务", "签名验签服务器", "电子签名服务", "验签服务"),
+    "可信密码服务（数据加解密服务）": ("可信密码服务", "服务器密码机", "数据加解密服务", "加解密服务", "加密服务", "解密服务"),
     "身份认证服务": ("身份认证服务", "统一身份认证服务", "统一认证服务"),
     "数字证书服务": ("数字证书服务", "证书服务"),
     "数据库服务器": ("数据库服务器", "数据库主机", "DB服务器", "db服务器", "数据库云主机"),
-    "服务器操作系统": ("服务器操作系统", "操作系统", "国产操作系统", "OS", "os", "麒麟", "统信", "欧拉", "服务器OS"),
-    "数据库软件": ("数据库软件", "数据库授权", "数据库产品", "数据库管理系统", "达梦数据库", "人大金仓", "GaussDB", "MySQL", "PostgreSQL", "Oracle"),
+    "服务器操作系统": ("服务器操作系统", "操作系统", "国产操作系统", "OS", "os", "麒麟", "kylin", "统信", "uos", "欧拉", "openEuler", "openeuler", "服务器OS"),
+    "数据库软件": ("数据库软件", "数据库授权", "数据库产品", "数据库管理系统", "国产数据库", "数据库", "达梦数据库", "人大金仓", "GaussDB", "MySQL", "PostgreSQL", "Oracle"),
     "服务器": ("云服务器", "应用服务器", "服务器", "虚拟机", "计算资源", "主机", "云主机", "计算实例"),
 }
 
@@ -43,7 +43,9 @@ DOCUMENT_SOURCE_ALIASES = {
 }
 
 QUANTITY_PATTERN = re.compile(
-    r"(?<![\d.])(-?\d+(?:\.\d+)?)\s*(项|套|台|个|份|张|次|年|月|人|核|G|GB|T|TB)?"
+    r"(?<![\d.])(-?\d+(?:\.\d+)?)\s*"
+    r"(项|套|台|个|份|张|次|年|月|人|核|线程|块|颗|路|副本|G|GB|T|TB|GHz|MHz|QPS|ms|毫秒|秒)?",
+    re.IGNORECASE,
 )
 
 SECTION_NUMBER_PATTERN = re.compile(r"(?<!\d)\d+(?:\.\d+){1,3}(?!\d)")
@@ -114,6 +116,16 @@ MAX_REASONABLE_RESOURCE_QUANTITY = 10000.0
 RESOURCE_COUNT_UNITS = {"项", "套", "台", "个", "份", "张", "次", "套/台"}
 SPEC_UNITS = {"核", "G", "GB", "T", "TB", "年", "月", "人"}
 QUANTITY_CONTEXT_KEYWORDS = ("数量", "台数", "套数", "个数", "申请", "配置", "采购", "配套", "共", "合计")
+NON_RESOURCE_COUNT_UNITS = {
+    "核", "线程", "块", "颗", "路", "副本",
+    "g", "gb", "t", "tb", "ghz", "mhz", "qps", "ms", "毫秒", "秒",
+    "年", "月", "人",
+}
+SPEC_CONTEXT_KEYWORDS = (
+    "raid", "ssd", "hdd", "cpu", "gpu", "内存", "硬盘", "系统盘", "数据盘",
+    "主频", "线程", "副本", "qps", "响应时间", "延迟", "数据量", "容量",
+)
+GENERIC_RESOURCE_NAMES = {"物理机", "虚拟机", "主机", "服务器", "PC服务器", "硬件产品", "产品软件"}
 
 
 @dataclass(frozen=True)
@@ -272,6 +284,8 @@ def _parse_rows(
     items: list[ParsedResourceItem] = []
     for offset, row in enumerate(materialized[header_index + 1 :], start=header_index + 2):
         name = _value_at(row, mapping.get("name"))
+        raw_text = " ".join(_cell_text(cell) for cell in row if _cell_text(cell))
+        name = _refine_resource_name_from_row(row, name)
         if not name:
             # 没有资源名称时无法参与规则匹配，直接跳过该行。
             continue
@@ -279,7 +293,6 @@ def _parse_rows(
         source = _value_at(row, mapping.get("source")) or sheet_name
         quantity_text = _value_at(row, mapping.get("quantity"))
         spec = _value_at(row, mapping.get("spec"))
-        raw_text = " ".join(_cell_text(cell) for cell in row if _cell_text(cell))
         if require_resource_context and not _is_resource_related_row(f"{source} {name} {spec} {raw_text}"):
             continue
         unit = _value_at(row, mapping.get("unit")) or _guess_unit(quantity_text) or "项"
@@ -523,11 +536,16 @@ def _parse_quantity_near_alias(
     after = _quantity_window_after_alias(value, end)
     before = _quantity_window_before_alias(value, start)
 
+    before_matches = list(_iter_resource_quantity_matches(before, strict=strict))
+    if before_matches:
+        match = before_matches[-1]
+        if not strict or len(before) - match.end() <= 4:
+            return float(match.group(1)), match.group(2) or _guess_unit(before)
+
     after_match = _select_resource_quantity_match(after, strict=strict)
     if after_match:
         return float(after_match.group(1)), after_match.group(2) or _guess_unit(after)
 
-    before_matches = list(_iter_resource_quantity_matches(before, strict=strict))
     if before_matches:
         match = before_matches[-1]
         return float(match.group(1)), match.group(2) or _guess_unit(before)
@@ -654,6 +672,33 @@ def _parse_quantity_for_resource_row(value: str, resource_name: str) -> tuple[Op
     return None, ""
 
 
+def _refine_resource_name_from_row(row: list[object], current_name: str) -> str:
+    """把“物理机/虚拟机/产品软件”等泛化名称替换为同一行里的具体资源名。"""
+
+    current = _cell_text(current_name)
+    if current and current not in GENERIC_RESOURCE_NAMES and _find_document_resources(current):
+        return current
+
+    candidates: list[str] = []
+    for cell in row:
+        text = _cell_text(cell)
+        if not text or text == current or text in GENERIC_RESOURCE_NAMES:
+            continue
+        if len(text) <= 8 and _parse_quantity(text) is not None:
+            continue
+        if _find_document_resources(text):
+            candidates.append(text)
+
+    if not candidates:
+        return current
+    concise = [item for item in candidates if len(item) <= 32]
+    concise.sort(key=lambda item: (len(item), item))
+    if concise:
+        return concise[0]
+    candidates.sort(key=lambda item: (len(item), item))
+    return candidates[0]
+
+
 def _quantity_window_after_alias(value: str, end: int) -> str:
     """截取资源名后的同一描述片段，避免跨到下一个资源项取数量。"""
 
@@ -713,13 +758,28 @@ def _select_resource_quantity_match(value: str, strict: bool) -> Optional[re.Mat
 
 def _is_resource_quantity_match(value: str, match: re.Match[str]) -> bool:
     unit = match.group(2) or ""
+    unit_lower = unit.lower()
+    left = value[max(0, match.start() - 12) : match.start()]
+    right = value[match.end() : min(len(value), match.end() + 12)]
+    local_context = f"{left}{right}".lower()
+    if unit_lower in NON_RESOURCE_COUNT_UNITS:
+        return False
+    if not unit and _starts_with_non_resource_unit(right):
+        return False
+    if any(keyword in local_context for keyword in SPEC_CONTEXT_KEYWORDS):
+        return False
+    if re.search(r"每\s*$|单\s*$", left):
+        return False
     if unit in RESOURCE_COUNT_UNITS:
         return True
     if unit in SPEC_UNITS:
         return False
-    left = value[max(0, match.start() - 8) : match.start()]
-    right = value[match.end() : min(len(value), match.end() + 8)]
     return any(keyword in f"{left}{right}" for keyword in QUANTITY_CONTEXT_KEYWORDS)
+
+
+def _starts_with_non_resource_unit(value: str) -> bool:
+    stripped = value.strip().lower()
+    return any(stripped.startswith(unit) for unit in NON_RESOURCE_COUNT_UNITS)
 
 
 def _parse_chinese_quantity(value: str) -> Optional[float]:

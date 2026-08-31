@@ -184,20 +184,6 @@ DEFAULT_RULES: List[Rule] = [
     ),
 ]
 
-SUPPLEMENTAL_RULES: List[Rule] = [
-    Rule(
-        rule_id="FUNC_CORR_006",
-        rule_category="一致性校验规则",
-        rule_name="建设内容一致性校验规则",
-        rule_detail="功能点需在需求描述章节、建设内容章节及投资概算章节中，形成一一对应的关联关系",
-        city_judgement="功能点需在需求描述章节、建设内容章节及投资概算章节中，形成一一对应的关联关系",
-        district_judgement="功能点需在需求描述章节、建设内容章节及投资概算章节中，形成一一对应的关联关系",
-        tags=["市级项目", "区级项目", "所有项目"],
-        source="local_builtin",
-    ),
-]
-
-
 # =============================
 # 3. 文档解析：DOCX / PDF / TXT
 # =============================
@@ -501,24 +487,12 @@ def load_rules(
     if rules_xlsx_path:
         rules = load_rules_from_xlsx(rules_xlsx_path)
         if rules:
-            return _append_supplemental_rules(rules)
+            return rules
     if rule_api_base:
         rules = load_rules_from_api(rule_api_base, keyword=keyword)
         if rules:
-            return _append_supplemental_rules(rules)
-    return _append_supplemental_rules(list(DEFAULT_RULES))
-
-
-def _append_supplemental_rules(rules: List[Rule]) -> List[Rule]:
-    existing_ids = {rule.rule_id for rule in rules}
-    existing_names = {rule.rule_name for rule in rules}
-    result = list(rules)
-    for rule in SUPPLEMENTAL_RULES:
-        if rule.rule_id not in existing_ids and rule.rule_name not in existing_names:
-            result.append(rule)
-            existing_ids.add(rule.rule_id)
-            existing_names.add(rule.rule_name)
-    return result
+            return rules
+    return list(DEFAULT_RULES)
 
 
 # =============================

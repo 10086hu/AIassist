@@ -7,6 +7,7 @@ from sqlalchemy import delete
 from sqlalchemy.orm import Session
 
 from app.db.models import CheckResult, Project, ResourceItem
+from app.modules.maintenance.service import evaluate_maintenance_rules, is_maintenance_project_document
 from app.modules.resource.parser import ParsedResourceItem, parse_resource_items
 from app.modules.resource.rules import ResourceRuleFinding, evaluate_resource_rules
 from app.schemas import ProjectOut, ResourceCheckFindingOut, ResourceCheckResponse
@@ -25,6 +26,7 @@ def run_resource_check_from_file(
     project_id: Optional[str],
     project_name: str,
     department: Optional[str],
+    selected_rule_ids: Optional[list[str]] = None,
 ) -> ResourceCheckResponse:
     """资源申请合理性检查主流程。
 
@@ -40,9 +42,32 @@ def run_resource_check_from_file(
     # project_id 存在时复用旧项目；不存在或查不到时新建项目。
     project = _get_or_create_project(db, project_id, project_name, department)
 
+    selected = {str(item).strip() for item in selected_rule_ids or [] if str(item).strip()}
     parsed_items = parse_resource_items(content, filename)
-    if not parsed_items:
+
+    findings: list[ResourceRuleFinding] = []
+    explicit_maintenance_rules_selected = _maintenance_rules_selected(selected)
+    run_maintenance_rules = explicit_maintenance_rules_selected and is_maintenance_project_document(content, filename)
+    if parsed_items and _standard_resource_rules_selected(selected):
+        findings.extend(
+            finding
+            for finding in evaluate_resource_rules(parsed_items)
+            if _resource_finding_selected(finding, selected)
+        )
+
+    if run_maintenance_rules:
+        findings.extend(
+            evaluate_maintenance_rules(
+                content,
+                filename,
+                selected_rule_ids=selected if explicit_maintenance_rules_selected else None,
+                db=db,
+            )
+        )
+
+    if not parsed_items and _standard_resource_rules_selected(selected) and not run_maintenance_rules:
         findings = [
+            *findings,
             ResourceRuleFinding(
                 rule_code="RESOURCE_PARSE_SCOPE",
                 rule_name="资源申请清单解析",
@@ -58,18 +83,9 @@ def run_resource_check_from_file(
                 row_indexes=[],
             )
         ]
-        _replace_resource_items(db, project.id, [])
-        _replace_check_results(db, project.id, findings, [])
-        project.status = "evaluated"
-        db.commit()
-        db.refresh(project)
-        return _build_response(project, imported_count=0, findings=findings, parsed_items=[], filename=filename)
 
     # 当前实现采用“本次上传结果覆盖该项目旧资源清单”的策略。
     _replace_resource_items(db, project.id, parsed_items)
-
-    # 规则引擎只依赖 parsed_items，不直接访问数据库，便于单元测试。
-    findings = evaluate_resource_rules(parsed_items)
 
     # 删除旧检查结果并写入新结果，保证同一项目重复上传时不会产生重复记录。
     _replace_check_results(db, project.id, findings, parsed_items)
@@ -80,13 +96,7 @@ def run_resource_check_from_file(
     db.refresh(project)
 
     # Pydantic 响应模型负责控制 API 返回字段，避免直接暴露 SQLAlchemy 对象。
-    return _build_response(
-        project,
-        imported_count=len(parsed_items),
-        findings=findings,
-        parsed_items=parsed_items,
-        filename=filename,
-    )
+    return _build_response(project, imported_count=len(parsed_items), findings=findings, parsed_items=parsed_items, filename=filename)
 
 
 def _build_response(
@@ -100,74 +110,80 @@ def _build_response(
     items_by_row: dict[int, list[ParsedResourceItem]] = {}
     for item in parsed_items:
         items_by_row.setdefault(item.row_index, []).append(item)
-    return ResourceCheckResponse(
-        project=ProjectOut.model_validate(project),
-        imported_count=imported_count,
-        checked_rule_count=len({finding.rule_code for finding in findings}),
-        findings=[_resource_finding_out(finding, items_by_row, filename) for finding in findings],
-    )
 
-
-def _resource_finding_out(
-    finding: ResourceRuleFinding,
-    items_by_row: dict[int, list[ParsedResourceItem]],
-    filename: str,
-) -> ResourceCheckFindingOut:
-    source_locations = finding.source_locations or [
-        {
-            "file_name": filename,
-            "sheet_name": item.sheet_name,
-            "row_index": row,
-            "source": item.source,
-            "quote": item.raw_text,
-            "precision": "row",
-        }
-        for row in finding.row_indexes
-        for item in items_by_row.get(row, [])
-    ]
-    highlights = [
-        {
-            "role": "current",
-            "file_name": location.get("file_name") or filename,
-            "sheet_name": location.get("sheet_name"),
-            "row_index": location.get("row_index"),
-            "section": location.get("source"),
-            "quote": str(location.get("quote") or "")[:500],
-            "precision": location.get("precision") or "row",
-            "highlight": True,
-        }
-        for location in source_locations
-        if str(location.get("quote") or "").strip()
-    ]
-    location_hint = _resource_location_hint(finding, items_by_row)
-    if filename and location_hint:
-        location_hint = f"{filename}，{location_hint}"
-    return ResourceCheckFindingOut(
-        rule_code=finding.rule_code,
-        rule_name=finding.rule_name,
-        resource_name=finding.resource_name,
-        severity=finding.severity,
-        result_label=finding.result_label,
-        reason=finding.reason,
-        suggestion=finding.suggestion,
-        source_quantities=finding.source_quantities,
-        row_indexes=finding.row_indexes,
-        source_locations=source_locations,
-        evidence="；".join(
+    def to_output(finding: ResourceRuleFinding) -> ResourceCheckFindingOut:
+        locations = getattr(finding, "source_locations", None) or [
+            {
+                "file_name": filename,
+                "sheet_name": item.sheet_name,
+                "row_index": row,
+                "source": item.source,
+                "quote": item.raw_text,
+                "precision": "row",
+            }
+            for row in finding.row_indexes
+            for item in items_by_row.get(row, [])
+        ]
+        highlights = [
+            {
+                "role": "current",
+                "file_name": location.get("file_name") or filename,
+                "sheet_name": location.get("sheet_name"),
+                "row_index": location.get("row_index"),
+                "section": location.get("source"),
+                "quote": str(location.get("quote") or "")[:500],
+                "precision": location.get("precision") or "row",
+                "highlight": True,
+            }
+            for location in locations
+            if str(location.get("quote") or "").strip()
+        ]
+        location_hint = "；".join(dict.fromkeys(
+            f"{item.sheet_name}第{row}行"
+            for row in finding.row_indexes[:8]
+            for item in items_by_row.get(row, [])
+        )) or None
+        if filename and location_hint:
+            location_hint = f"{filename}，{location_hint}"
+        evidence = "；".join(
             item.raw_text
             for row in finding.row_indexes
             for item in items_by_row.get(row, [])
             if item.raw_text
-        ) or None,
-        location_hint=location_hint,
-        source_highlights=highlights,
-        revision_target={
-            "location_hint": location_hint or f"{filename}，资源申请清单（未匹配到具体行）",
-            "source_location": {"entries": source_locations, "file_name": filename},
-            "highlights": highlights,
-            "target_type": "source_text" if highlights else "section_or_document",
-            "advice": finding.suggestion or "",
-        },
+        ) or None
+        return ResourceCheckFindingOut(
+            rule_code=finding.rule_code,
+            rule_name=finding.rule_name,
+            resource_name=finding.resource_name,
+            severity=finding.severity,
+            result_label=finding.result_label,
+            reason=finding.reason,
+            suggestion=finding.suggestion,
+            source_quantities=finding.source_quantities,
+            row_indexes=finding.row_indexes,
+            source_locations=locations,
+            evidence=evidence,
+            location_hint=location_hint,
+            source_highlights=highlights,
+            revision_target={
+                "location_hint": location_hint or f"{filename}，资源申请清单（未匹配到具体行）",
+                "source_location": {"entries": locations, "file_name": filename},
+                "highlights": highlights,
+                "target_type": "source_text" if highlights else "section_or_document",
+                "advice": finding.suggestion or "",
+            },
+            evidence_examples=finding.evidence_examples,
+            source_section=finding.source_section,
+        )
+
+    return ResourceCheckResponse(
+        project=ProjectOut.model_validate(project),
+        imported_count=imported_count,
+        checked_rule_count=len({finding.rule_code for finding in findings}),
+        findings=[
+            to_output(finding)
+            for finding in findings
+        ],
     )
 
 
@@ -240,7 +256,7 @@ def _replace_check_results(
     for item in parsed_items:
         items_by_row.setdefault(item.row_index, []).append(item)
     for finding in findings:
-        source_locations = finding.source_locations or [
+        source_locations = getattr(finding, "source_locations", None) or [
             {
                 "sheet_name": item.sheet_name,
                 "row_index": row,
@@ -268,6 +284,8 @@ def _replace_check_results(
                         "resource_name": finding.resource_name,
                         "source_quantities": finding.source_quantities,
                         "row_indexes": finding.row_indexes,
+                        "evidence_examples": finding.evidence_examples,
+                        "source_section": finding.source_section,
                         "source_locations": source_locations,
                     },
                     ensure_ascii=False,
@@ -277,25 +295,45 @@ def _replace_check_results(
         )
 
 
-def _resource_location_hint(
-    finding: ResourceRuleFinding,
-    items_by_row: dict[int, list[ParsedResourceItem]],
-) -> str | None:
-    rows = finding.row_indexes or []
-    if not rows:
-        return None
-    labels = []
-    for row in rows[:8]:
-        items = items_by_row.get(row, [])
-        if items:
-            labels.extend(f"{item.sheet_name}第{row}行" for item in items)
-        else:
-            labels.append(f"第{row}行")
-    return "；".join(dict.fromkeys(labels))
-
-
 def _is_major_item(name: str) -> bool:
     """标记是否属于三大件或关键资源，用于 ResourceItem.is_major_item。"""
 
     keywords = ("服务器", "操作系统", "数据库", "PaaS", "密码服务", "安全服务")
     return int(any(keyword.lower() in name.lower() for keyword in keywords))
+
+
+def _standard_resource_rules_selected(selected: set[str]) -> bool:
+    if not selected:
+        return True
+    aliases = {
+        # 兼容前端/Excel 直接传“规则分工”行号的场景。
+        "15",
+        "16",
+        "RESOURCE_REASON_001",
+        "RESOURCE_REASON_002",
+        "R15_SECURITY_PAAS_CRYPTO_QUANTITY",
+        "R16_SERVER_OS_QUANTITY",
+        "R16_DB_SERVER_DATABASE_QUANTITY",
+        "安全服务需求表、PaaS服务清单、密码服务资源内容清单的关联内容一致性校验规则",
+        "三大件数量一致性校验规则",
+    }
+    return bool(selected & aliases)
+
+
+def _maintenance_rules_selected(selected: set[str]) -> bool:
+    # 运维专项规则必须使用 MAINT_OPS_* 或 MAINT_OPS_ALL。
+    # 不能把纯数字行号当作运维规则，否则“16”会和规则分工第16行冲突，
+    # 导致非运维项目被运维门禁拦截，标准三大件规则不运行。
+    return any(item == "MAINT_OPS_ALL" or item.startswith("MAINT_OPS_") for item in selected)
+
+
+def _resource_finding_selected(finding: ResourceRuleFinding, selected: set[str]) -> bool:
+    if not selected:
+        return True
+    if finding.rule_code in selected or finding.rule_name in selected:
+        return True
+    if finding.rule_code == "R15_SECURITY_PAAS_CRYPTO_QUANTITY":
+        return "RESOURCE_REASON_001" in selected or "15" in selected
+    if finding.rule_code in {"R16_SERVER_OS_QUANTITY", "R16_DB_SERVER_DATABASE_QUANTITY"}:
+        return "RESOURCE_REASON_002" in selected or "16" in selected or "三大件数量一致性校验规则" in selected
+    return False

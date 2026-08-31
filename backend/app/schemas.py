@@ -62,6 +62,8 @@ class DuplicatePairOut(BaseModel):
     location_hint: Optional[str] = None
     source_highlights: List[Dict[str, object]] = Field(default_factory=list)
     revision_target: Dict[str, object] = Field(default_factory=dict)
+    evidence_examples: List[str] = Field(default_factory=list)
+    source_section: str = "资源申请清单"
     model_name: Optional[str] = None
 
 

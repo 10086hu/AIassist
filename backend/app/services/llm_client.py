@@ -463,37 +463,6 @@ def _build_prompt(module_code: str, rule: dict[str, Any], finding: dict[str, Any
                 "confidence": 0.8,
             },
         }
-    elif module_code == "content_consistency":
-        payload = {
-            "任务": "建设内容一致性第十条结果语义复核，并整理成类似其他小规则的简洁问题结果",
-            "规则名称": finding.get("rule_name") or rule.get("rule_name"),
-            "规则描述": rule.get("rule_detail") or finding.get("rule_detail"),
-            "疑似功能点": finding.get("item") or finding.get("feature"),
-            "原始功能点": finding.get("raw_item"),
-            "问题标题": finding.get("description"),
-            "原始原因": finding.get("reason"),
-            "原始建议": finding.get("suggestion"),
-            "证据片段": finding.get("evidence") or finding.get("evidence_examples") or context,
-            "所在章节": finding.get("source_section"),
-            "当前风险等级": finding.get("risk_level"),
-            "要求": [
-                "先判断疑似功能点是否为具体建设功能；如果原始功能点包含逗号、顿号或“数据中台-”等父级前缀，只提炼最短的具体功能点名称。",
-                "display_title 要像其他小规则一样简洁，不要罗列多个前缀或整段原文；优先使用“功能点对应说明不足：具体功能点”。",
-                "复核是否确实缺少需求分析、建设内容、功能点设计或投资概算之间的对应说明，不要覆盖规则检查结论。",
-                "user_reason、user_suggestion、user_basis 每项控制在60到120字。",
-            ],
-            "输出JSON字段": {
-                "display_title": "功能点对应说明不足：具体功能点",
-                "feature_label": "最短具体功能点名称",
-                "judgement": "是否确实存在建设内容一致性问题",
-                "risk_level_suggestion": "高/中/低/需人工确认/通过",
-                "user_reason": "用户可读原因",
-                "user_suggestion": "用户可执行修改建议",
-                "user_basis": "规则、章节、上下文或证据依据概括",
-                "need_human_review": True,
-                "confidence": 0.8,
-            },
-        }
     elif module_code == "security":
         payload = {
             "任务": "安全内容合理性 / 安全需求分析合规性审查",
