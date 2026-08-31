@@ -53,6 +53,15 @@ class DuplicatePairOut(BaseModel):
     related_stage: Optional[str] = None
     item_source: Optional[str] = None
     related_source: Optional[str] = None
+    item_row_index: Optional[int] = None
+    related_row_index: Optional[int] = None
+    item_source_location: Dict[str, object] = Field(default_factory=dict)
+    related_source_location: Dict[str, object] = Field(default_factory=dict)
+    item_source_excerpt: Optional[str] = None
+    related_source_excerpt: Optional[str] = None
+    location_hint: Optional[str] = None
+    source_highlights: List[Dict[str, object]] = Field(default_factory=list)
+    revision_target: Dict[str, object] = Field(default_factory=dict)
     model_name: Optional[str] = None
 
 
@@ -76,6 +85,11 @@ class ResourceCheckFindingOut(BaseModel):
     suggestion: Optional[str] = None
     source_quantities: Dict[str, float] = Field(default_factory=dict)
     row_indexes: List[int] = Field(default_factory=list)
+    source_locations: List[Dict[str, object]] = Field(default_factory=list)
+    evidence: Optional[str] = None
+    location_hint: Optional[str] = None
+    source_highlights: List[Dict[str, object]] = Field(default_factory=list)
+    revision_target: Dict[str, object] = Field(default_factory=dict)
 
 
 class ResourceCheckResponse(BaseModel):

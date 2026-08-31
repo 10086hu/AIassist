@@ -59,11 +59,11 @@ def run_resource_check_from_file(
             )
         ]
         _replace_resource_items(db, project.id, [])
-        _replace_check_results(db, project.id, findings)
+        _replace_check_results(db, project.id, findings, [])
         project.status = "evaluated"
         db.commit()
         db.refresh(project)
-        return _build_response(project, imported_count=0, findings=findings)
+        return _build_response(project, imported_count=0, findings=findings, parsed_items=[], filename=filename)
 
     # 当前实现采用“本次上传结果覆盖该项目旧资源清单”的策略。
     _replace_resource_items(db, project.id, parsed_items)
@@ -72,7 +72,7 @@ def run_resource_check_from_file(
     findings = evaluate_resource_rules(parsed_items)
 
     # 删除旧检查结果并写入新结果，保证同一项目重复上传时不会产生重复记录。
-    _replace_check_results(db, project.id, findings)
+    _replace_check_results(db, project.id, findings, parsed_items)
 
     # 标记项目已完成一次审查。
     project.status = "evaluated"
@@ -80,32 +80,94 @@ def run_resource_check_from_file(
     db.refresh(project)
 
     # Pydantic 响应模型负责控制 API 返回字段，避免直接暴露 SQLAlchemy 对象。
-    return _build_response(project, imported_count=len(parsed_items), findings=findings)
+    return _build_response(
+        project,
+        imported_count=len(parsed_items),
+        findings=findings,
+        parsed_items=parsed_items,
+        filename=filename,
+    )
 
 
 def _build_response(
     project: Project,
     imported_count: int,
     findings: list[ResourceRuleFinding],
+    parsed_items: list[ParsedResourceItem] | None = None,
+    filename: str = "",
 ) -> ResourceCheckResponse:
+    parsed_items = parsed_items or []
+    items_by_row: dict[int, list[ParsedResourceItem]] = {}
+    for item in parsed_items:
+        items_by_row.setdefault(item.row_index, []).append(item)
     return ResourceCheckResponse(
         project=ProjectOut.model_validate(project),
         imported_count=imported_count,
         checked_rule_count=len({finding.rule_code for finding in findings}),
-        findings=[
-            ResourceCheckFindingOut(
-                rule_code=finding.rule_code,
-                rule_name=finding.rule_name,
-                resource_name=finding.resource_name,
-                severity=finding.severity,
-                result_label=finding.result_label,
-                reason=finding.reason,
-                suggestion=finding.suggestion,
-                source_quantities=finding.source_quantities,
-                row_indexes=finding.row_indexes,
-            )
-            for finding in findings
-        ],
+        findings=[_resource_finding_out(finding, items_by_row, filename) for finding in findings],
+    )
+
+
+def _resource_finding_out(
+    finding: ResourceRuleFinding,
+    items_by_row: dict[int, list[ParsedResourceItem]],
+    filename: str,
+) -> ResourceCheckFindingOut:
+    source_locations = finding.source_locations or [
+        {
+            "file_name": filename,
+            "sheet_name": item.sheet_name,
+            "row_index": row,
+            "source": item.source,
+            "quote": item.raw_text,
+            "precision": "row",
+        }
+        for row in finding.row_indexes
+        for item in items_by_row.get(row, [])
+    ]
+    highlights = [
+        {
+            "role": "current",
+            "file_name": location.get("file_name") or filename,
+            "sheet_name": location.get("sheet_name"),
+            "row_index": location.get("row_index"),
+            "section": location.get("source"),
+            "quote": str(location.get("quote") or "")[:500],
+            "precision": location.get("precision") or "row",
+            "highlight": True,
+        }
+        for location in source_locations
+        if str(location.get("quote") or "").strip()
+    ]
+    location_hint = _resource_location_hint(finding, items_by_row)
+    if filename and location_hint:
+        location_hint = f"{filename}，{location_hint}"
+    return ResourceCheckFindingOut(
+        rule_code=finding.rule_code,
+        rule_name=finding.rule_name,
+        resource_name=finding.resource_name,
+        severity=finding.severity,
+        result_label=finding.result_label,
+        reason=finding.reason,
+        suggestion=finding.suggestion,
+        source_quantities=finding.source_quantities,
+        row_indexes=finding.row_indexes,
+        source_locations=source_locations,
+        evidence="；".join(
+            item.raw_text
+            for row in finding.row_indexes
+            for item in items_by_row.get(row, [])
+            if item.raw_text
+        ) or None,
+        location_hint=location_hint,
+        source_highlights=highlights,
+        revision_target={
+            "location_hint": location_hint or f"{filename}，资源申请清单（未匹配到具体行）",
+            "source_location": {"entries": source_locations, "file_name": filename},
+            "highlights": highlights,
+            "target_type": "source_text" if highlights else "section_or_document",
+            "advice": finding.suggestion or "",
+        },
     )
 
 
@@ -158,7 +220,12 @@ def _replace_resource_items(
     db.flush()
 
 
-def _replace_check_results(db: Session, project_id: str, findings) -> None:
+def _replace_check_results(
+    db: Session,
+    project_id: str,
+    findings,
+    parsed_items: list[ParsedResourceItem] | None = None,
+) -> None:
     """用本次规则发现替换项目旧的第 15/16 行资源检查结果。"""
 
     db.execute(
@@ -168,7 +235,21 @@ def _replace_check_results(db: Session, project_id: str, findings) -> None:
             CheckResult.check_subtype == RESOURCE_CHECK_SUBTYPE,
         )
     )
+    parsed_items = parsed_items or []
+    items_by_row: dict[int, list[ParsedResourceItem]] = {}
+    for item in parsed_items:
+        items_by_row.setdefault(item.row_index, []).append(item)
     for finding in findings:
+        source_locations = finding.source_locations or [
+            {
+                "sheet_name": item.sheet_name,
+                "row_index": row,
+                "source": item.source,
+                "quote": item.raw_text,
+            }
+            for row in finding.row_indexes
+            for item in items_by_row.get(row, [])
+        ]
         # reference_data 保存结构化明细，便于前端后续做展开展示或导出报告。
         db.add(
             CheckResult(
@@ -187,12 +268,30 @@ def _replace_check_results(db: Session, project_id: str, findings) -> None:
                         "resource_name": finding.resource_name,
                         "source_quantities": finding.source_quantities,
                         "row_indexes": finding.row_indexes,
+                        "source_locations": source_locations,
                     },
                     ensure_ascii=False,
                 ),
                 model_name="local-resource-rule-engine",
             )
         )
+
+
+def _resource_location_hint(
+    finding: ResourceRuleFinding,
+    items_by_row: dict[int, list[ParsedResourceItem]],
+) -> str | None:
+    rows = finding.row_indexes or []
+    if not rows:
+        return None
+    labels = []
+    for row in rows[:8]:
+        items = items_by_row.get(row, [])
+        if items:
+            labels.extend(f"{item.sheet_name}第{row}行" for item in items)
+        else:
+            labels.append(f"第{row}行")
+    return "；".join(dict.fromkeys(labels))
 
 
 def _is_major_item(name: str) -> bool:

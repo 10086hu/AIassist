@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
-from typing import List, Optional
+from dataclasses import dataclass, replace
+from typing import Any, List, Optional
 
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
@@ -42,6 +42,8 @@ class ReportPoint:
     report_name: str
     stage: str
     source: str
+    source_location: dict[str, Any]
+    source_excerpt: str
 
 
 @dataclass(frozen=True)
@@ -193,6 +195,12 @@ def run_duplicate_compare_check(
                         "related_report_name": pair.related_report_name,
                         "item_stage": pair.item_stage,
                         "related_stage": pair.related_stage,
+                        "item_row_index": pair.item_row_index,
+                        "related_row_index": pair.related_row_index,
+                        "item_source_location": pair.item_source_location,
+                        "related_source_location": pair.related_source_location,
+                        "item_source_excerpt": pair.item_source_excerpt,
+                        "related_source_excerpt": pair.related_source_excerpt,
                     },
                     ensure_ascii=False,
                 ),
@@ -239,6 +247,13 @@ def _process_function_points(
             .order_by(FunctionPoint.row_index.asc())
         ).all()
     )
+    locations_by_row = {
+        point.row_index: dict(point.source_location or {
+            "row_index": point.row_index,
+            "precision": "row",
+        })
+        for point in parsed_points
+    }
     candidates = _find_candidate_pairs(points)
     db.execute(
         delete(CheckResult).where(
@@ -271,7 +286,18 @@ def _process_function_points(
             reason=judgement.reason,
             suggestion=judgement.suggestion,
             model_name=judgement.model_name,
-            reference_data=json.dumps({"similarity": candidate.similarity}, ensure_ascii=False),
+            reference_data=json.dumps(
+                {
+                    "similarity": candidate.similarity,
+                    "item_row_index": candidate.left.row_index,
+                    "related_row_index": candidate.right.row_index,
+                    "item_source_location": locations_by_row.get(candidate.left.row_index, {}),
+                    "related_source_location": locations_by_row.get(candidate.right.row_index, {}),
+                    "item_source_excerpt": locations_by_row.get(candidate.left.row_index, {}).get("quote", ""),
+                    "related_source_excerpt": locations_by_row.get(candidate.right.row_index, {}).get("quote", ""),
+                },
+                ensure_ascii=False,
+            ),
         )
         db.add(result)
         pairs.append(
@@ -285,6 +311,26 @@ def _process_function_points(
                 severity=judgement.severity,
                 reason=judgement.reason,
                 suggestion=judgement.suggestion,
+                item_row_index=candidate.left.row_index,
+                related_row_index=candidate.right.row_index,
+                item_source_location=locations_by_row.get(candidate.left.row_index, {}),
+                related_source_location=locations_by_row.get(candidate.right.row_index, {}),
+                item_source_excerpt=locations_by_row.get(candidate.left.row_index, {}).get("quote"),
+                related_source_excerpt=locations_by_row.get(candidate.right.row_index, {}).get("quote"),
+                location_hint=_format_pair_location_hint(
+                    locations_by_row.get(candidate.left.row_index, {}),
+                    locations_by_row.get(candidate.right.row_index, {}),
+                ),
+                source_highlights=_duplicate_pair_highlights(
+                    locations_by_row.get(candidate.left.row_index, {}),
+                    locations_by_row.get(candidate.right.row_index, {}),
+                ),
+                revision_target=_duplicate_revision_target(
+                    locations_by_row.get(candidate.left.row_index, {}),
+                    locations_by_row.get(candidate.right.row_index, {}),
+                    judgement.suggestion,
+                ),
+                model_name=judgement.model_name,
             )
         )
 
@@ -369,9 +415,10 @@ def _parse_points_from_file(content: bytes, filename: str, project_context: str)
     if lower.endswith((".xlsx", ".csv")):
         return parse_function_points(content, filename)
     if lower.endswith((".docx", ".pdf")):
-        return _parse_document_function_points(
-            parse_document(content, filename),
-            project_context=project_context,
+        document = parse_document(content, filename)
+        return _annotate_document_points(
+            _parse_document_function_points(document, project_context=project_context),
+            document,
         )
     raise ValueError(f"不支持的文件格式: {filename}")
 
@@ -384,6 +431,52 @@ def _parse_document_function_points(
     if len(section_points) >= 3:
         return section_points
     return extract_function_points(doc_content, project_context=project_context)
+
+
+def _annotate_document_points(
+    points: list[ParsedFunctionPoint],
+    document: DocumentContent,
+) -> list[ParsedFunctionPoint]:
+    """Map extracted function points back to their source line/page and quote."""
+    lines = [line.strip() for line in document.raw_text.splitlines() if line.strip()]
+    output: list[ParsedFunctionPoint] = []
+    for point in points:
+        existing = dict(point.source_location or {})
+        match_index = None
+        match_line = ""
+        for index, line in enumerate(lines, start=1):
+            if point.name and point.name in line:
+                match_index, match_line = index, line
+                break
+        if match_index is None:
+            description_token = (point.description or "").strip()[:30]
+            if description_token:
+                for index, line in enumerate(lines, start=1):
+                    if description_token in line:
+                        match_index, match_line = index, line
+                        break
+
+        section = next(
+            (item for item in document.sections if point.name and point.name in item.content),
+            None,
+        )
+        existing.update({
+            "file_name": document.filename,
+            "file_type": document.format,
+            "precision": "line" if match_index is not None else "document",
+        })
+        if match_index is not None:
+            existing.update({"line_start": match_index, "line_end": match_index, "quote": match_line[:500]})
+        if section is not None:
+            existing.setdefault("section", section.title)
+            if section.page_no is not None:
+                existing.setdefault("page", section.page_no)
+            if section.start_line:
+                existing.setdefault("section_line_start", section.start_line)
+            if section.end_line:
+                existing.setdefault("section_line_end", section.end_line)
+        output.append(replace(point, source_location=existing))
+    return output
 
 
 def _extract_function_sections(doc_content: DocumentContent) -> list[ParsedFunctionPoint]:
@@ -442,7 +535,10 @@ def run_duplicate_check_from_document(
     department: Optional[str],
 ) -> DuplicateInternalResponse:
     doc_content = parse_document(content, filename)
-    parsed_points = _parse_document_function_points(doc_content, project_name)
+    parsed_points = _annotate_document_points(
+        _parse_document_function_points(doc_content, project_name),
+        doc_content,
+    )
     return _process_function_points(
         db, parsed_points, project_id, project_name, department
     )
@@ -462,6 +558,15 @@ def _report_points_from_parsed(report: ParsedReport) -> list[ReportPoint]:
                 report_name=report.report_name,
                 stage=report.stage,
                 source=report.source,
+                source_location=dict(point.source_location or {
+                    "file_name": report.report_name,
+                    "row_index": point.row_index,
+                    "precision": "row",
+                }),
+                source_excerpt=str(
+                    (point.source_location or {}).get("quote")
+                    or f"{point.name} {point.description}"
+                )[:500],
             )
         )
     return refs
@@ -545,7 +650,87 @@ def _judge_report_pairs(
                 related_stage=candidate.right.stage,
                 item_source=candidate.left.source,
                 related_source=candidate.right.source,
+                item_row_index=candidate.left.row_index,
+                related_row_index=candidate.right.row_index,
+                item_source_location=dict(candidate.left.source_location),
+                related_source_location=dict(candidate.right.source_location),
+                item_source_excerpt=candidate.left.source_excerpt,
+                related_source_excerpt=candidate.right.source_excerpt,
+                location_hint=_format_pair_location_hint(
+                    candidate.left.source_location,
+                    candidate.right.source_location,
+                ),
+                source_highlights=_duplicate_pair_highlights(
+                    candidate.left.source_location,
+                    candidate.right.source_location,
+                ),
+                revision_target=_duplicate_revision_target(
+                    candidate.left.source_location,
+                    candidate.right.source_location,
+                    judgement.suggestion,
+                ),
                 model_name=judgement.model_name,
             )
         )
     return pairs
+
+
+def _format_pair_location_hint(left: dict[str, Any], right: dict[str, Any]) -> str:
+    def format_one(location: dict[str, Any], fallback: str) -> str:
+        filename = str(location.get("file_name") or fallback)
+        if location.get("page") is not None and location.get("line_start") is not None:
+            return f"{filename}第{location['page']}页第{location['line_start']}行"
+        if location.get("line_start") is not None:
+            return f"{filename}第{location['line_start']}行"
+        if location.get("row_index") is not None:
+            sheet = str(location.get("sheet_name") or "")
+            sheet_text = f"（{sheet}）" if sheet else ""
+            return f"{filename}{sheet_text}第{location['row_index']}行"
+        if location.get("paragraph") is not None:
+            return f"{filename}第{location['paragraph']}段"
+        return f"{filename}位置未识别"
+
+    return f"当前：{format_one(left, '当前报告')}；关联：{format_one(right, '关联报告')}"
+
+
+def _duplicate_pair_highlights(
+    left: dict[str, Any],
+    right: dict[str, Any],
+) -> list[dict[str, Any]]:
+    highlights: list[dict[str, Any]] = []
+    for role, location in (("current", left), ("related", right)):
+        quote = str(location.get("quote") or "").strip()[:500]
+        if not quote:
+            continue
+        highlights.append(
+            {
+                "role": role,
+                "file_name": location.get("file_name"),
+                "file_type": location.get("file_type"),
+                "sheet_name": location.get("sheet_name"),
+                "page": location.get("page"),
+                "line_start": location.get("line_start"),
+                "line_end": location.get("line_end"),
+                "row_index": location.get("row_index"),
+                "section": location.get("section"),
+                "quote": quote,
+                "precision": location.get("precision") or "unknown",
+                "highlight": True,
+            }
+        )
+    return highlights
+
+
+def _duplicate_revision_target(
+    left: dict[str, Any],
+    right: dict[str, Any],
+    advice: str | None,
+) -> dict[str, Any]:
+    highlights = _duplicate_pair_highlights(left, right)
+    return {
+        "location_hint": _format_pair_location_hint(left, right),
+        "source_location": {"current": left, "related": right},
+        "highlights": highlights,
+        "target_type": "source_text" if highlights else "section_or_document",
+        "advice": advice or "",
+    }

@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass
 from io import BytesIO, StringIO
-from typing import Iterable, List, Optional, Tuple, Dict
+from typing import Any, Iterable, List, Optional, Tuple, Dict
 
 
 HEADER_ALIASES = {
@@ -19,49 +19,65 @@ class ParsedFunctionPoint:
     name: str
     description: str
     category: Optional[str] = None
+    source_location: Optional[Dict[str, Any]] = None
 
 
 def parse_function_points(content: bytes, filename: str) -> List[ParsedFunctionPoint]:
     if filename.lower().endswith(".csv"):
-        return _parse_csv(content)
-    return _parse_xlsx(content)
+        return _parse_csv(content, filename)
+    return _parse_xlsx(content, filename)
 
 
-def _parse_xlsx(content: bytes) -> List[ParsedFunctionPoint]:
+def _parse_xlsx(content: bytes, filename: str = "") -> List[ParsedFunctionPoint]:
     from openpyxl import load_workbook
 
     workbook = load_workbook(BytesIO(content), data_only=True)
     sheet = workbook.active
     rows = list(sheet.iter_rows(values_only=True))
-    return _parse_rows(rows)
+    return _parse_rows(rows, sheet.title, filename=filename)
 
 
-def _parse_csv(content: bytes) -> List[ParsedFunctionPoint]:
+def _parse_csv(content: bytes, filename: str = "") -> List[ParsedFunctionPoint]:
     text = content.decode("utf-8-sig")
     rows = list(csv.reader(StringIO(text)))
-    return _parse_rows(rows)
+    return _parse_rows(rows, "CSV", filename=filename)
 
 
-def _parse_rows(rows: Iterable[Iterable[object]]) -> List[ParsedFunctionPoint]:
-    materialized = [list(row) for row in rows if any(_cell_text(cell) for cell in row)]
-    if not materialized:
+def _parse_rows(
+    rows: Iterable[Iterable[object]],
+    sheet_name: str = "",
+    filename: str = "",
+) -> List[ParsedFunctionPoint]:
+    materialized = [list(row) for row in rows]
+    if not any(any(_cell_text(cell) for cell in row) for row in materialized):
         return []
 
     header_index, mapping = _find_header(materialized)
     points: List[ParsedFunctionPoint] = []
-    for offset, row in enumerate(materialized[header_index + 1 :], start=header_index + 2):
+    for row_offset, row in enumerate(materialized[header_index + 1 :], start=header_index + 2):
+        if not any(_cell_text(cell) for cell in row):
+            continue
         name = _value_at(row, mapping.get("name"))
         description = _value_at(row, mapping.get("description"))
         category = _value_at(row, mapping.get("category")) or None
         if not name and description:
             name = description[:40]
         if name:
+            raw_text = " | ".join(_cell_text(cell) for cell in row if _cell_text(cell))
             points.append(
                 ParsedFunctionPoint(
-                    row_index=offset,
+                    row_index=row_offset,
                     name=name,
                     description=description,
                     category=category,
+                    source_location={
+                        "file_type": "spreadsheet",
+                        "file_name": filename,
+                        "sheet_name": sheet_name or "CSV",
+                        "row_index": row_offset,
+                        "quote": raw_text,
+                        "precision": "row",
+                    },
                 )
             )
     return points

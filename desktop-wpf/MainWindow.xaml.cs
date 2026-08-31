@@ -4,9 +4,12 @@ using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
+using System.Text.Encodings.Web;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
+using System.Windows.Documents;
 using System.Windows.Media;
 
 namespace AiReportDesktop;
@@ -1743,9 +1746,81 @@ public partial class MainWindow : Window
             Header = "查看技术详情 / 原始 JSON",
             IsExpanded = false,
             Margin = new Thickness(0, 8, 0, 0),
-            Content = Text(root.GetRawText(), 12, null, FindBrush("MutedBrush"), new Thickness(0, 8, 0, 0), true)
+            Content = BuildTechnicalJsonViewer(root)
         };
         _recordDetailPanel.Children.Add(expander);
+    }
+
+    private UIElement BuildTechnicalJsonViewer(JsonElement root)
+    {
+        var panel = new StackPanel { Margin = new Thickness(0, 8, 0, 0) };
+        panel.Children.Add(Text(
+            "定位字段已标色：修改建议/位置为蓝色，原文摘录/高亮标记为黄色。",
+            12,
+            null,
+            FindBrush("MutedBrush"),
+            new Thickness(0, 0, 0, 6),
+            true));
+
+        string json;
+        try
+        {
+            // Parse first so \uXXXX escape sequences are decoded before the
+            // technical view is rendered, then keep Chinese characters intact.
+            var displayNode = JsonNode.Parse(root.GetRawText());
+            json = displayNode?.ToJsonString(new JsonSerializerOptions
+            {
+                WriteIndented = true,
+                Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+            }) ?? root.GetRawText();
+        }
+        catch (JsonException)
+        {
+            json = root.GetRawText();
+        }
+        var viewer = new RichTextBox
+        {
+            IsReadOnly = true,
+            IsDocumentEnabled = false,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
+            Background = Brush(248, 250, 252),
+            BorderBrush = Brush(226, 232, 240),
+            BorderThickness = new Thickness(1),
+            Padding = new Thickness(8),
+            FontFamily = new System.Windows.Media.FontFamily("Consolas"),
+            FontSize = 12,
+            MaxHeight = 460
+        };
+
+        foreach (var line in json.Split('\n'))
+        {
+            var trimmed = line.Trim();
+            var run = new Run(line + Environment.NewLine);
+            if (trimmed.Contains("\"revision_advice\"")
+                || trimmed.Contains("\"location_hint\"")
+                || trimmed.Contains("\"revision_target\""))
+            {
+                run.Background = Brush(219, 234, 254);
+                run.Foreground = Brush(30, 64, 175);
+            }
+            else if (trimmed.Contains("\"source_highlights\"")
+                || trimmed.Contains("\"quote\"")
+                || trimmed.Contains("\"highlight\"")
+                || trimmed.Contains("\"source_location\""))
+            {
+                run.Background = Brush(255, 247, 214);
+                run.Foreground = Brush(120, 53, 15);
+            }
+            viewer.Document.Blocks.Add(new Paragraph(run)
+            {
+                Margin = new Thickness(0),
+                LineHeight = 18
+            });
+        }
+
+        panel.Children.Add(viewer);
+        return panel;
     }
 
     private async Task DeleteRecordAsync(string resultId)
@@ -2301,6 +2376,7 @@ public partial class MainWindow : Window
         var title = FirstNonEmpty(GetString(finding, "display_title"), GetString(finding, "issue_type"), GetString(finding, "description"), GetString(finding, "hit_text"), "问题项");
         var opinion = FirstNonEmpty(GetString(finding, "review_opinion"), GetLlmReviewString(finding, "user_reason"), GetString(finding, "reason"));
         var evidence = FirstNonEmpty(GetString(finding, "evidence_summary"), GetLlmReviewString(finding, "user_basis"), GetString(finding, "evidence"), GetString(finding, "context"), GetString(finding, "source_section"));
+        var location = FirstNonEmpty(GetString(finding, "location_hint"), GetString(finding, "source_section"));
         var advice = FirstNonEmpty(GetString(finding, "revision_advice"), GetLlmReviewString(finding, "user_suggestion"), GetString(finding, "suggestion"));
         var rule = FirstNonEmpty(GetString(finding, "rule_basis"), GetString(finding, "rule_name"), GetString(finding, "matched_rule"));
         var mergedCount = GetInt(finding, "merged_count");
@@ -2311,13 +2387,119 @@ public partial class MainWindow : Window
         stack.Children.Add(Text(llmRefined ? "AI辅助整理" : "规则审查结果", 12, FontWeights.SemiBold, llmRefined ? Brush(37, 99, 235) : Brush(102, 112, 133), new Thickness(0, 5, 0, 0), true));
         AddTextIf(stack, "审查意见", opinion, FindBrush("TextBrush"));
         AddTextIf(stack, "文档依据", evidence, FindBrush("MutedBrush"));
-        AddTextIf(stack, "修改建议", advice, FindBrush("TextBrush"));
+        AddRevisionAdvice(stack, advice, location);
+        AddSourceHighlights(stack, finding);
         AddTextIf(stack, "涉及规则", rule, FindBrush("MutedBrush"));
         if (mergedCount > 1)
         {
             stack.Children.Add(Text($"同类问题数量：{mergedCount}", 12, null, FindBrush("MutedBrush"), new Thickness(0, 3, 0, 0), true));
         }
         return new Border { Background = Brush(248, 250, 252), BorderBrush = Brush(234, 236, 240), BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), Padding = new Thickness(12), Margin = new Thickness(0, 0, 0, 10), Child = stack };
+    }
+
+    private void AddRevisionAdvice(StackPanel stack, string advice, string location)
+    {
+        if (string.IsNullOrWhiteSpace(advice) && string.IsNullOrWhiteSpace(location))
+        {
+            return;
+        }
+
+        var content = new StackPanel();
+        content.Children.Add(Text("修改建议", 13, FontWeights.SemiBold, Brush(29, 78, 216)));
+        if (!string.IsNullOrWhiteSpace(advice))
+        {
+            content.Children.Add(Text(advice, 13, null, FindBrush("TextBrush"), new Thickness(0, 4, 0, 0), true));
+        }
+        if (!string.IsNullOrWhiteSpace(location))
+        {
+            content.Children.Add(Text($"修改位置：{location}", 12, FontWeights.SemiBold, Brush(71, 84, 103), new Thickness(0, 5, 0, 0), true));
+        }
+        stack.Children.Add(new Border
+        {
+            Background = Brush(239, 246, 255),
+            BorderBrush = Brush(147, 197, 253),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(6),
+            Padding = new Thickness(10),
+            Margin = new Thickness(0, 8, 0, 0),
+            Child = content
+        });
+    }
+
+    private void AddSourceHighlights(StackPanel stack, JsonElement finding)
+    {
+        if (!finding.TryGetProperty("source_highlights", out var highlights)
+            || highlights.ValueKind != JsonValueKind.Array)
+        {
+            AddLegacySourceHighlight(stack, "当前报告原文", GetString(finding, "item_source_excerpt"), GetString(finding, "location_hint"));
+            AddLegacySourceHighlight(stack, "关联报告原文", GetString(finding, "related_source_excerpt"), string.Empty);
+            return;
+        }
+
+        foreach (var highlight in highlights.EnumerateArray())
+        {
+            var quote = GetString(highlight, "quote");
+            if (string.IsNullOrWhiteSpace(quote))
+            {
+                continue;
+            }
+
+            var role = GetString(highlight, "role") switch
+            {
+                "current" => "当前报告原文",
+                "related" => "关联报告原文",
+                _ => "定位原文"
+            };
+            var locator = FormatHighlightLocation(highlight);
+            AddLegacySourceHighlight(stack, role, quote, locator);
+        }
+    }
+
+    private void AddLegacySourceHighlight(StackPanel stack, string role, string quote, string locator)
+    {
+        if (string.IsNullOrWhiteSpace(quote))
+        {
+            return;
+        }
+        var content = new StackPanel();
+        content.Children.Add(Text(
+            string.IsNullOrWhiteSpace(locator) ? role : $"{role} · {locator}",
+            12,
+            FontWeights.SemiBold,
+            Brush(146, 64, 14),
+            null,
+            true));
+        content.Children.Add(Text(quote, 13, null, Brush(66, 32, 6), new Thickness(0, 4, 0, 0), true));
+        stack.Children.Add(new Border
+        {
+            Background = Brush(255, 247, 214),
+            BorderBrush = Brush(245, 196, 81),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(6),
+            Padding = new Thickness(10),
+            Margin = new Thickness(0, 6, 0, 0),
+            Child = content
+        });
+    }
+
+    private static string FormatHighlightLocation(JsonElement highlight)
+    {
+        var filename = GetString(highlight, "file_name");
+        var sheet = GetString(highlight, "sheet_name");
+        var page = GetInt(highlight, "page");
+        var line = GetInt(highlight, "line_start");
+        var row = GetInt(highlight, "row_index");
+        var paragraph = GetInt(highlight, "paragraph");
+        var section = GetString(highlight, "section");
+        var parts = new List<string>();
+        if (!string.IsNullOrWhiteSpace(filename)) parts.Add(filename);
+        if (!string.IsNullOrWhiteSpace(sheet)) parts.Add(sheet);
+        if (page > 0) parts.Add($"第{page}页");
+        if (line > 0) parts.Add($"第{line}行");
+        else if (row > 0) parts.Add($"第{row}行");
+        else if (paragraph > 0) parts.Add($"第{paragraph}段");
+        if (!string.IsNullOrWhiteSpace(section)) parts.Add(section);
+        return string.Join(" · ", parts);
     }
 
     private void AddTextIf(StackPanel stack, string label, string value, Brush brush)

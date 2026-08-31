@@ -1,4 +1,5 @@
 import json
+import mimetypes
 import os
 import tempfile
 import threading
@@ -7,12 +8,13 @@ import uuid
 from collections import Counter
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
-from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Form, HTTPException, Response, UploadFile
 from fastapi.encoders import jsonable_encoder
 from sqlalchemy.orm import Session
 
-from app.db.models import CheckResult, Project
+from app.db.models import CheckResult, Project, SourceArtifact
 from app.db.session import SessionLocal, get_db
 from app.modules.content_consistency.service import run_content_consistency_check_from_document
 from app.modules.data_rules.service import (
@@ -24,6 +26,7 @@ from app.modules.duplicate.service import (
     run_duplicate_check_from_document,
     run_internal_duplicate_check,
 )
+from app.modules.shanghai_review.base import BaseValidator
 from app.modules.resource.service import run_resource_check_from_file
 from app.modules.price.service import (
     import_price_benchmarks,
@@ -129,6 +132,7 @@ async def create_evaluate_task(
     if not module_list:
         raise HTTPException(status_code=400, detail="请至少选择一个已接入的检测模块")
 
+    original_filename = file.filename or "未命名报告"
     temp_path = await _save_upload_to_temp(file, TASK_FILE_EXTENSIONS)
     task_id = str(uuid.uuid4())
     _set_task(
@@ -144,6 +148,7 @@ async def create_evaluate_task(
         _run_evaluate_task,
         task_id,
         temp_path,
+        original_filename,
         project_name,
         department,
         module_list,
@@ -182,6 +187,28 @@ def evaluate_result_detail(result_id: str, db: Session = Depends(get_db)) -> dic
     if row is None:
         raise HTTPException(status_code=404, detail="审查记录不存在")
     return _check_result_to_detail(row)
+
+
+@router.get("/results/{result_id}/sources/{source_id}")
+def evaluate_result_source(result_id: str, source_id: str, db: Session = Depends(get_db)) -> Response:
+    """读取审查记录保存的原始报告快照，供历史报告定位后重新打开。"""
+    artifact = (
+        db.query(SourceArtifact)
+        .filter(
+            SourceArtifact.id == source_id,
+            SourceArtifact.check_result_id == result_id,
+        )
+        .first()
+    )
+    if artifact is None:
+        raise HTTPException(status_code=404, detail="原始报告附件不存在")
+    media_type = artifact.media_type or "application/octet-stream"
+    filename = artifact.filename.replace('"', "")
+    return Response(
+        content=artifact.content,
+        media_type=media_type,
+        headers={"Content-Disposition": f"inline; filename*=UTF-8''{quote(filename)}"},
+    )
 
 
 @router.delete("/results/{result_id}")
@@ -242,10 +269,10 @@ async def evaluate_duplicate_compare(
             current_stage=current_stage,
             history_stages=_parse_history_stages(history_stages),
         )
-        normalized = _normalize_duplicate_result(raw)
+        normalized = _attach_finding_locations(_normalize_duplicate_result(raw), current_content, current_filename)
         project = db.get(Project, raw.project.id)
         if project is not None:
-            _store_check_result(
+            result_id = _store_check_result(
                 db=db,
                 project=project,
                 module="duplicate",
@@ -253,6 +280,24 @@ async def evaluate_duplicate_compare(
                 severity=_highest_result_severity(normalized),
                 suggestion=_first_finding_value(normalized.get("findings") or [], "revision_advice"),
             )
+            source_documents = _store_duplicate_source_artifacts(
+                db=db,
+                result_id=result_id,
+                current=(current_content, current_filename),
+                history=history_payloads,
+                current_stage=current_stage or "本期",
+                history_stages=_parse_history_stages(history_stages),
+            )
+            normalized["source_documents"] = source_documents
+            result_row = db.get(CheckResult, result_id)
+            if result_row is not None:
+                result_row.reference_data = _json_dumps(
+                    {
+                        "project_name": project.name,
+                        "checked_module": "duplicate",
+                        "result": normalized,
+                    }
+                )
             db.commit()
         return normalized
     except ValueError as exc:
@@ -277,7 +322,7 @@ async def evaluate_content_consistency_document(
             filename=filename,
             project_name=project_name,
         )
-        return _normalize_document_rule_result(raw, "content_consistency", use_llm=use_llm)
+        return _attach_finding_locations(_normalize_document_rule_result(raw, "content_consistency", use_llm=use_llm), content, filename)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -299,7 +344,7 @@ async def evaluate_basis_document(
             project_name=project_name,
             selected_rule_ids=_parse_selected_rule_ids(selected_rule_ids),
         )
-        return _normalize_document_rule_result(raw, "basis", use_llm=use_llm)
+        return _attach_finding_locations(_normalize_document_rule_result(raw, "basis", use_llm=use_llm), content, filename)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -321,7 +366,7 @@ async def evaluate_security_document(
             selected_rule_ids=_parse_selected_rule_ids(selected_rule_ids),
             use_llm=use_llm,
         )
-        return _normalize_security_result(raw)
+        return _attach_finding_locations(_normalize_security_result(raw), content, filename)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -341,7 +386,7 @@ async def evaluate_data_rules_document(
             project_name=project_name,
             selected_rule_ids=_parse_selected_rule_ids(selected_rule_ids),
         )
-        return _normalize_document_rule_result(raw, "data_reasonableness", use_llm=use_llm)
+        return _attach_finding_locations(_normalize_document_rule_result(raw, "data_reasonableness", use_llm=use_llm), content, filename)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -362,7 +407,7 @@ async def evaluate_data_reporting_document(
             project_name=project_name,
             selected_rule_ids=_parse_selected_rule_ids(selected_rule_ids),
         )
-        return _normalize_document_rule_result(raw, "data_reasonableness", use_llm=use_llm)
+        return _attach_finding_locations(_normalize_document_rule_result(raw, "data_reasonableness", use_llm=use_llm), content, filename)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -403,6 +448,7 @@ async def evaluate_function_correspondence(
     selected_rule_ids: str | None = Form(default=None),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
+    original_filename = file.filename or "未命名报告"
     temp_path = await _save_upload_to_temp(file, FUNCTION_CORRESPONDENCE_EXTENSIONS)
     try:
         selected_ids = _parse_selected_rule_ids(selected_rule_ids)
@@ -417,11 +463,12 @@ async def evaluate_function_correspondence(
         normalized = _merge_content_consistency_result(
             normalized=normalized,
             content=Path(temp_path).read_bytes(),
-            filename=Path(temp_path).name,
+            filename=original_filename,
             project_name=project_name,
             selected_rule_ids=selected_ids,
             use_llm=use_llm,
         )
+        _attach_finding_locations(normalized, Path(temp_path).read_bytes(), original_filename)
         project = _get_or_create_project(db, project_id, project_name, department)
         _store_check_result(
             db=db,
@@ -455,6 +502,7 @@ async def evaluate_sensitive_word(
     selected_rule_ids: str | None = Form(default=None),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
+    original_filename = file.filename or "未命名报告"
     temp_path = await _save_upload_to_temp(file, SENSITIVE_WORD_EXTENSIONS)
     try:
         result = run_sensitive_word_check(
@@ -464,7 +512,11 @@ async def evaluate_sensitive_word(
             use_llm=use_llm,
             selected_rule_ids=_parse_selected_rule_ids(selected_rule_ids),
         )
-        normalized = _normalize_function_or_sensitive_result(result, "sensitive_word")
+        normalized = _attach_finding_locations(
+            _normalize_function_or_sensitive_result(result, "sensitive_word"),
+            Path(temp_path).read_bytes(),
+            original_filename,
+        )
         project = _get_or_create_project(db, project_id, project_name, department)
         summary = normalized.get("risk_summary") or normalized.get("summary") or {}
         _store_check_result(
@@ -579,7 +631,7 @@ async def _evaluate_price_document_for_module(
             project_level=project_level,
             selected_rule_ids=rule_ids,
         )
-        normalized = _normalize_price_result(result, module)
+        normalized = _attach_finding_locations(_normalize_price_result(result, module), content, file.filename or "price.xlsx")
         project = db.get(Project, result["project_id"])
         if project is not None:
             _store_check_result(db, project, module, normalized, _highest_result_severity(normalized), _first_finding_value(normalized.get("findings") or [], "suggestion"))
@@ -634,6 +686,7 @@ def _set_task(task_id: str, **updates: Any) -> None:
 def _run_evaluate_task(
     task_id: str,
     temp_path: str,
+    original_filename: str,
     project_name: str,
     department: str | None,
     modules: list[str],
@@ -664,6 +717,7 @@ def _run_evaluate_task(
                     db=db,
                     module=module,
                     temp_path=temp_path,
+                    source_filename=original_filename,
                     project=project,
                     project_name=project_name,
                     department=department,
@@ -672,6 +726,7 @@ def _run_evaluate_task(
                     selected_rule_ids=selected_rules.get(module) or [],
                     task_context=task_context,
                 )
+                _attach_finding_locations(result, Path(temp_path).read_bytes(), original_filename)
                 summary = _result_summary(result)
                 severity = _highest_result_severity(result)
                 suggestion = _first_finding_value(result.get("findings") or [], "revision_advice")
@@ -734,6 +789,7 @@ def _run_module_check(
     db: Session,
     module: str,
     temp_path: str,
+    source_filename: str,
     project: Project,
     project_name: str,
     department: str | None,
@@ -758,7 +814,7 @@ def _run_module_check(
         return _merge_content_consistency_result(
             normalized=normalized,
             content=content,
-            filename=Path(temp_path).name,
+            filename=source_filename,
             project_name=project_name,
             selected_rule_ids=selected_rule_ids,
             use_llm=use_llm,
@@ -768,7 +824,7 @@ def _run_module_check(
         _ensure_extension(suffix, BASIS_EXTENSIONS, module)
         raw = run_basis_check_from_document(
             content=content,
-            filename=Path(temp_path).name,
+            filename=source_filename,
             project_name=project_name,
             selected_rule_ids=selected_rule_ids,
         )
@@ -778,7 +834,7 @@ def _run_module_check(
         _ensure_extension(suffix, DOCUMENT_RULE_EXTENSIONS, module)
         raw = run_security_check_from_document(
             content=content,
-            filename=Path(temp_path).name,
+            filename=source_filename,
             project_name=project_name,
             selected_rule_ids=selected_rule_ids,
             use_llm=use_llm,
@@ -801,7 +857,7 @@ def _run_module_check(
         raw = _run_duplicate_module(
             db=db,
             content=content,
-            filename=Path(temp_path).name,
+            filename=source_filename,
             project_id=project.id,
             project_name=project_name,
             department=department,
@@ -812,7 +868,7 @@ def _run_module_check(
         _ensure_extension(suffix, DOCUMENT_RULE_EXTENSIONS, module)
         raw = run_data_rules_check_from_document(
             content=content,
-            filename=Path(temp_path).name,
+            filename=source_filename,
             project_name=project_name,
             selected_rule_ids=selected_rule_ids,
         )
@@ -824,7 +880,7 @@ def _run_module_check(
             raw = run_resource_check_from_file(
                 db=db,
                 content=content,
-                filename=Path(temp_path).name,
+                filename=source_filename,
                 project_id=project.id,
                 project_name=project_name,
                 department=department,
@@ -848,12 +904,12 @@ def _run_module_check(
         if task_context is not None:
             parsed_document = task_context.get("price_document")
             if parsed_document is None:
-                parsed_document = parse_price_document(content, Path(temp_path).name)
+                parsed_document = parse_price_document(content, source_filename)
                 task_context["price_document"] = parsed_document
         raw = run_price_check_from_file(
             db=db,
             content=content,
-            filename=Path(temp_path).name,
+            filename=source_filename,
             project_id=project.id,
             project_name=project_name,
             department=department,
@@ -1274,6 +1330,51 @@ def _store_check_result(
     return row.id
 
 
+def _store_duplicate_source_artifacts(
+    db: Session,
+    result_id: str,
+    current: tuple[bytes, str],
+    history: list[tuple[bytes, str]],
+    current_stage: str,
+    history_stages: list[str],
+) -> list[dict[str, Any]]:
+    """保存跨报告比较涉及的文件快照，并返回可供详情 JSON 使用的入口。"""
+    documents: list[tuple[str, str, tuple[bytes, str]]] = [("current", current_stage, current)]
+    for index, payload in enumerate(history):
+        stage = (
+            history_stages[index]
+            if index < len(history_stages) and history_stages[index]
+            else f"往期{index + 1}"
+        )
+        documents.append(("history", stage, payload))
+
+    result: list[dict[str, Any]] = []
+    for role, stage, (content, filename) in documents:
+        safe_filename = filename or "未命名报告"
+        media_type = mimetypes.guess_type(safe_filename)[0] or "application/octet-stream"
+        artifact = SourceArtifact(
+            check_result_id=result_id,
+            role=role,
+            stage=stage,
+            filename=safe_filename,
+            media_type=media_type,
+            content=content,
+        )
+        db.add(artifact)
+        db.flush()
+        result.append(
+            {
+                "id": artifact.id,
+                "role": role,
+                "stage": stage,
+                "filename": safe_filename,
+                "media_type": media_type,
+                "download_url": f"/api/evaluate/results/{result_id}/sources/{artifact.id}",
+            }
+        )
+    return result
+
+
 def _json_dumps(value: Any) -> str:
     return json.dumps(jsonable_encoder(value), ensure_ascii=False, default=str)
 
@@ -1318,6 +1419,13 @@ def _normalize_duplicate_result(result: DuplicateInternalResponse) -> dict[str, 
                 "related_report_name": right_report,
                 "item_stage": pair.get("item_stage") or "",
                 "related_stage": pair.get("related_stage") or "",
+                "item_row_index": pair.get("item_row_index"),
+                "related_row_index": pair.get("related_row_index"),
+                "item_source_location": pair.get("item_source_location") or {},
+                "related_source_location": pair.get("related_source_location") or {},
+                "item_source_excerpt": pair.get("item_source_excerpt") or "",
+                "related_source_excerpt": pair.get("related_source_excerpt") or "",
+                "location_hint": pair.get("location_hint"),
                 "llm_refined": pair.get("model_name") == "deepseek",
                 "model_name": pair.get("model_name") or "",
                 "merged_count": 1,
@@ -1520,6 +1628,10 @@ def _normalize_resource_result(result: ResourceCheckResponse, use_llm: bool = Fa
                 "rule_id": item.get("rule_code") or item.get("rule_name") or "",
                 "rule_name": item.get("rule_name") or "",
                 "source_section": "资源申请清单",
+                "row_indexes": item.get("row_indexes") or [],
+                "source_locations": item.get("source_locations") or [],
+                "evidence": item.get("evidence"),
+                "location_hint": item.get("location_hint"),
                 "evidence_examples": [value for value in [evidence, item.get("reason")] if value],
                 "merged_count": 1,
             }
@@ -1565,6 +1677,10 @@ def _fallback_resource_result(result: ResourceCheckResponse, exc: Exception) -> 
                 "evidence_summary": evidence,
                 "revision_advice": item.get("suggestion") or "请核对资源申请数量、用途说明和相关章节/清单是否一致。",
                 "rule_basis": item.get("rule_name") or item.get("rule_code") or "资源申请合理性规则",
+                "row_indexes": item.get("row_indexes") or [],
+                "source_locations": item.get("source_locations") or [],
+                "evidence": item.get("evidence"),
+                "location_hint": item.get("location_hint"),
                 "merged_count": 1,
                 "llm_refined": False,
             }
@@ -1618,6 +1734,8 @@ def _resource_result_from_existing_checks(db: Session, project_id: str, exc: Exc
                 "evidence_summary": row.reference_data or "",
                 "revision_advice": row.suggestion or "请核对资源申请数量、用途说明和相关章节/清单是否一致。",
                 "rule_basis": "资源申请合理性规则",
+                "row_indexes": _reference_row_indexes(row.reference_data),
+                "source_locations": _reference_source_locations(row.reference_data),
                 "merged_count": 1,
                 "llm_refined": False,
             }
@@ -1642,8 +1760,283 @@ def _resource_result_from_existing_checks(db: Session, project_id: str, exc: Exc
     }
 
 
+def _reference_row_indexes(reference_data: str | None) -> list[int]:
+    try:
+        payload = json.loads(reference_data or "{}")
+    except (TypeError, ValueError):
+        return []
+    values = payload.get("row_indexes") if isinstance(payload, dict) else []
+    return [int(value) for value in values or [] if str(value).strip().isdigit()]
+
+
+def _reference_source_locations(reference_data: str | None) -> list[dict[str, Any]]:
+    try:
+        payload = json.loads(reference_data or "{}")
+    except (TypeError, ValueError):
+        return []
+    values = payload.get("source_locations") if isinstance(payload, dict) else []
+    return values if isinstance(values, list) else []
+
+
 def _business_status_from_findings(findings: list[dict[str, Any]]) -> str:
     return "发现问题" if findings else "通过"
+
+
+def _attach_finding_locations(
+    result: dict[str, Any],
+    content: bytes,
+    filename: str,
+) -> dict[str, Any]:
+    """Add stable, machine-readable source locations without changing finding text."""
+    lines = _extract_location_lines(content, filename)
+
+    def enrich(finding: dict[str, Any]) -> None:
+        if not isinstance(finding, dict):
+            return
+        existing = finding.get("source_location")
+        location = dict(existing) if isinstance(existing, dict) else {}
+        location.setdefault("file_name", filename)
+        quote_values = [
+            finding.get("evidence"),
+            finding.get("context"),
+            finding.get("hit_text"),
+            finding.get("item"),
+            finding.get("raw_item"),
+            finding.get("item_source_excerpt"),
+            finding.get("related_source_excerpt"),
+        ]
+        for key in ("evidence_examples", "context_examples"):
+            values = finding.get(key)
+            if isinstance(values, list):
+                quote_values.extend(values)
+        quote = next((str(value).strip() for value in quote_values if str(value or "").strip()), "")
+
+        if finding.get("page_no") is not None:
+            location.setdefault("page", finding.get("page_no"))
+        if finding.get("paragraph_index") is not None:
+            location.setdefault("paragraph", finding.get("paragraph_index"))
+        if isinstance(finding.get("start"), int) and finding.get("start", -1) >= 0:
+            location.setdefault("char_start", finding.get("start"))
+        if isinstance(finding.get("end"), int) and finding.get("end", -1) >= 0:
+            location.setdefault("char_end", finding.get("end"))
+        if finding.get("source_row") is not None:
+            location.setdefault("row", finding.get("source_row"))
+        if finding.get("affected_row_start") is not None:
+            location.setdefault("row_start", finding.get("affected_row_start"))
+        if finding.get("affected_row_end") is not None:
+            location.setdefault("row_end", finding.get("affected_row_end"))
+        if finding.get("item_row_index") is not None:
+            location.setdefault("item_row", finding.get("item_row_index"))
+        if finding.get("related_row_index") is not None:
+            location.setdefault("related_row", finding.get("related_row_index"))
+        if finding.get("row_indexes"):
+            location.setdefault("rows", finding.get("row_indexes"))
+        if finding.get("source_locations"):
+            location.setdefault("entries", finding.get("source_locations"))
+        if finding.get("item_source_location"):
+            location.setdefault("current", finding.get("item_source_location"))
+        if finding.get("related_source_location"):
+            location.setdefault("related", finding.get("related_source_location"))
+
+        section = str(finding.get("source_section") or finding.get("section") or "").strip()
+        if section:
+            location.setdefault("section", section)
+
+        match = _find_location_line(lines, quote)
+        if match:
+            location.setdefault("line_start", match[0])
+            location.setdefault("line_end", match[1])
+            location.setdefault("quote", match[2])
+            location.setdefault("precision", "line")
+        elif quote and quote not in {section, "全文"}:
+            # Keep a bounded excerpt even when the parser cannot resolve a
+            # concrete line. Clients can render this as a text highlight.
+            location.setdefault("quote", quote[:500])
+            location.setdefault("precision", "text")
+        else:
+            location.setdefault("precision", "section" if section else "unknown")
+
+        if location:
+            finding["source_location"] = location
+            finding["location_hint"] = _format_location_hint(location)
+            highlights = _build_source_highlights(finding, location)
+            finding["source_highlights"] = highlights
+            finding["revision_target"] = {
+                "location_hint": finding["location_hint"],
+                "source_location": location,
+                "highlights": highlights,
+                "target_type": "source_text" if highlights else "section_or_document",
+                "advice": str(
+                    finding.get("revision_advice")
+                    or finding.get("suggestion")
+                    or ""
+                ),
+            }
+
+    def enrich_findings(items: Any) -> None:
+        if isinstance(items, list):
+            for item in items:
+                enrich(item)
+
+    enrich_findings(result.get("findings"))
+    for rule_result in result.get("rule_results") or []:
+        if isinstance(rule_result, dict):
+            enrich_findings(rule_result.get("findings"))
+    return result
+
+
+def _build_source_highlights(
+    finding: dict[str, Any],
+    location: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Build explicit source excerpts that a client can render as highlights."""
+    candidates: list[tuple[str, dict[str, Any], str]] = []
+    current = location.get("current")
+    related = location.get("related")
+    entries = location.get("entries")
+    if isinstance(current, dict):
+        candidates.append(("current", current, str(finding.get("item_source_excerpt") or "")))
+    if isinstance(related, dict):
+        candidates.append(("related", related, str(finding.get("related_source_excerpt") or "")))
+    if isinstance(entries, list):
+        for index, entry in enumerate(entries, start=1):
+            if isinstance(entry, dict):
+                candidates.append((f"evidence_{index}", entry, str(entry.get("quote") or "")))
+    if not candidates:
+        candidates.append(
+            (
+                "current",
+                location,
+                str(
+                    location.get("quote")
+                    or finding.get("hit_text")
+                    or finding.get("evidence")
+                    or finding.get("evidence_summary")
+                    or finding.get("context")
+                    or next(
+                        (
+                            str(value)
+                            for key in ("evidence_examples", "context_examples")
+                            for value in (finding.get(key) or [])
+                            if str(value or "").strip()
+                        ),
+                        "",
+                    )
+                    or ""
+                ),
+            )
+        )
+
+    highlights: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for role, source, fallback_quote in candidates:
+        # Some modules keep the excerpt on the finding while the location
+        # object only carries row/page metadata. Use that fallback so the
+        # JSON contract still contains a renderable highlight.
+        source_quote = str(source.get("quote") or fallback_quote or "").strip()
+        quote_text = source_quote[:500]
+        if not quote_text:
+            continue
+        item = {
+            "role": role,
+            "file_name": source.get("file_name") or location.get("file_name"),
+            "file_type": source.get("file_type"),
+            "sheet_name": source.get("sheet_name"),
+            "page": source.get("page"),
+            "paragraph": source.get("paragraph"),
+            "line_start": source.get("line_start"),
+            "line_end": source.get("line_end"),
+            "row_index": source.get("row_index") or source.get("row"),
+            "section": source.get("section"),
+            "char_start": source.get("char_start"),
+            "char_end": source.get("char_end"),
+            "quote": quote_text,
+            "precision": source.get("precision") or location.get("precision") or "unknown",
+            "highlight": True,
+        }
+        key = (
+            item["role"], item["file_name"], item["page"], item["line_start"],
+            item["row_index"], item["section"], item["quote"],
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        highlights.append(item)
+    return highlights
+
+
+def _extract_location_lines(content: bytes, filename: str) -> list[str]:
+    suffix = Path(filename).suffix.lower()
+    try:
+        if suffix in {".txt", ".md", ".csv"}:
+            return content.decode("utf-8-sig", errors="replace").splitlines()
+        if suffix in {".docx", ".pdf"}:
+            document = BaseValidator.parse_document(content, filename)
+            return str(document.get("_full_text") or "").splitlines()
+    except Exception:
+        return []
+    return []
+
+
+def _find_location_line(lines: list[str], quote: str) -> tuple[int, int, str] | None:
+    compact_quote = "".join(str(quote or "").split())
+    if len(compact_quote) < 4:
+        return None
+    for index, line in enumerate(lines, start=1):
+        if quote in line:
+            return index, index, line.strip()
+        compact_line = "".join(line.split())
+        if compact_quote in compact_line:
+            return index, index, line.strip()
+        if len(compact_line) >= 8 and compact_line in compact_quote:
+            return index, index, line.strip()
+    return None
+
+
+def _format_location_hint(location: dict[str, Any]) -> str:
+    if isinstance(location.get("current"), dict) or isinstance(location.get("related"), dict):
+        current = location.get("current") if isinstance(location.get("current"), dict) else {}
+        related = location.get("related") if isinstance(location.get("related"), dict) else {}
+        current_hint = _format_single_source_hint(current, "当前报告")
+        related_hint = _format_single_source_hint(related, "关联报告")
+        return f"当前：{current_hint}；关联：{related_hint}"
+    filename = str(location.get("file_name") or "").strip()
+    prefix = f"{filename}，" if filename else ""
+    if location.get("page") is not None and location.get("line_start") is not None:
+        return f"{prefix}第{location['page']}页，第{location['line_start']}行"
+    if location.get("row") is not None:
+        section = str(location.get("section") or "资源清单")
+        return f"{prefix}{section}第{location['row']}行"
+    if location.get("rows"):
+        section = str(location.get("section") or "资源清单")
+        rows = "、".join(str(item) for item in location["rows"][:8])
+        return f"{prefix}{section}原始行：{rows}"
+    if location.get("line_start") is not None:
+        section = str(location.get("section") or "原文")
+        return f"{prefix}{section}第{location['line_start']}行"
+    if location.get("paragraph") is not None:
+        return f"{prefix}原文第{location['paragraph']}段"
+    if location.get("section"):
+        return f"{prefix}章节：{location['section']}（未匹配到具体行）"
+    return f"{prefix}未识别到具体原文位置"
+
+
+def _format_single_source_hint(location: dict[str, Any], fallback_name: str) -> str:
+    filename = str(location.get("file_name") or fallback_name)
+    if location.get("page") is not None and location.get("line_start") is not None:
+        return f"{filename}第{location['page']}页第{location['line_start']}行"
+    if location.get("line_start") is not None:
+        return f"{filename}第{location['line_start']}行"
+    if location.get("row_index") is not None:
+        sheet = str(location.get("sheet_name") or "")
+        sheet_text = f"（{sheet}）" if sheet else ""
+        return f"{filename}{sheet_text}第{location['row_index']}行"
+    if location.get("row") is not None:
+        return f"{filename}第{location['row']}行"
+    if location.get("paragraph") is not None:
+        return f"{filename}第{location['paragraph']}段"
+    section = str(location.get("section") or "").strip()
+    return f"{filename}章节：{section}" if section else f"{filename}位置未识别"
 
 
 def _summary_from_findings(findings: list[dict[str, Any]], **extras: Any) -> dict[str, Any]:
@@ -1687,16 +2080,79 @@ def _check_result_to_list_item(row: CheckResult) -> dict[str, Any]:
 def _check_result_to_detail(row: CheckResult) -> dict[str, Any]:
     payload = _load_reference_payload(row)
     result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+    _upgrade_stored_finding_locations(result)
     findings = result.get("findings") or []
     if row.module == "function_correspondence" and isinstance(findings, list) and len(findings) > 50:
         findings = findings[:50]
     if row.module == "sensitive_word" and isinstance(findings, list) and len(findings) > 100:
         findings = findings[:100]
+    source_documents = result.get("source_documents") or _source_artifacts_to_list(row)
     return {
         **_check_result_to_list_item(row),
         "result": result,
         "findings": findings,
+        "source_documents": source_documents,
     }
+
+
+def _upgrade_stored_finding_locations(result: dict[str, Any]) -> None:
+    """Upgrade older stored results to the current revision-location contract."""
+    def upgrade(finding: Any) -> None:
+        if not isinstance(finding, dict):
+            return
+        existing_target = finding.get("revision_target")
+        existing_highlights = finding.get("source_highlights")
+        if (
+            isinstance(existing_target, dict)
+            and isinstance(existing_highlights, list)
+            and existing_highlights
+        ):
+            return
+        existing = finding.get("source_location")
+        location = dict(existing) if isinstance(existing, dict) else {}
+        if finding.get("item_source_location"):
+            location.setdefault("current", finding.get("item_source_location"))
+        if finding.get("related_source_location"):
+            location.setdefault("related", finding.get("related_source_location"))
+        if finding.get("source_locations"):
+            location.setdefault("entries", finding.get("source_locations"))
+        section = str(finding.get("source_section") or "").strip()
+        if section:
+            location.setdefault("section", section)
+        if not location:
+            return
+        finding["source_location"] = location
+        finding.setdefault("location_hint", _format_location_hint(location))
+        highlights = _build_source_highlights(finding, location)
+        finding["source_highlights"] = highlights
+        finding["revision_target"] = {
+            "location_hint": finding.get("location_hint"),
+            "source_location": location,
+            "highlights": highlights,
+            "target_type": "source_text" if highlights else "section_or_document",
+            "advice": str(finding.get("revision_advice") or finding.get("suggestion") or ""),
+        }
+
+    for finding in result.get("findings") or []:
+        upgrade(finding)
+    for rule_result in result.get("rule_results") or []:
+        if isinstance(rule_result, dict):
+            for finding in rule_result.get("findings") or []:
+                upgrade(finding)
+
+
+def _source_artifacts_to_list(row: CheckResult) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": artifact.id,
+            "role": artifact.role,
+            "stage": artifact.stage,
+            "filename": artifact.filename,
+            "media_type": artifact.media_type,
+            "download_url": f"/api/evaluate/results/{row.id}/sources/{artifact.id}",
+        }
+        for artifact in (row.source_artifacts or [])
+    ]
 
 
 def _load_reference_payload(row: CheckResult) -> dict[str, Any]:

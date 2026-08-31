@@ -12,6 +12,9 @@ from docx import Document
 class DocumentSection:
     title: str
     content: str
+    start_line: int = 0
+    end_line: int = 0
+    page_no: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -62,7 +65,7 @@ def _parse_docx(content: bytes, filename: str) -> DocumentContent:
             current_section_title = text
         else:
             current_section_content.append(text)
-            raw_text_parts.append(text)
+        raw_text_parts.append(text)
 
     table_text_parts = _extract_docx_table_text(doc)
     if table_text_parts:
@@ -110,14 +113,21 @@ def _parse_pdf(content: bytes, filename: str) -> DocumentContent:
     sections: List[DocumentSection] = []
     raw_text_parts = []
 
+    line_index = 0
     for page_num, page in enumerate(pdf.pages, 1):
         text = page.extract_text()
         if text:
             raw_text_parts.append(text.strip())
+            page_lines = [line for line in text.splitlines() if line.strip()]
+            start_line = line_index + 1
+            line_index += len(page_lines)
             sections.append(
                 DocumentSection(
                     title=f"第 {page_num} 页",
                     content=text.strip(),
+                    start_line=start_line,
+                    end_line=line_index,
+                    page_no=page_num,
                 )
             )
 

@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import List, Optional
 from uuid import uuid4
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, LargeBinary, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -160,6 +160,29 @@ class CheckResult(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     project: Mapped[Project] = relationship(back_populates="check_results")
+    source_artifacts: Mapped[List["SourceArtifact"]] = relationship(
+        back_populates="check_result",
+        cascade="all, delete-orphan",
+    )
+
+
+class SourceArtifact(Base):
+    """原始审查文件快照，用于历史报告定位后的重新读取。"""
+
+    __tablename__ = "source_artifacts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    check_result_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("check_results.id"), index=True
+    )
+    role: Mapped[str] = mapped_column(String(32), default="current")
+    stage: Mapped[Optional[str]] = mapped_column(String(64))
+    filename: Mapped[str] = mapped_column(String(300), nullable=False)
+    media_type: Mapped[str] = mapped_column(String(120), default="application/octet-stream")
+    content: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    check_result: Mapped["CheckResult"] = relationship(back_populates="source_artifacts")
 
 
 class AuditLog(Base):
@@ -172,4 +195,3 @@ class AuditLog(Base):
     module: Mapped[Optional[str]] = mapped_column(String(64))
     detail: Mapped[str] = mapped_column(Text, default="{}")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-

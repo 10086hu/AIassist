@@ -67,6 +67,7 @@ class ResourceRuleFinding:
     source_quantities: dict[str, float]
     # 相关原始行号，方便用户回到 Excel/CSV 定位。
     row_indexes: list[int]
+    source_locations: list[dict[str, object]] | None = None
 
 
 def evaluate_resource_rules(items: list[ParsedResourceItem]) -> list[ResourceRuleFinding]:
