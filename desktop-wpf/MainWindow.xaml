@@ -248,6 +248,7 @@
                     <RowDefinition Height="Auto"/>
                     <RowDefinition Height="Auto"/>
                     <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
                     <RowDefinition/>
                     <RowDefinition Height="Auto"/>
                 </Grid.RowDefinitions>
@@ -257,7 +258,6 @@
                         <TextBlock Text="可研报告智能检测工作台" FontSize="28" FontWeight="Bold" Foreground="{StaticResource TextBrush}"/>
                         <TextBlock Text="上传报告后，先完成前置完整性检查，再选择需要 AI 助手检测的审查点。" Foreground="{StaticResource MutedBrush}" Margin="0,6,0,0"/>
                     </StackPanel>
-                    <Button Content="开始检测" Style="{StaticResource PrimaryButton}" HorizontalAlignment="Right" VerticalAlignment="Center" Click="OnStartCheckClicked"/>
                 </Grid>
 
                 <Grid Grid.Row="1" Margin="0,18,0,0">
@@ -289,7 +289,23 @@
                     </Border>
                 </Grid>
 
-                <Border Grid.Row="2" Style="{StaticResource CardBorder}" Padding="18,16" Margin="0,16,0,0">
+                <Border Grid.Row="2" Style="{StaticResource CardBorder}" Padding="18,14" Margin="0,16,0,0">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="2*"/>
+                            <ColumnDefinition Width="4*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <StackPanel VerticalAlignment="Center">
+                            <TextBlock Text="所属项目" FontSize="17" FontWeight="SemiBold"/>
+                            <TextBlock Text="先选择项目，再选择本次审查报告。" Foreground="{StaticResource MutedBrush}" Margin="0,5,0,0"/>
+                        </StackPanel>
+                        <ComboBox x:Name="ProjectComboBox" Grid.Column="1" Margin="18,0" Padding="10,8" VerticalContentAlignment="Center" DisplayMemberPath="Name"/>
+                        <Button Grid.Column="2" Content="新建项目" Style="{StaticResource SecondaryButton}" Click="OnCreateProjectClicked"/>
+                    </Grid>
+                </Border>
+
+                <Border Grid.Row="3" Style="{StaticResource CardBorder}" Padding="18,16" Margin="0,16,0,0">
                     <Grid>
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="2*"/>
@@ -308,7 +324,26 @@
                     </Grid>
                 </Border>
 
-                <Grid Grid.Row="3" Margin="0,18,0,10">
+                <Border Grid.Row="4" Style="{StaticResource CardBorder}" Padding="18,16" Margin="0,16,0,0">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="2*"/>
+                            <ColumnDefinition Width="4*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <StackPanel VerticalAlignment="Center">
+                            <TextBlock Text="任务状态" FontSize="17" FontWeight="SemiBold"/>
+                            <TextBlock Text="查看当前检测进度并启动审查任务。"
+                                       Foreground="{StaticResource MutedBrush}" Margin="0,6,0,0"/>
+                        </StackPanel>
+                        <Border Grid.Column="1" Background="#F8FAFC" BorderBrush="{StaticResource BorderBrushSoft}" BorderThickness="1" CornerRadius="8" Padding="12" Margin="18,0">
+                            <TextBlock x:Name="StatusTextBlock" Text="等待上传报告并选择检测项" Foreground="#475467" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
+                        </Border>
+                        <Button Grid.Column="2" x:Name="StartCheckButton" Content="开始检测" Style="{StaticResource PrimaryButton}" Click="OnStartCheckClicked"/>
+                    </Grid>
+                </Border>
+
+                <Grid Grid.Row="5" Margin="0,18,0,10">
                     <TextBlock Text="专项检测范围" FontSize="18" FontWeight="Bold"/>
                     <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
                         <Button Content="全选" Style="{StaticResource SecondaryButton}" Margin="0,0,8,0" Click="OnSelectAllClicked"/>
@@ -316,18 +351,7 @@
                     </StackPanel>
                 </Grid>
 
-                <UniformGrid x:Name="CheckItemsGrid" Grid.Row="4" Columns="3" Rows="3"/>
-
-                <Grid Grid.Row="5" Margin="0,16,0,0">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="Auto"/>
-                        <ColumnDefinition/>
-                    </Grid.ColumnDefinitions>
-                    <TextBlock Text="任务状态" FontSize="17" FontWeight="SemiBold" VerticalAlignment="Center" Margin="0,0,16,0"/>
-                    <Border Grid.Column="1" Background="#F8FAFC" BorderBrush="{StaticResource BorderBrushSoft}" BorderThickness="1" CornerRadius="8" Padding="12">
-                        <TextBlock x:Name="StatusTextBlock" Text="等待上传报告并选择检测项" Foreground="#475467"/>
-                    </Border>
-                </Grid>
+                <UniformGrid x:Name="CheckItemsGrid" Grid.Row="6" Columns="3" Rows="3"/>
             </Grid>
         </Grid>
     </Grid>

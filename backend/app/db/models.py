@@ -43,6 +43,10 @@ class Project(Base):
         back_populates="project",
         cascade="all, delete-orphan",
     )
+    check_runs: Mapped[List["CheckRun"]] = relationship(
+        back_populates="project",
+        cascade="all, delete-orphan",
+    )
 
 
 class FunctionPoint(Base):
@@ -141,11 +145,30 @@ class DocChunk(Base):
     doc: Mapped[KnowledgeDoc] = relationship(back_populates="chunks")
 
 
+class CheckRun(Base):
+    __tablename__ = "check_runs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    project_id: Mapped[str] = mapped_column(String(36), ForeignKey("projects.id"), index=True)
+    report_name: Mapped[str] = mapped_column(String(300), nullable=False)
+    source_filename: Mapped[Optional[str]] = mapped_column(String(300))
+    status: Mapped[str] = mapped_column(String(32), default="running")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    project: Mapped[Project] = relationship(back_populates="check_runs")
+    check_results: Mapped[List["CheckResult"]] = relationship(
+        back_populates="check_run",
+        cascade="all, delete-orphan",
+    )
+
+
 class CheckResult(Base):
     __tablename__ = "check_results"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     project_id: Mapped[str] = mapped_column(String(36), ForeignKey("projects.id"), index=True)
+    check_run_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("check_runs.id"), index=True)
     module: Mapped[str] = mapped_column(String(32), nullable=False)
     check_subtype: Mapped[str] = mapped_column(String(64), nullable=False)
     item_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
@@ -160,6 +183,7 @@ class CheckResult(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     project: Mapped[Project] = relationship(back_populates="check_results")
+    check_run: Mapped[Optional[CheckRun]] = relationship(back_populates="check_results")
     source_artifacts: Mapped[List["SourceArtifact"]] = relationship(
         back_populates="check_result",
         cascade="all, delete-orphan",

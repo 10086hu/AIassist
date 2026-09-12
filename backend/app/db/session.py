@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import settings
@@ -18,6 +18,13 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, futu
 
 def init_db() -> None:
     Base.metadata.create_all(bind=engine)
+    if "check_results" not in inspect(engine).get_table_names():
+        return
+
+    columns = {column["name"] for column in inspect(engine).get_columns("check_results")}
+    if "check_run_id" not in columns:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE check_results ADD COLUMN check_run_id VARCHAR(36)"))
 
 
 def get_db():

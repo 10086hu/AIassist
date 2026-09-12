@@ -24,6 +24,11 @@ class ProjectOut(BaseModel):
     updated_at: datetime
 
 
+class CheckRunCreate(BaseModel):
+    report_name: str = Field(min_length=1, max_length=300)
+    source_filename: Optional[str] = None
+
+
 class FunctionPointOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

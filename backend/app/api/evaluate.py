@@ -14,7 +14,7 @@ from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Form, HTTPE
 from fastapi.encoders import jsonable_encoder
 from sqlalchemy.orm import Session
 
-from app.db.models import CheckResult, Project, SourceArtifact
+from app.db.models import CheckResult, CheckRun, Project, SourceArtifact
 from app.db.session import SessionLocal, get_db
 from app.modules.content_consistency.service import run_content_consistency_check_from_document
 from app.modules.data_rules.service import (
@@ -120,6 +120,8 @@ def evaluate_llm_ping(payload: dict[str, Any] = Body(default_factory=dict)) -> d
 async def create_evaluate_task(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
+    project_id: str | None = Form(default=None),
+    check_run_id: str | None = Form(default=None),
     project_name: str = Form(default="未命名可研项目"),
     department: str | None = Form(default=None),
     modules: str = Form(default="function_correspondence,sensitive_word"),
@@ -149,6 +151,8 @@ async def create_evaluate_task(
         task_id,
         temp_path,
         original_filename,
+        project_id,
+        check_run_id,
         project_name,
         department,
         module_list,
@@ -244,6 +248,7 @@ async def evaluate_duplicate_compare(
     current_file: UploadFile = File(...),
     history_files: list[UploadFile] = File(default=[]),
     project_id: str | None = Form(default=None),
+    check_run_id: str | None = Form(default=None),
     project_name: str = Form(default="未命名可研项目"),
     department: str | None = Form(default=None),
     current_stage: str = Form(default="本期"),
@@ -272,6 +277,9 @@ async def evaluate_duplicate_compare(
         normalized = _attach_finding_locations(_normalize_duplicate_result(raw), current_content, current_filename)
         project = db.get(Project, raw.project.id)
         if project is not None:
+            check_run = db.get(CheckRun, check_run_id) if check_run_id else None
+            if check_run_id and (check_run is None or check_run.project_id != project.id):
+                raise ValueError("报告检查记录不存在或不属于当前项目")
             result_id = _store_check_result(
                 db=db,
                 project=project,
@@ -279,6 +287,8 @@ async def evaluate_duplicate_compare(
                 result=normalized,
                 severity=_highest_result_severity(normalized),
                 suggestion=_first_finding_value(normalized.get("findings") or [], "revision_advice"),
+                check_run_id=check_run.id if check_run else None,
+                report_name=current_filename,
             )
             source_documents = _store_duplicate_source_artifacts(
                 db=db,
@@ -294,10 +304,13 @@ async def evaluate_duplicate_compare(
                 result_row.reference_data = _json_dumps(
                     {
                         "project_name": project.name,
+                        "report_name": current_filename,
                         "checked_module": "duplicate",
                         "result": normalized,
                     }
                 )
+            if check_run is not None:
+                check_run.status = "completed"
             db.commit()
         return normalized
     except ValueError as exc:
@@ -687,6 +700,8 @@ def _run_evaluate_task(
     task_id: str,
     temp_path: str,
     original_filename: str,
+    project_id: str | None,
+    check_run_id: str | None,
     project_name: str,
     department: str | None,
     modules: list[str],
@@ -701,7 +716,20 @@ def _run_evaluate_task(
     try:
         _set_task(task_id, status="running", progress=5, stage="running", message="正在执行规则审查")
         selected_rules = _parse_selected_rule_ids_by_module(selected_rule_ids)
-        project = _get_or_create_project(db, None, project_name, department)
+        project = _get_or_create_project(db, project_id, project_name, department)
+        check_run = db.get(CheckRun, check_run_id) if check_run_id else None
+        if check_run is None or check_run.project_id != project.id:
+            check_run = CheckRun(
+                project_id=project.id,
+                report_name=original_filename,
+                source_filename=original_filename,
+                status="running",
+            )
+            db.add(check_run)
+            db.flush()
+        else:
+            check_run.status = "running"
+        db.commit()
 
         for index, module in enumerate(modules, start=1):
             progress_base = int((index - 1) / max(1, len(modules)) * 80) + 5
@@ -737,6 +765,8 @@ def _run_evaluate_task(
                     result=result,
                     severity=severity,
                     suggestion=suggestion,
+                    check_run_id=check_run.id,
+                    report_name=original_filename,
                 )
                 db.commit()
                 result_ids.append(result_id)
@@ -748,6 +778,8 @@ def _run_evaluate_task(
                 task_errors.append(f"{_module_display_name(module)}: {exc}")
 
         if not result_ids:
+            check_run.status = "failed"
+            db.commit()
             _set_task(
                 task_id,
                 status="failed",
@@ -760,6 +792,8 @@ def _run_evaluate_task(
             return
 
         final_status = "partial" if task_errors else "completed"
+        check_run.status = final_status
+        db.commit()
         _set_task(
             task_id,
             status=final_status,
@@ -1307,15 +1341,19 @@ def _store_check_result(
     result: dict[str, Any],
     severity: str,
     suggestion: str | None,
+    check_run_id: str | None = None,
+    report_name: str | None = None,
 ) -> str:
     serializable_result = jsonable_encoder(result)
     result_json = {
         "project_name": project.name,
+        "report_name": report_name or result.get("report_name") or project.name,
         "checked_module": module,
         "result": serializable_result,
     }
     row = CheckResult(
         project_id=project.id,
+        check_run_id=check_run_id,
         module=module,
         check_subtype="aggregate",
         severity=severity or "通过",
