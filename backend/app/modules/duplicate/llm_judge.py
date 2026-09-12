@@ -32,9 +32,10 @@ def judge_pair_with_llm(
     right_description: str,
     similarity: float,
     context: str = "",
+    use_llm: bool = True,
 ) -> LLMJudgement:
     """调用 DeepSeek 大模型进行重复判定"""
-    if not settings.deepseek_api_key:
+    if not use_llm or not settings.deepseek_api_key:
         logger.warning("DEEPSEEK_API_KEY not set, falling back to rule-based judge")
         return _fallback_judge(left_name, left_description, right_name, right_description, similarity)
 

@@ -232,13 +232,14 @@ async def evaluate_duplicate_internal(
     project_id: str | None = Form(default=None),
     project_name: str = Form(default="未命名可研项目"),
     department: str | None = Form(default=None),
+    use_llm: bool = Form(default=True),
     db: Session = Depends(get_db),
 ) -> DuplicateInternalResponse:
     filename = file.filename or ""
     content = await _read_upload(file, DUPLICATE_EXTENSIONS)
 
     try:
-        return _run_duplicate_module(db, content, filename, project_id, project_name, department)
+        return _run_duplicate_module(db, content, filename, project_id, project_name, department, use_llm=use_llm)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -253,6 +254,7 @@ async def evaluate_duplicate_compare(
     department: str | None = Form(default=None),
     current_stage: str = Form(default="本期"),
     history_stages: str | None = Form(default=None),
+    use_llm: bool = Form(default=True),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     current_filename = current_file.filename or ""
@@ -273,6 +275,7 @@ async def evaluate_duplicate_compare(
             department=department,
             current_stage=current_stage,
             history_stages=_parse_history_stages(history_stages),
+            use_llm=use_llm,
         )
         normalized = _attach_finding_locations(_normalize_duplicate_result(raw), current_content, current_filename)
         project = db.get(Project, raw.project.id)
@@ -895,6 +898,7 @@ def _run_module_check(
             project_id=project.id,
             project_name=project_name,
             department=department,
+            use_llm=use_llm,
         )
         return _normalize_duplicate_result(raw)
 
@@ -962,6 +966,7 @@ def _run_duplicate_module(
     project_id: str | None,
     project_name: str,
     department: str | None,
+    use_llm: bool = True,
 ) -> DuplicateInternalResponse:
     lower = filename.lower()
     if lower.endswith((".xlsx", ".csv")):
@@ -972,6 +977,7 @@ def _run_duplicate_module(
             project_id=project_id,
             project_name=project_name,
             department=department,
+            use_llm=use_llm,
         )
     if lower.endswith((".docx", ".pdf")):
         return run_duplicate_check_from_document(
@@ -981,6 +987,7 @@ def _run_duplicate_module(
             project_id=project_id,
             project_name=project_name,
             department=department,
+            use_llm=use_llm,
         )
     raise ValueError("不支持的文件格式。重复建设检查支持：.xlsx, .csv, .docx, .pdf")
 
@@ -1050,6 +1057,16 @@ def _build_function_rule_results(
             )
         )
     return rule_results
+
+
+def _attach_function_rule_results(normalized: dict[str, Any]) -> dict[str, Any]:
+    """Backward-compatible wrapper for callers using the previous helper name."""
+    findings = [dict(item) for item in normalized.get("findings") or [] if isinstance(item, dict)]
+    rule_results = _build_function_rule_results(normalized, findings)
+    normalized["findings"] = findings
+    normalized["rule_results"] = rule_results
+    normalized["rule_results_summary"] = _summary_from_rule_results(rule_results)
+    return normalized
 
 
 def _rules_from_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:

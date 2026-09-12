@@ -1,10 +1,10 @@
 from pathlib import Path
 
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, inspect, text, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import settings
-from app.db.models import Base
+from app.db.models import Base, CheckRun
 
 
 if settings.database_url.startswith("sqlite:///"):
@@ -25,6 +25,15 @@ def init_db() -> None:
     if "check_run_id" not in columns:
         with engine.begin() as connection:
             connection.execute(text("ALTER TABLE check_results ADD COLUMN check_run_id VARCHAR(36)"))
+
+    # A process crash cannot execute the normal task finalizer. Recover those
+    # batches on the next startup instead of exposing them as permanently running.
+    with SessionLocal.begin() as db:
+        db.execute(
+            update(CheckRun)
+            .where(CheckRun.status == "running")
+            .values(status="interrupted")
+        )
 
 
 def get_db():

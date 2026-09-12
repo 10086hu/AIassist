@@ -15,6 +15,9 @@ from app.modules.duplicate.excel_parser import ParsedFunctionPoint
 
 logger = logging.getLogger(__name__)
 
+MAX_SECTION_CHARS = 12000
+SECTION_OVERLAP_CHARS = 500
+
 
 def extract_function_points(
     doc_content: DocumentContent,
@@ -49,13 +52,22 @@ def extract_function_points(
 
             logger.info(f"提取第 {idx} 个章节: {section.title}")
 
-            points = _extract_from_text(
-                section.content,
-                section_title=section.title,
-                project_context=project_context,
-                previous_points=extracted_points,
-            )
-            extracted_points.extend(points)
+            content = section.content.strip()
+            step = MAX_SECTION_CHARS - SECTION_OVERLAP_CHARS
+            for offset in range(0, len(content), step):
+                chunk = content[offset : offset + MAX_SECTION_CHARS]
+                if not chunk.strip():
+                    continue
+                chunk_title = section.title
+                if len(content) > MAX_SECTION_CHARS:
+                    chunk_title = f"{section.title}（片段 {offset // step + 1}）"
+                points = _extract_from_text(
+                    chunk,
+                    section_title=chunk_title,
+                    project_context=project_context,
+                    previous_points=extracted_points,
+                )
+                extracted_points.extend(points)
 
     # 后处理：去重和验证
     final_points: List[ParsedFunctionPoint] = []

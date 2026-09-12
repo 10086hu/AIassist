@@ -1,4 +1,5 @@
 import json
+from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
@@ -54,6 +55,55 @@ def project_tree(db: Session = Depends(get_db)) -> dict[str, list[dict[str, obje
     return {"items": [_project_tree_to_dict(project) for project in projects]}
 
 
+@router.delete("/{project_id}")
+def delete_project(project_id: str, db: Session = Depends(get_db)) -> dict[str, object]:
+    project = db.get(Project, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="项目不存在")
+
+    db.delete(project)
+    db.commit()
+    return {"success": True, "deleted_id": project_id}
+
+
+@router.delete("/{project_id}/check-runs/{check_run_id}")
+def delete_check_run(project_id: str, check_run_id: str, db: Session = Depends(get_db)) -> dict[str, object]:
+    """Delete a real check batch or one legacy result group."""
+    if check_run_id.startswith("legacy:"):
+        legacy_payload = check_run_id[len("legacy:"):]
+        if ":" not in legacy_payload:
+            raise HTTPException(status_code=404, detail="历史检查记录编号无效")
+        report_name, created_day = legacy_payload.rsplit(":", 1)
+        try:
+            target_day = date.fromisoformat(created_day)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail="历史检查记录日期无效") from exc
+
+        candidates = [
+            result
+            for result in db.query(CheckResult)
+            .filter(CheckResult.project_id == project_id, CheckResult.check_run_id.is_(None))
+            .all()
+            if result.created_at
+            and result.created_at.date() == target_day
+            and _legacy_report_name(result) == report_name
+        ]
+        if not candidates:
+            raise HTTPException(status_code=404, detail="历史检查记录不存在或不属于当前项目")
+        for result in candidates:
+            db.delete(result)
+        db.commit()
+        return {"success": True, "deleted_id": check_run_id, "deleted_count": len(candidates), "legacy": True}
+
+    run = db.get(CheckRun, check_run_id)
+    if run is None or run.project_id != project_id:
+        raise HTTPException(status_code=404, detail="报告检查记录不存在或不属于当前项目")
+
+    db.delete(run)
+    db.commit()
+    return {"success": True, "deleted_id": check_run_id, "project_id": project_id}
+
+
 @router.get("/{project_id}", response_model=ProjectOut)
 def get_project(project_id: str, db: Session = Depends(get_db)) -> Project:
     project = db.get(Project, project_id)
@@ -67,12 +117,14 @@ def _project_tree_to_dict(project: Project) -> dict[str, object]:
     for result in project.check_results:
         if result.check_run_id:
             continue
-        legacy_id = f"legacy:{result.id}"
+        report_name = _legacy_report_name(result)
+        created_day = result.created_at.date().isoformat() if result.created_at else "unknown"
+        legacy_id = f"legacy:{report_name}:{created_day}"
         run = runs.setdefault(
             legacy_id,
             {
                 "id": legacy_id,
-                "report_name": _legacy_report_name(result),
+                "report_name": report_name,
                 "source_filename": None,
                 "status": "completed",
                 "created_at": result.created_at.isoformat() if result.created_at else "",

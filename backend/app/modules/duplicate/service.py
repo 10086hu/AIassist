@@ -18,6 +18,11 @@ from app.modules.duplicate.llm_judge import judge_pair_with_llm
 from app.schemas import DuplicateInternalResponse, DuplicatePairOut, ProjectOut
 
 
+MAX_LOCAL_DOCUMENT_CHARS = 300_000
+MAX_DUPLICATE_POINTS = 120
+MAX_CANDIDATE_PAIRS = 2_000
+
+
 @dataclass(frozen=True)
 class CandidatePair:
     left: FunctionPoint
@@ -61,11 +66,12 @@ def run_internal_duplicate_check(
     project_id: Optional[str],
     project_name: str,
     department: Optional[str],
+    use_llm: bool = True,
 ) -> DuplicateInternalResponse:
     """从 Excel/CSV 文件进行内部去重检查"""
     parsed_points = parse_function_points(content, filename)
     return _process_function_points(
-        db, parsed_points, project_id, project_name, department
+        db, parsed_points, project_id, project_name, department, use_llm=use_llm
     )
 
 
@@ -76,6 +82,7 @@ def run_duplicate_check_from_document(
     project_id: Optional[str],
     project_name: str,
     department: Optional[str],
+    use_llm: bool = True,
 ) -> DuplicateInternalResponse:
     """
     从上传的文档（Word/PDF）进行内部去重检查
@@ -85,11 +92,11 @@ def run_duplicate_check_from_document(
     doc_content = parse_document(content, filename)
 
     # 2. LLM 提取功能点
-    extracted_points = extract_function_points(doc_content, project_context=project_name)
+    extracted_points = _parse_document_function_points(doc_content, project_name, use_llm=use_llm)
 
     # 3. 复用现有流程处理功能点
     return _process_function_points(
-        db, extracted_points, project_id, project_name, department
+        db, extracted_points, project_id, project_name, department, use_llm=use_llm
     )
 
 
@@ -103,9 +110,10 @@ def run_duplicate_compare_check(
     department: Optional[str],
     current_stage: str = "本期",
     history_stages: Optional[list[str]] = None,
+    use_llm: bool = True,
 ) -> DuplicateInternalResponse:
     """对当前可研报告进行内部查重，并与往期报告进行跨报告重复建设检查。"""
-    current_points = _parse_points_from_file(current_content, current_filename, project_name)
+    current_points = _parse_points_from_file(current_content, current_filename, project_name, use_llm=use_llm)
     if not current_points:
         raise ValueError("当前可研报告未找到任何功能点")
     if not history_files:
@@ -128,7 +136,7 @@ def run_duplicate_compare_check(
             if history_stages and index < len(history_stages) and history_stages[index].strip()
             else f"往期{index + 1}"
         )
-        points = _parse_points_from_file(content, filename, f"{project_name} {stage}")
+        points = _parse_points_from_file(content, filename, f"{project_name} {stage}", use_llm=use_llm)
         if points:
             history_reports.append(
                 ParsedReport(
@@ -154,6 +162,7 @@ def run_duplicate_compare_check(
         project_id=project.id,
         comparison_type="internal",
         context_builder=lambda left, right: f"两项均来自当前报告《{left.report_name}》（{left.stage}）。",
+        use_llm=use_llm,
     )
     cross_pairs = _judge_report_pairs(
         _find_cross_report_candidate_pairs(current_refs, history_refs),
@@ -164,6 +173,7 @@ def run_duplicate_compare_check(
             f"功能点2来自往期报告《{right.report_name}》（{right.stage}）。"
             "请重点判断是否属于本期重复申报、边界不清，或只是合理的阶段延续。"
         ),
+        use_llm=use_llm,
     )
 
     db.execute(
@@ -229,6 +239,7 @@ def _process_function_points(
     project_id: Optional[str],
     project_name: str,
     department: Optional[str],
+    use_llm: bool = True,
 ) -> DuplicateInternalResponse:
     """
     处理功能点的通用流程（来自 Excel 或文档提取）
@@ -271,6 +282,7 @@ def _process_function_points(
             candidate.right.name,
             candidate.right.description,
             candidate.similarity,
+            use_llm=use_llm,
         )
         if judgement.label == "无关":
             continue
@@ -407,17 +419,17 @@ def _find_candidate_pairs(points: list[FunctionPoint]) -> list[CandidatePair]:
                     )
                 )
 
-    return sorted(candidates, key=lambda item: item.similarity, reverse=True)
+    return sorted(candidates, key=lambda item: item.similarity, reverse=True)[:MAX_CANDIDATE_PAIRS]
 
 
-def _parse_points_from_file(content: bytes, filename: str, project_context: str) -> list[ParsedFunctionPoint]:
+def _parse_points_from_file(content: bytes, filename: str, project_context: str, use_llm: bool = True) -> list[ParsedFunctionPoint]:
     lower = filename.lower()
     if lower.endswith((".xlsx", ".csv")):
         return parse_function_points(content, filename)
     if lower.endswith((".docx", ".pdf")):
         document = parse_document(content, filename)
         return _annotate_document_points(
-            _parse_document_function_points(document, project_context=project_context),
+            _parse_document_function_points(document, project_context=project_context, use_llm=use_llm),
             document,
         )
     raise ValueError(f"不支持的文件格式: {filename}")
@@ -426,11 +438,37 @@ def _parse_points_from_file(content: bytes, filename: str, project_context: str)
 def _parse_document_function_points(
     doc_content: DocumentContent,
     project_context: str,
+    use_llm: bool = True,
 ) -> list[ParsedFunctionPoint]:
     section_points = _extract_function_sections(doc_content)
-    if len(section_points) >= 3:
-        return section_points
-    return extract_function_points(doc_content, project_context=project_context)
+    if len(section_points) >= 3 or len(doc_content.raw_text) > MAX_LOCAL_DOCUMENT_CHARS or not use_llm:
+        return _limit_function_points(section_points or _extract_local_paragraph_points(doc_content))
+    return _limit_function_points(extract_function_points(doc_content, project_context=project_context))
+
+
+def _extract_local_paragraph_points(doc_content: DocumentContent) -> list[ParsedFunctionPoint]:
+    points: list[ParsedFunctionPoint] = []
+    for section in doc_content.sections:
+        for paragraph in section.content.splitlines():
+            text = " ".join(paragraph.split()).strip()
+            if len(text) < 12 or not any(word in text for word in ("建设", "提供", "功能", "模块", "平台", "服务", "系统")):
+                continue
+            points.append(ParsedFunctionPoint(
+                row_index=len(points) + 1,
+                name=(section.title or text[:30]).strip()[:80],
+                description=text[:800],
+                category="文档段落",
+            ))
+            if len(points) >= MAX_DUPLICATE_POINTS:
+                return points
+    return points
+
+
+def _limit_function_points(points: list[ParsedFunctionPoint]) -> list[ParsedFunctionPoint]:
+    return [
+        replace(point, row_index=index)
+        for index, point in enumerate(points[:MAX_DUPLICATE_POINTS], start=1)
+    ]
 
 
 def _annotate_document_points(
@@ -533,14 +571,15 @@ def run_duplicate_check_from_document(
     project_id: Optional[str],
     project_name: str,
     department: Optional[str],
+    use_llm: bool = True,
 ) -> DuplicateInternalResponse:
     doc_content = parse_document(content, filename)
     parsed_points = _annotate_document_points(
-        _parse_document_function_points(doc_content, project_name),
+        _parse_document_function_points(doc_content, project_name, use_llm=use_llm),
         doc_content,
     )
     return _process_function_points(
-        db, parsed_points, project_id, project_name, department
+        db, parsed_points, project_id, project_name, department, use_llm=use_llm
     )
 
 
@@ -585,7 +624,7 @@ def _find_report_candidate_pairs(points: list[ReportPoint]) -> list[ReportCandid
                         similarity=similarity,
                     )
                 )
-    return sorted(candidates, key=lambda item: item.similarity, reverse=True)
+    return sorted(candidates, key=lambda item: item.similarity, reverse=True)[:MAX_CANDIDATE_PAIRS]
 
 
 def _find_cross_report_candidate_pairs(
@@ -604,7 +643,7 @@ def _find_cross_report_candidate_pairs(
                         similarity=similarity,
                     )
                 )
-    return sorted(candidates, key=lambda item: item.similarity, reverse=True)
+    return sorted(candidates, key=lambda item: item.similarity, reverse=True)[:MAX_CANDIDATE_PAIRS]
 
 
 def _report_point_similarity(left: ReportPoint, right: ReportPoint) -> float:
@@ -619,6 +658,7 @@ def _judge_report_pairs(
     project_id: str,
     comparison_type: str,
     context_builder,
+    use_llm: bool = True,
 ) -> list[DuplicatePairOut]:
     pairs: list[DuplicatePairOut] = []
     for candidate in candidates:
@@ -629,6 +669,7 @@ def _judge_report_pairs(
             candidate.right.description,
             candidate.similarity,
             context=context_builder(candidate.left, candidate.right),
+            use_llm=use_llm,
         )
         if judgement.label == "无关":
             continue

@@ -32,7 +32,6 @@ public partial class MainWindow : Window
     private UIElement? _settingsPage;
     private StackPanel? _recordsListPanel;
     private StackPanel? _projectTreePanel;
-    private StackPanel? _checkModulesPanel;
     private StackPanel? _recordDetailPanel;
     private StackPanel? _rulesDirectoryPanel;
     private StackPanel? _rulesEditorPanel;
@@ -50,6 +49,10 @@ public partial class MainWindow : Window
     private TextBlock? _tableCompletenessTextBlock;
     private TextBlock? _chapterCompletenessTextBlock;
     private TextBlock? _priceBenchmarkStatusTextBlock;
+    private PasswordBox? _llmApiKeyBox;
+    private TextBox? _llmBaseUrlBox;
+    private TextBox? _llmModelBox;
+    private TextBlock? _llmConfigStatusTextBlock;
     private CheckBox? _llmReviewCheckBox;
     private bool _isCompletenessChecked;
     private bool _isChecking;
@@ -698,6 +701,54 @@ public partial class MainWindow : Window
 
     private sealed record ProjectDialogValues(string Name, string Department, string Description);
 
+    private async Task DeleteProjectAsync(string projectId, string projectName)
+    {
+        if (string.IsNullOrWhiteSpace(projectId))
+        {
+            return;
+        }
+
+        var confirm = MessageBox.Show(
+            this,
+            $"确定删除项目“{projectName}”吗？项目下的报告检查记录和检查结果也会被删除。",
+            "删除项目",
+            MessageBoxButton.OKCancel,
+            MessageBoxImage.Warning);
+        if (confirm != MessageBoxResult.OK)
+        {
+            return;
+        }
+
+        try
+        {
+            using var response = await BackendClient.DeleteAsync($"{BackendBaseUrl}/projects/{Uri.EscapeDataString(projectId)}");
+            var responseBody = await response.Content.ReadAsStringAsync();
+            if (!response.IsSuccessStatusCode)
+            {
+                MessageBox.Show(this, $"删除项目失败：{ExtractErrorMessage(responseBody)}", "删除项目失败", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
+            if (_selectedProjectId == projectId)
+            {
+                _selectedProjectId = null;
+                _selectedProjectName = null;
+                _selectedCheckRunId = null;
+                _runResults.Clear();
+                ResetRecordDetail("请选择一个项目和报告检查查看结果。");
+                RenderCheckModules(Array.Empty<RunResultInfo>());
+            }
+
+            await LoadProjectsAsync();
+            await LoadRecordsAsync();
+            StatusTextBlock.Text = $"项目“{projectName}”已删除。";
+        }
+        catch (Exception exc)
+        {
+            MessageBox.Show(this, $"删除项目失败：{exc.Message}", "删除项目失败", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
     private async Task<string> CreateCheckRunAsync(string projectId, string reportPath)
     {
         var payload = JsonSerializer.Serialize(new
@@ -889,7 +940,12 @@ public partial class MainWindow : Window
     {
         var page = PageGrid(3);
         page.RowDefinitions[2].Height = new GridLength(1, GridUnitType.Star);
-        page.Children.Add(Header("系统设置", "统一配置客户端运行、文件保存、审查偏好和服务连接。", "保存设置", true));
+        var header = Header("系统设置", "统一配置客户端运行、文件保存、审查偏好和服务连接。", "保存设置", true);
+        if (header.Children.OfType<Button>().FirstOrDefault() is Button saveButton)
+        {
+            saveButton.Click += async (_, _) => await SaveLlmSettingsAsync();
+        }
+        page.Children.Add(header);
 
         var summary = new UniformGrid { Columns = 4, Margin = new Thickness(0, 18, 0, 0) };
         Grid.SetRow(summary, 1);
@@ -930,6 +986,26 @@ public partial class MainWindow : Window
             SettingRow("价格基准数据", "支持 Excel 或 CSV；相同来源、名称、品牌和型号会更新而不是重复新增", importPriceButton),
             _priceBenchmarkStatusTextBlock
         }));
+        _llmApiKeyBox = new PasswordBox { Style = (Style)FindResource("PasswordInput"), ToolTip = "输入后保存，界面不会回显密钥" };
+        _llmBaseUrlBox = Input(GetUserEnvironment("DEEPSEEK_API_BASE_URL", "https://llmapi.tongji.edu.cn/v1"));
+        _llmModelBox = Input(GetUserEnvironment("DEEPSEEK_MODEL", "DeepSeek-R1"));
+        _llmConfigStatusTextBlock = Text(
+            HasUserApiKey() ? "当前用户密钥已配置（已隐藏）" : "当前用户尚未配置 API Key",
+            12,
+            null,
+            FindBrush("MutedBrush"),
+            new Thickness(0, 8, 0, 0),
+            true);
+        var testLlmButton = Button("测试连接", false);
+        testLlmButton.Click += async (_, _) => await TestLlmConnectionAsync();
+        right.Children.Add(SettingsPanel("大模型 API 配置", "配置 DeepSeek 或 OpenAI 兼容接口。密钥仅保存到当前 Windows 用户环境变量，不会在界面中显示。", new UIElement[]
+        {
+            SettingRow("API Key", "留空表示保留现有密钥；输入新值后点击顶部保存设置", _llmApiKeyBox),
+            SettingRow("接口地址", "填写到 /v1，不要包含 /chat/completions", _llmBaseUrlBox),
+            SettingRow("模型名称", "例如 DeepSeek-R1 或兼容接口提供的模型名", _llmModelBox),
+            ActionRow(testLlmButton),
+            _llmConfigStatusTextBlock
+        }, new Thickness(0, 14, 0, 0)));
         right.Children.Add(SettingsPanel("服务连接", "配置客户端访问审查服务的地址和响应策略。", new UIElement[]
         {
             SettingRow("服务地址", "当前客户端请求入口", Input("http://127.0.0.1:8000/api")),
@@ -945,6 +1021,129 @@ public partial class MainWindow : Window
         body.Children.Add(right);
         page.Children.Add(body);
         return page;
+    }
+
+    private static bool HasUserEnvironment(string name) =>
+        !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(name, EnvironmentVariableTarget.User));
+
+    private static bool HasUserApiKey() =>
+        HasUserEnvironment("DEEPSEEK_API_KEY") || HasUserEnvironment("LLM_API_KEY");
+
+    private static string GetUserEnvironment(string name, string fallback)
+    {
+        return Environment.GetEnvironmentVariable(name, EnvironmentVariableTarget.User)?.Trim() is { Length: > 0 } value
+            ? value
+            : fallback;
+    }
+
+    private async Task SaveLlmSettingsAsync()
+    {
+        if (_llmApiKeyBox == null || _llmBaseUrlBox == null || _llmModelBox == null)
+        {
+            return;
+        }
+
+        var apiKey = _llmApiKeyBox.Password.Trim();
+        var baseUrl = _llmBaseUrlBox.Text.Trim().TrimEnd('/');
+        var model = _llmModelBox.Text.Trim();
+        if (string.IsNullOrWhiteSpace(baseUrl) || string.IsNullOrWhiteSpace(model))
+        {
+            MessageBox.Show(this, "接口地址和模型名称不能为空。", "保存失败", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(apiKey) && !HasUserApiKey())
+        {
+            MessageBox.Show(this, "请输入 API Key。", "保存失败", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(apiKey))
+            {
+                SetUserEnvironment("DEEPSEEK_API_KEY", apiKey);
+                SetUserEnvironment("LLM_API_KEY", apiKey);
+            }
+            else if (!HasUserEnvironment("DEEPSEEK_API_KEY"))
+            {
+                // Migrate an older generic-only configuration without exposing it in the UI.
+                var existingGenericKey = GetUserEnvironment("LLM_API_KEY", string.Empty);
+                if (!string.IsNullOrWhiteSpace(existingGenericKey))
+                {
+                    SetUserEnvironment("DEEPSEEK_API_KEY", existingGenericKey);
+                }
+            }
+
+            SetUserEnvironment("DEEPSEEK_API_URL", baseUrl);
+            SetUserEnvironment("DEEPSEEK_API_BASE_URL", baseUrl);
+            SetUserEnvironment("DEEPSEEK_MODEL", model);
+            SetUserEnvironment("LLM_BASE_URL", baseUrl);
+            SetUserEnvironment("LLM_MODEL", model);
+            _llmApiKeyBox.Clear();
+            _llmConfigStatusTextBlock!.Text = "已保存到当前 Windows 用户环境变量；请重启后端后生效。";
+            StatusTextBlock.Text = "大模型配置已保存，请重启后端。";
+            MessageBox.Show(this, "大模型配置已保存。请重启后端，新的 API Key 和模型配置才会生效。", "保存成功", MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+        catch (Exception exc)
+        {
+            _llmConfigStatusTextBlock!.Text = "配置保存失败。";
+            MessageBox.Show(this, $"大模型配置保存失败：{exc.Message}", "保存失败", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+
+        await Task.CompletedTask;
+    }
+
+    private static void SetUserEnvironment(string name, string value)
+    {
+        Environment.SetEnvironmentVariable(name, value, EnvironmentVariableTarget.User);
+        Environment.SetEnvironmentVariable(name, value, EnvironmentVariableTarget.Process);
+    }
+
+    private async Task TestLlmConnectionAsync()
+    {
+        if (_llmConfigStatusTextBlock == null)
+        {
+            return;
+        }
+
+        _llmConfigStatusTextBlock.Text = "正在测试后端中的大模型配置...";
+        try
+        {
+            using var statusResponse = await BackendClient.GetAsync($"{BackendBaseUrl}/evaluate/llm/status");
+            var statusBody = await statusResponse.Content.ReadAsStringAsync();
+            if (!statusResponse.IsSuccessStatusCode)
+            {
+                _llmConfigStatusTextBlock.Text = $"大模型状态读取失败：{ExtractErrorMessage(statusBody)}";
+                return;
+            }
+
+            using var statusDocument = JsonDocument.Parse(statusBody);
+            if (!GetBool(statusDocument.RootElement, "configured"))
+            {
+                _llmConfigStatusTextBlock.Text = "后端当前未读取到 API Key；请保存配置并重启后端。";
+                return;
+            }
+
+            using var pingResponse = await BackendClient.PostAsync(
+                $"{BackendBaseUrl}/evaluate/llm/ping",
+                new StringContent("{\"text\":\"桌面端配置连通性测试\"}", Encoding.UTF8, "application/json"));
+            var pingBody = await pingResponse.Content.ReadAsStringAsync();
+            if (!pingResponse.IsSuccessStatusCode)
+            {
+                _llmConfigStatusTextBlock.Text = $"大模型连通性测试失败：{ExtractErrorMessage(pingBody)}";
+                return;
+            }
+
+            using var pingDocument = JsonDocument.Parse(pingBody);
+            _llmConfigStatusTextBlock.Text = GetBool(pingDocument.RootElement, "success")
+                ? "大模型连接成功。"
+                : $"大模型连接失败：{FirstNonEmpty(GetString(pingDocument.RootElement, "error"), "请检查 API Key、地址和模型。")}";
+        }
+        catch (Exception exc)
+        {
+            _llmConfigStatusTextBlock.Text = $"大模型连通性测试失败：{exc.Message}";
+        }
     }
 
     private async Task RefreshPriceBenchmarkStatusAsync()
@@ -1466,10 +1665,27 @@ public partial class MainWindow : Window
             if (duplicateItem != null && duplicateHistoryFiles.Count > 0)
             {
                 StatusTextBlock.Text = "正在执行重复建设跨报告比对...";
-                var duplicateResult = await UploadAndRunDuplicateCompareAsync(reportPath, duplicateHistoryFiles, projectId, _selectedCheckRunId);
-                RenderCheckResult(duplicateResult);
-                AddResultNotice("重复建设检查已完成：已完成当前报告内部和往期报告跨报告比对。");
-                await LoadRecordsAsync();
+                try
+                {
+                    var duplicateResult = await UploadAndRunDuplicateCompareAsync(reportPath, duplicateHistoryFiles, projectId, _selectedCheckRunId);
+                    RenderCheckResult(duplicateResult);
+                    AddResultNotice("重复建设检查已完成：已完成当前报告内部和往期报告跨报告比对。");
+                    await LoadRecordsAsync();
+                }
+                catch (Exception exc)
+                {
+                    // Cross-report comparison can fail on a malformed or very
+                    // large history attachment. Keep this batch's duplicate
+                    // check by falling back to the internal comparison path.
+                    AddResultNotice($"跨报告比对失败，已回退为当前报告内部重复检查：{exc.Message}");
+                    StatusTextBlock.Text = "跨报告比对失败，正在执行当前报告内部重复检查...";
+                    var fallbackTaskId = await CreateEvaluateTaskAsync(
+                        new[] { duplicateItem },
+                        reportPath,
+                        projectId,
+                        _selectedCheckRunId);
+                    await PollEvaluateTaskAsync(fallbackTaskId);
+                }
             }
 
             if (taskItems.Count > 0)
@@ -1891,7 +2107,19 @@ public partial class MainWindow : Window
             _selectedProjectName = projectName;
             RenderProjectTreeFromCurrentData();
         };
-        _projectTreePanel.Children.Add(projectButton);
+        var projectRow = new Grid { Margin = new Thickness(0, 0, 0, 4) };
+        projectRow.ColumnDefinitions.Add(new ColumnDefinition());
+        projectRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        projectButton.Margin = new Thickness(0);
+        projectRow.Children.Add(projectButton);
+        var deleteProjectButton = Button("删除", false);
+        deleteProjectButton.Padding = new Thickness(9, 8, 9, 8);
+        deleteProjectButton.Margin = new Thickness(6, 0, 0, 0);
+        deleteProjectButton.ToolTip = "删除项目及其全部检查记录";
+        deleteProjectButton.Click += async (_, _) => await DeleteProjectAsync(projectId, projectName);
+        Grid.SetColumn(deleteProjectButton, 1);
+        projectRow.Children.Add(deleteProjectButton);
+        _projectTreePanel.Children.Add(projectRow);
 
         if (!expanded)
         {
@@ -1927,8 +2155,73 @@ public partial class MainWindow : Window
                 Margin = new Thickness(24, 0, 0, 5),
                 Tag = runId
             };
-            runButton.Click += (_, _) => SelectCheckRun(runId, run);
-            _projectTreePanel.Children.Add(runButton);
+            // JsonElement is backed by the response JsonDocument, which is disposed
+            // when LoadRecordsAsync returns. Keep an owned snapshot for the click handler.
+            var runSnapshot = run.Clone();
+            runButton.Click += (_, _) => SelectCheckRun(runId, runSnapshot);
+            var runRow = new Grid { Margin = new Thickness(24, 0, 0, 5) };
+            runRow.ColumnDefinitions.Add(new ColumnDefinition());
+            runRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            runButton.Margin = new Thickness(0);
+            runRow.Children.Add(runButton);
+            var deleteRunButton = Button("删除", false);
+            deleteRunButton.Padding = new Thickness(9, 8, 9, 8);
+            deleteRunButton.Margin = new Thickness(6, 0, 0, 0);
+            deleteRunButton.ToolTip = runId.StartsWith("legacy:", StringComparison.OrdinalIgnoreCase)
+                ? "删除这组历史检查结果"
+                : "删除这一次九项检查及其全部模块结果";
+            deleteRunButton.Click += async (_, _) => await DeleteCheckRunAsync(projectId, runId, runName);
+            Grid.SetColumn(deleteRunButton, 1);
+            runRow.Children.Add(deleteRunButton);
+            _projectTreePanel.Children.Add(runRow);
+        }
+    }
+
+    private async Task DeleteCheckRunAsync(string projectId, string runId, string runName)
+    {
+        if (string.IsNullOrWhiteSpace(projectId) || string.IsNullOrWhiteSpace(runId))
+        {
+            return;
+        }
+
+        var confirm = MessageBox.Show(
+            this,
+            runId.StartsWith("legacy:", StringComparison.OrdinalIgnoreCase)
+                ? $"确定删除历史检查记录“{runName}”吗？该记录组下的结果都会删除，项目和其他检查不受影响。"
+                : $"确定删除这次检查“{runName}”吗？该次检查下的所有模块结果都会删除，项目和其他检查不受影响。",
+            "删除本次检查",
+            MessageBoxButton.OKCancel,
+            MessageBoxImage.Warning);
+        if (confirm != MessageBoxResult.OK)
+        {
+            return;
+        }
+
+        try
+        {
+            using var response = await BackendClient.DeleteAsync(
+                $"{BackendBaseUrl}/projects/{Uri.EscapeDataString(projectId)}/check-runs/{Uri.EscapeDataString(runId)}");
+            var responseBody = await response.Content.ReadAsStringAsync();
+            if (!response.IsSuccessStatusCode)
+            {
+                MessageBox.Show(this, $"删除本次检查失败：{ExtractErrorMessage(responseBody)}", "删除失败", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
+            if (_selectedCheckRunId == runId)
+            {
+                _selectedCheckRunId = null;
+                _runResults.Remove(runId);
+                ResetRecordDetail("请选择一个项目和报告检查查看结果。");
+                RenderCheckModules(Array.Empty<RunResultInfo>());
+            }
+
+            await LoadRecordsAsync();
+            StatusTextBlock.Text = $"检查“{runName}”已删除。";
+        }
+        catch (Exception exc)
+        {
+            MessageBox.Show(this, $"删除本次检查失败：{exc.Message}", "删除失败", MessageBoxButton.OK, MessageBoxImage.Warning);
         }
     }
 
@@ -1979,15 +2272,28 @@ public partial class MainWindow : Window
 
         _recordsListPanel.Children.Clear();
         _recordsListPanel.Children.Add(Text("九项检查", 18, FontWeights.Bold));
-        _recordsListPanel.Children.Add(Text("点击检查项，在右侧查看详细结果。", 13, null, FindBrush("MutedBrush"), new Thickness(0, 6, 0, 14), true));
-        foreach (var item in _checkItems)
+        _recordsListPanel.Children.Add(Text("点击本次报告已执行的检查项，在右侧查看详细结果。", 13, null, FindBrush("MutedBrush"), new Thickness(0, 6, 0, 14), true));
+        var orderedResults = results
+            .Where(item => !string.IsNullOrWhiteSpace(item.Module))
+            .OrderBy(item =>
+            {
+                var index = Array.FindIndex(_checkItems, checkItem => checkItem.ModuleCode == item.Module);
+                return index < 0 ? int.MaxValue : index;
+            })
+            .ToList();
+        foreach (var result in orderedResults)
         {
-            var result = results.FirstOrDefault(value => value.Module == item.ModuleCode);
-            var status = result == null ? "未执行" : FirstNonEmpty(result.Status, "已完成");
-            var details = result == null ? "本次检查未包含" : $"{status} · 问题：{result.FindingsCount}";
+            var moduleTitle = ModuleDisplayName(result.Module);
+            if (!string.IsNullOrWhiteSpace(result.ModuleName) && result.ModuleName != result.Module)
+            {
+                moduleTitle = result.ModuleName;
+            }
+
+            var status = FirstNonEmpty(result.Status, "已完成");
+            var details = $"{status} · 问题：{result.FindingsCount}";
             var stack = new StackPanel();
-            stack.Children.Add(Text(item.Title, 14, FontWeights.SemiBold, FindBrush("TextBrush"), null, true));
-            stack.Children.Add(Text(details, 12, null, result == null ? FindBrush("MutedBrush") : Brush(2, 122, 72), new Thickness(0, 4, 0, 0), true));
+            stack.Children.Add(Text(moduleTitle, 14, FontWeights.SemiBold, FindBrush("TextBrush"), null, true));
+            stack.Children.Add(Text(details, 12, null, Brush(2, 122, 72), new Thickness(0, 4, 0, 0), true));
             var button = new Button
             {
                 Content = stack,
@@ -1995,14 +2301,19 @@ public partial class MainWindow : Window
                 HorizontalContentAlignment = HorizontalAlignment.Left,
                 Padding = new Thickness(12, 10, 12, 10),
                 Margin = new Thickness(0, 0, 0, 8),
-                Tag = result?.Id,
-                IsEnabled = result != null
+                Tag = result.Id,
+                IsEnabled = !string.IsNullOrWhiteSpace(result.Id)
             };
-            if (result != null)
+            if (!string.IsNullOrWhiteSpace(result.Id))
             {
                 button.Click += async (_, _) => await LoadRecordDetailAsync(result.Id);
             }
             _recordsListPanel.Children.Add(button);
+        }
+
+        if (orderedResults.Count == 0)
+        {
+            _recordsListPanel.Children.Add(Text("本次报告暂无已完成的检查结果。", 13, null, FindBrush("MutedBrush"), null, true));
         }
     }
 
@@ -2515,6 +2826,7 @@ public partial class MainWindow : Window
         form.Add(new StringContent(FirstNonEmpty(_selectedProjectName ?? string.Empty, Path.GetFileNameWithoutExtension(currentReportPath)), Encoding.UTF8), "project_name");
         form.Add(new StringContent(string.Empty, Encoding.UTF8), "department");
         form.Add(new StringContent("本期", Encoding.UTF8), "current_stage");
+        form.Add(new StringContent((_llmReviewCheckBox?.IsChecked == true).ToString().ToLowerInvariant()), "use_llm");
 
         var streams = new List<FileStream>();
         try

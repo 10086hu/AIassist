@@ -63,6 +63,13 @@ echo [AI Assist] LLM model: %DEEPSEEK_MODEL%
 if "%DEEPSEEK_API_KEY%"=="" (
     echo [AI Assist] LLM API key is not configured. Run configure_llm_api.bat first if you need model features.
 )
-python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+echo [AI Assist] Auto-restart is enabled for unexpected backend exits.
+:backend_loop
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+if errorlevel 1 (
+    echo [AI Assist] Backend exited unexpectedly. Restarting in 3 seconds...
+    timeout /t 3 /nobreak >nul
+    goto backend_loop
+)
 
 pause
