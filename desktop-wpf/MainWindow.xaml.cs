@@ -235,7 +235,7 @@ public partial class MainWindow : Window
 
         _recordsPage = BuildRecordsPage();
         _rulesPage = BuildRulesPage();
-        _settingsPage = BuildSettingsPage();
+        _settingsPage = ScrollablePage(BuildSettingsPage(), showScrollBar: true);
 
         _reportNavButton = FindNavButton("可研报告检测", "Report");
         _recordsNavButton = FindNavButton("审查记录", "Records");
@@ -317,12 +317,13 @@ public partial class MainWindow : Window
         }
     }
 
-    private static ScrollViewer ScrollablePage(UIElement page)
+    private static ScrollViewer ScrollablePage(UIElement page, bool showScrollBar = false)
     {
         return new ScrollViewer
         {
-            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            VerticalScrollBarVisibility = showScrollBar ? ScrollBarVisibility.Visible : ScrollBarVisibility.Auto,
             HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+            PanningMode = PanningMode.VerticalOnly,
             Content = page
         };
     }
