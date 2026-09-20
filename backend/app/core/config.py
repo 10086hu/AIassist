@@ -11,7 +11,7 @@ from typing import List
 def _default_database_url() -> str:
     data_dir = os.getenv("AIASSIST_DATA_DIR")
     if not data_dir:
-        data_dir = str(Path(tempfile.gettempdir()) / "AIassist")
+        data_dir = str(Path(__file__).resolve().parents[3] / ".runtime")
     return f"sqlite:///{(Path(data_dir) / 'app.db').as_posix()}"
 
 

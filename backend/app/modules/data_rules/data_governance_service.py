@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import re
+import json
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Iterable
 
 from app.modules.shanghai_review.base import ValidationError
+from app.modules.docx_grid import table_grid
+from app.modules.evidence_text import positive_mentions
 
 
 @dataclass(frozen=True)
@@ -15,6 +19,20 @@ class DataGovernanceServiceSpec:
     stage_aliases: tuple[str, ...]
     aliases: tuple[str, ...] = ()
     category_aliases: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class GovernanceAnnexTable:
+    rows: tuple[tuple[str, ...], ...]
+    heading_number: str = ""
+    heading_text: str = ""
+    raw_text: str = ""
+
+    @property
+    def text(self) -> str:
+        if self.raw_text:
+            return self.raw_text
+        return "\n".join(" | ".join(cell for cell in row if cell) for row in self.rows if row)
 
 
 DATA_GOVERNANCE_SERVICE_SPECS: tuple[DataGovernanceServiceSpec, ...] = (
@@ -91,6 +109,12 @@ NEGATIVE_LIST_ITEMS: tuple[str, ...] = (
 )
 
 
+POLICY = json.loads(Path(__file__).with_name('data_governance_policy_2026.json').read_text(encoding='utf-8'))
+DATA_GOVERNANCE_SERVICE_SPECS = tuple(
+    DataGovernanceServiceSpec(**{k: tuple(v) if isinstance(v, list) else v for k, v in row.items()})
+    for row in POLICY['services']
+)
+NEGATIVE_LIST_ITEMS = tuple(POLICY['negative_list'])
 _SERVICE_BY_NAME = {spec.name: spec for spec in DATA_GOVERNANCE_SERVICE_SPECS}
 _ALL_CATEGORY_ALIASES = tuple(
     dict.fromkeys(
@@ -106,17 +130,19 @@ _TRIGGER_TERMS = (
     "数据治理内容附表",
     "数据治理服务适用阶段",
     *tuple(spec.name for spec in DATA_GOVERNANCE_SERVICE_SPECS),
-    *NEGATIVE_LIST_ITEMS,
 )
 
 _REQUIRED_ANNEX_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("服务类型", ("服务类型", "服务类别", "数据治理服务类型")),
-    ("服务事项", ("服务事项", "数据治理服务事项", "数据服务事项")),
-    ("测算单位", ("测算单位", "计量单位", "单位")),
-    ("标准", ("标准", "测算标准", "计量标准")),
-    ("适用项目阶段", ("适用项目阶段", "适用阶段", "建设/运维")),
-    ("申报条件", ("申报条件", "申报要求")),
+    ("服务类型", ("服务类型", "服务类别", "服务分类", "数据治理服务类型", "数据治理服务类别")),
+    ("服务事项", ("服务事项", "服务项", "数据治理服务事项", "数据服务事项")),
+    ("测算单位", ("测算单位", "计量单位", "工作量单位", "单位")),
+    ("标准", ("标准", "测算标准", "计量标准", "工作量标准")),
+    ("适用项目阶段", ("适用项目阶段", "适用阶段", "项目阶段", "建设/运维")),
+    ("申报条件", ("申报条件", "申报要求", "适用条件", "申报范围")),
 )
+
+_SERVICE_FIELD_ALIASES = _REQUIRED_ANNEX_FIELDS[1][1]
+_UNIT_FIELD_ALIASES = _REQUIRED_ANNEX_FIELDS[2][1]
 
 
 def validate_data_governance_service_design(document: dict[str, Any]) -> list[ValidationError]:
@@ -128,52 +154,67 @@ def validate_data_governance_service_design(document: dict[str, Any]) -> list[Va
     """
 
     full_text = _clean_text(_to_text(document.get("_full_text", "")))
-    section_text = _extract_6_3_to_6_4_text(document, full_text)
-    triggered = _has_any(_compact(full_text), (_compact(term) for term in _TRIGGER_TERMS))
-
-    if not triggered and not section_text:
+    applicability = assess_data_governance_service_applicability(document, full_text)
+    if not applicability["applies"]:
         return []
 
-    if not section_text:
+    section_text = _extract_6_3_to_6_4_text(document, full_text)
+    candidate_tables = _extract_governance_annex_candidates(document, section_text)
+    triggered = _has_positive_governance_trigger(full_text)
+
+    if not triggered and not candidate_tables:
+        return []
+
+    if not section_text and not candidate_tables:
         return [
             ValidationError(
                 code="DGS-001",
-                message="项目涉及数据治理服务，但未识别到第6.3节「数据治理内容附表」。",
+                message="项目涉及数据治理服务，但未识别到可核验的服务附表或等价清单，需指出其位置。",
                 section="6.3",
-                severity="risk",
-                suggestion="请在6.3节补充数据治理内容附表，列明服务类型、服务事项、计量单位、适用阶段和申报条件。",
+                severity="warning",
+                suggestion="请指出现有服务清单位置，或补充服务事项、测算依据及交付物；正文可以补充表内信息，不要求固定章节号。",
             )
         ]
 
-    candidate_tables = _extract_governance_annex_candidates(document, section_text)
     if not candidate_tables:
         return [
             ValidationError(
                 code="DGS-001",
-                message="第6.3节未识别到数据治理服务附表。",
+                message="已找到数据治理说明，但未识别到可核验的服务附表或等价清单。",
                 section="6.3",
-                severity="risk",
-                suggestion="请在6.3节补充数据治理内容附表，并按指引附表列明服务类型、服务事项、计量方式、适用项目阶段和申报条件。",
+                severity="warning",
+                suggestion="请指出现有服务清单及测算依据位置；不要求照抄指引目录的全部栏目。",
             )
         ]
 
-    annex_text = _clean_text("\n".join(candidate_tables))
-    compact_annex = _compact(annex_text)
+    annex_text = _clean_text("\n".join(table.text for table in candidate_tables))
     errors: list[ValidationError] = []
 
-    missing_fields = _missing_required_annex_fields(annex_text)
+    # The policy directory describes its own service taxonomy; it does not
+    # require each report to reproduce all six column names. Only unresolved
+    # service identity and measurement warrant a missing-information warning.
+    missing_fields = [f for f in _missing_required_annex_fields_from_tables(candidate_tables) if f in {'服务事项', '测算单位'}]
+    if _find_annex_service_specs(candidate_tables, annex_text):
+        missing_fields = [f for f in missing_fields if f != '服务事项']
+    # Equivalent explicit information in service-specific prose is valid too.
+    service_lines = [line for line in full_text.splitlines()
+                     if '数据治理服务' in line or any(s.name in line for s in _find_annex_service_specs(candidate_tables, annex_text))]
+    missing_fields = [field for field in missing_fields if not any(
+        re.search(rf'{re.escape(alias)}\s*[：:]\s*[^\s，。；;|]{{2,}}', line)
+        and not re.search(r'未明确|待定|待补充|另行确定|无需填写', line)
+        for line in service_lines for label, aliases in _REQUIRED_ANNEX_FIELDS if label == field for alias in aliases)]
     if missing_fields:
         errors.append(
             ValidationError(
                 code="DGS-007",
-                message=f"第6.3节数据治理内容附表缺少指引要求字段：{'、'.join(missing_fields)}。",
-                section="6.3",
-                severity="risk",
-                suggestion="请按指引附表补充服务类型、服务事项、计量方式（测算单位、标准）、适用项目阶段和申报条件等字段。",
+                message=f"已识别数据治理服务表，但以下申报核验信息未在表头或明确关联的正文说明中识别到：{'、'.join(missing_fields)}；需结合正文补充核验。",
+                section=" / ".join(t.heading_text for t in candidate_tables),
+                severity="warning",
+                suggestion="请说明服务事项及测算单位所在位置；可以在关联正文说明，无需复制指引目录的全部栏目。",
             )
         )
 
-    negative_hits = _find_negative_hits(compact_annex)
+    negative_hits = _find_annex_negative_hits(candidate_tables, annex_text)
     for item in negative_hits:
         errors.append(
             ValidationError(
@@ -185,28 +226,58 @@ def validate_data_governance_service_design(document: dict[str, Any]) -> list[Va
             )
         )
 
-    found_specs = _find_service_specs(annex_text)
+    found_specs = _find_annex_service_specs(candidate_tables, annex_text)
+    for table in candidate_tables:
+        mapping = _table_header_mapping(table)
+        si = mapping.get("服务事项")
+        if si is None:
+            continue
+        for ri, row in enumerate(table.rows, 1):
+            if si >= len(row):
+                continue
+            name = row[si].strip()
+            if _service_text_matches_spec(name, next(s for s in DATA_GOVERNANCE_SERVICE_SPECS if s.name == '数据标签')) and _has_positive_phrase(' '.join(row), ('训练数据标注', '模型训练标注', '图像标注', '语音转写')) and not any(e.code == 'DGS-014' for e in errors):
+                errors.append(ValidationError(code='DGS-014', message='数据标签服务涉及训练数据标注等内容，需结合标签对象和用途确认服务范围；不因“特征标注”一词本身认定超范围。', section=f'{table.heading_text} 表内行{ri}', severity='warning', suggestion='请说明标签对象、分类分级上链用途及交付物，核实训练标注与指引服务的对应关系。'))
+            if not name or _header_cell_matches(name, _SERVICE_FIELD_ALIASES) or name in {"合计", "总计", "/", "无"}:
+                continue
+            if not _find_service_specs(name) and not _find_negative_hits(name):
+                errors.append(ValidationError(code="DGS-013", message=f"服务事项「{name}」未能映射到指引六项服务，不能自动认定合规。", section=f"{table.heading_text} 表内行{ri}", severity="warning", suggestion="请明确对应的服务类别和事项；新名称应提供与指引范围一致的说明。"))
     if not found_specs:
         errors.append(
             ValidationError(
                 code="DGS-002",
                 message="第6.3节未识别到《数据治理服务配置指引》允许的4类6项数据治理服务事项。",
                 section="6.3",
-                severity="risk",
-                suggestion="请将服务事项限定为数据购买、历史数据迁移、数据标签、数据融合、历史数据归档及销毁、数据安全风险评估。",
+                severity="warning",
+                suggestion="请说明现有服务与指引六项服务的对应关系；不同名称不直接认定超范围。",
             )
         )
         return _dedupe_errors(errors)
 
+    # 指引明确禁止数据融合与软件开发/产品软件购置重复申报，
+    # 也不允许历史数据迁移包含迁移工具开发或购买。此类冲突需要结合全文判断，
+    # 不能只看 6.3 表内的服务名称和计量单位。
+    errors.extend(_find_service_declaration_conflicts(full_text, annex_text, found_specs))
+    errors.extend(_check_governance_acceptance_requirements(full_text, found_specs))
+
     for spec in found_specs:
         context = _service_context(annex_text, spec)
         compact_context = _compact(context)
-        if not _has_any(compact_context, (_compact(unit) for unit in spec.unit_aliases)):
+        unit_status, observed_units = _annex_service_unit_status(candidate_tables, spec)
+        if unit_status == 'unknown' and not any(e.code == 'DGS-007' for e in errors):
+            context_with_prose = _service_context(full_text, spec)
+            if not any(_unit_cell_matches(c, spec.unit_aliases) for c in re.split(r'[，。；;\n|]', context_with_prose)):
+                errors.append(ValidationError(code='DGS-007', message=f'「{spec.name}」的测算单位未可靠识别，需核实其测算依据；不要求固定表头。', section='数据治理服务测算', severity='warning', suggestion='请指出工作量、单位及测算依据所在的表格或正文。'))
+        if unit_status == "invalid":
+            observed_text = "、".join(observed_units) if observed_units else "未填写"
             errors.append(
                 ValidationError(
                     code="DGS-003",
-                    message=f"「{spec.name}」计量单位不符合指引要求，应使用：{' / '.join(spec.unit_aliases)}。",
-                    section="6.3",
+                    message=(
+                        f"「{spec.name}」测算单位为「{observed_text}」，不符合指引要求，"
+                        f"应使用：{' / '.join(spec.unit_aliases)}。"
+                    ),
+                    section='；'.join(f'{t.heading_text} 表内行{ri}：' + ' | '.join(row) for t in candidate_tables for ri, row in enumerate(t.rows, 1) if _service_text_matches_spec(' '.join(row), spec))[:1400],
                     severity="risk",
                     suggestion=f"请将「{spec.name}」的测算单位调整为{' / '.join(spec.unit_aliases)}，并补充对应测算标准。",
                 )
@@ -229,7 +300,13 @@ def validate_data_governance_service_design(document: dict[str, Any]) -> list[Va
                 )
             )
 
-        if _stage_is_present_but_invalid(compact_context, spec.stage_aliases):
+        stage_cells = []
+        for table in candidate_tables:
+            mapping = _table_header_mapping(table)
+            si, pi = mapping.get("服务事项"), mapping.get("适用项目阶段")
+            if si is not None and pi is not None:
+                stage_cells.extend(row[pi] for row in table.rows if max(si, pi) < len(row) and _service_text_matches_spec(row[si], spec))
+        if any(_stage_is_present_but_invalid(_compact(c), spec.stage_aliases) for c in stage_cells):
             errors.append(
                 ValidationError(
                     code="DGS-006",
@@ -241,6 +318,147 @@ def validate_data_governance_service_design(document: dict[str, Any]) -> list[Va
             )
 
     return _dedupe_errors(errors)
+
+
+def _find_service_declaration_conflicts(
+    full_text: str,
+    annex_text: str,
+    found_specs: list[DataGovernanceServiceSpec],
+) -> list[ValidationError]:
+    errors: list[ValidationError] = []
+    compact_full = _compact(full_text)
+    compact_annex = _compact(annex_text)
+
+    fusion_present = any(spec.name == "数据融合" for spec in found_specs)
+    software_terms = ("软件开发", "产品软件购置", "产品软件购买", "软件购置", "软件采购")
+    if fusion_present and _has_positive_nearby_phrase(compact_full, "数据融合", software_terms, 120):
+        errors.append(
+            ValidationError(
+                code="DGS-008",
+                message="数据融合服务与附近的软件开发或购置表述可能涉及同一工作范围，需核对合同、交付物和费用；仅凭词语相邻不能认定重复申报。",
+                section="数据治理服务 / 建设内容 / 预算",
+                severity="warning",
+                suggestion="请区分数据融合服务与软件开发、产品软件购置的边界，避免同一工作内容重复计费。",
+            )
+        )
+
+    migration_present = any(spec.name == "历史数据迁移" for spec in found_specs)
+    if migration_present and _has_positive_phrase(compact_annex, ("迁移工具", "工具开发", "工具购买", "工具采购")):
+        errors.append(
+            ValidationError(
+                code="DGS-009",
+                message="6.3历史数据迁移服务中出现迁移工具开发或购买内容，不符合指引边界。",
+                section="6.3",
+                severity="risk",
+                suggestion="请删除迁移工具开发、购买或采购内容；历史数据迁移服务仅包含迁移准备、设计、实施和交付。",
+            )
+        )
+    return errors
+
+
+def _check_governance_acceptance_requirements(
+    full_text: str,
+    found_specs: list[DataGovernanceServiceSpec],
+) -> list[ValidationError]:
+    """在报告明确编写验收/交付物时，核对指引要求的证明材料。"""
+
+    # Only service-linked delivery prose is evidence. A generic security log
+    # or quoted policy elsewhere must not satisfy this service's acceptance.
+    linked_text = _governance_delivery_context(full_text, found_specs)
+    errors: list[ValidationError] = []
+    names = {spec.name for spec in found_specs}
+    if names & {"数据购买", "历史数据迁移", "数据融合"}:
+        required = {"数据上链": ("数据上链", "完成上链", "开展上链", "进行上链", "归集和上链", "政务目录链登记", "政务目录链编目"), "资源归集": ("数据资源归集", "资源归集", "归集至市大数据中心", "归集至公共数据平台", "向市大数据中心汇聚"), "质量自评估": ("质量自评估", "质量自评价", "数据质量评价", "质量自评", "自行开展数据质量评估", "自行评价数据质量", "自行评估数据质量")}
+        missing = [label for label, aliases in required.items() if not _has_delivery_evidence(linked_text, aliases)]
+        if missing:
+            errors.append(
+                ValidationError(
+                    code="DGS-010",
+                    message=f"数据购买、历史数据迁移或数据融合未识别到以下交付要求：{'、'.join(missing)}；通用背景提及仍需与本服务交付物对应。",
+                    section="验收要求",
+                    severity="warning",
+                    suggestion="请补充新数据上链、资源归集及数据质量自评估等验收内容。",
+                )
+            )
+    log_specs = [s for s in found_specs if s.name in {'数据标签', '历史数据归档及销毁'}]
+    if log_specs and not _has_delivery_evidence(_governance_delivery_context(full_text, log_specs, include_common=False), ('执行日志', '操作记录', '执行记录', '处理日志', '作业日志', '归档日志', '销毁记录', '标注日志')):
+        errors.append(
+            ValidationError(
+                code="DGS-011",
+                message="数据标签或历史数据归档及销毁服务的验收描述未明确执行日志。",
+                section="验收要求",
+                severity="warning",
+                suggestion="请将执行日志列为数据标签、归档及销毁服务的验收交付物。",
+            )
+        )
+    if "数据安全风险评估" in names and not all(_has_delivery_evidence(linked_text, (token,)) for token in ("评估报告", "整改报告", "信息安全服务资质")):
+        errors.append(
+            ValidationError(
+                code="DGS-012",
+                message="数据安全风险评估的验收描述未明确第三方资质、评估报告或整改报告。",
+                section="验收要求",
+                severity="warning",
+                suggestion="请补充第三方信息安全服务资质、盖章版评估报告和数据安全风险整改报告。",
+            )
+        )
+    return errors
+
+
+def _governance_delivery_context(text, specs, include_common=True):
+    lines = _meaningful_lines(text)
+    selected = []
+    for i, line in enumerate(lines):
+        named = any(_service_text_matches_spec(line, s) for s in specs)
+        common = include_common and bool(re.search(r'数据治理(?:服务)?|数据上链内容|本项目.{0,25}(?:新数据|数据资源|政务目录链)', line))
+        if not (named or common) or re.search(r'例如|示例|政策规定|指引规定|模板示范', line):
+            continue
+        selected.append(line)
+        # A short heading can introduce its delivery paragraph. Never consume
+        # unrelated paragraphs merely because a long service row precedes them.
+        if len(line) < 40 and i + 1 < len(lines) and not re.match(r'^\d+(?:\.\d+)*\s', lines[i + 1]):
+            selected.append(lines[i + 1])
+    return '\n'.join(selected)
+
+
+def _has_delivery_evidence(text, terms):
+    for clause in re.split(r'[。；;\n]', text):
+        if re.fullmatch(r'\s*(?:\d+(?:\.\d+)*\s*)?(?:数据上链|资源归集|数据质量|验收|执行日志)(?:内容|要求|说明)?\s*', clause):
+            continue
+        if re.search(r'未(?:提供|提交|形成|开展|完成)|尚无|缺少|待补充|无需|不提供|不提交|不开展|不要求|无需', clause):
+            continue
+        if _has_positive_phrase(clause, terms):
+            return True
+    return False
+
+
+def _has_positive_nearby_phrase(text: str, anchor: str, phrases: Iterable[str], window: int) -> bool:
+    compact_anchor = _compact(anchor)
+    indexes = [m.start() for m in re.finditer(re.escape(compact_anchor), text)]
+    if not indexes:
+        return False
+    for phrase in phrases:
+        compact_phrase = _compact(phrase)
+        if not compact_phrase:
+            continue
+        for match in re.finditer(re.escape(compact_phrase), text):
+            if all(abs(match.start() - index) > window for index in indexes):
+                continue
+            prefix = text[max(0, match.start() - 14) : match.start()]
+            suffix = text[match.end() : match.end() + 14]
+            if not _is_negated_context(prefix, suffix):
+                return True
+    return False
+
+
+def _has_positive_phrase(text: str, phrases: Iterable[str]) -> bool:
+    return bool(list(positive_mentions(text, phrases)))
+
+
+def _is_negated_context(prefix: str, suffix: str) -> bool:
+    tokens = ("不包含", "不涉及", "不申报", "不纳入", "不得", "禁止", "不应", "无需")
+    # 否定词可能位于事项前（“不包含数据质量检查”）或后（“数据质量检查（不纳入）”）。
+    # 仅在短窗口内判断，避免把相邻列/下一句的否定错误套用到当前事项。
+    return any(token in prefix[-20:] or token in suffix[:20] for token in tokens)
 
 
 def _to_text(value: Any) -> str:
@@ -272,25 +490,48 @@ def _extract_6_3_to_6_4_text(document: dict[str, Any], full_text: str) -> str:
     return ""
 
 
-def _extract_governance_annex_candidates(document: dict[str, Any], section_text: str) -> list[str]:
+def _extract_governance_annex_candidates(
+    document: dict[str, Any],
+    section_text: str,
+) -> list[GovernanceAnnexTable]:
     candidates = [
         table
-        for table in _extract_docx_6_3_table_texts(
+        for table in _extract_docx_6_3_tables(
             document.get("_content"),
             str(document.get("_filename") or ""),
         )
-        if _governance_table_score(table) >= 4
+        if _looks_like_governance_annex(table.text)
     ]
     if candidates:
         return candidates
 
+    # DOCX 已能按正文顺序精确读取表格；若 6.3 范围内没有合格表格，不能再把编号段落
+    # 或普通说明性文字降级当作“附表”，否则会把数据分析章节误判为治理服务附表。
+    if document.get("_content") and str(document.get("_filename") or "").lower().endswith(".docx"):
+        return []
+
     cleaned_section = _clean_text(section_text)
-    if cleaned_section and _governance_table_score(cleaned_section) >= 4:
-        return [cleaned_section]
+    if (
+        cleaned_section
+        and _governance_table_score(cleaned_section) >= 4
+        and _looks_like_structured_governance_annex(cleaned_section)
+    ):
+        # Preserve the archive's text-table unit checking. Only explicit
+        # header-led rows with matching column counts are treated as cells.
+        rows = []
+        width = None
+        for line in cleaned_section.splitlines():
+            cells = tuple(re.split(r"\s+|\s*\|\s*", line.strip()))
+            if any('测算单位' in c or '计量单位' in c for c in cells) and any('服务事项' in c for c in cells):
+                width = len(cells)
+                rows = [cells]
+            elif width and len(cells) == width and re.fullmatch(r"\d+", cells[0]):
+                rows.append(cells)
+        return [GovernanceAnnexTable(rows=tuple(rows), raw_text=cleaned_section)]
     return []
 
 
-def _extract_docx_6_3_table_texts(content: Any, filename: str) -> list[str]:
+def _extract_docx_6_3_tables(content: Any, filename: str) -> list[GovernanceAnnexTable]:
     if not content or not str(filename or "").lower().endswith(".docx"):
         return []
 
@@ -310,36 +551,56 @@ def _extract_docx_6_3_table_texts(content: Any, filename: str) -> list[str]:
     except Exception:
         return []
 
-    tables: list[str] = []
+    tables: list[GovernanceAnnexTable] = []
     in_6_3 = False
+    current_heading_number = ""
+    current_heading_text = ""
 
     for child in doc.element.body.iterchildren():
         if isinstance(child, CT_P):
-            text = Paragraph(child, doc).text.strip()
+            paragraph = Paragraph(child, doc)
+            text = paragraph.text.strip()
             if not text:
                 continue
-            if _is_section_heading(text, "6.3"):
+            section_number = _leading_section_number(text)
+            if len(text) < 150:
+                current_heading_number = section_number
+                current_heading_text = text
+            if _is_6_3_section_number(section_number):
                 in_6_3 = True
+                current_heading_number = section_number
+                current_heading_text = text
                 continue
-            if in_6_3 and _is_section_heading(text, "6.4"):
-                break
-            if in_6_3 and _is_after_6_3_section_heading(text):
-                break
+            if in_6_3 and _is_after_6_3_section_number(section_number):
+                in_6_3 = False
             continue
 
-        if isinstance(child, CT_Tbl) and in_6_3:
+        if isinstance(child, CT_Tbl):
             table = Table(child, doc)
-            lines: list[str] = []
-            for row in table.rows:
-                cells = [_clean_table_cell(cell.text) for cell in row.cells]
-                cells = _dedupe_adjacent_cells([cell for cell in cells if cell])
-                if cells:
-                    lines.append(" | ".join(cells))
-            table_text = _clean_text("\n".join(lines))
-            if table_text:
-                tables.append(table_text)
+            rows = [tuple(row) for row in table_grid(table) if any(row)]
+            header = ' '.join(' '.join(r) for r in rows[:2])
+            # Different templates use 7.2 or attachments. A service/unit table
+            # is evidence regardless of chapter numbering; a copied guideline is not.
+            if not in_6_3 and not ("服务事项" in header and any(t in header for t in ("单位", "工作量"))):
+                continue
+            if any(t in current_heading_text for t in ("配置指引", "参考模板", "政策原文")):
+                continue
+            if rows:
+                tables.append(
+                    GovernanceAnnexTable(
+                        rows=tuple(rows),
+                        heading_number=current_heading_number,
+                        heading_text=current_heading_text,
+                    )
+                )
 
     return tables
+
+
+def _extract_docx_6_3_table_texts(content: Any, filename: str) -> list[str]:
+    """Compatibility wrapper retained for focused tests and diagnostics."""
+
+    return [table.text for table in _extract_docx_6_3_tables(content, filename)]
 
 
 def _governance_table_score(text: str) -> int:
@@ -360,6 +621,44 @@ def _governance_table_score(text: str) -> int:
     return score
 
 
+def _leading_section_number(text: str) -> str:
+    match = re.match(r"^\s*(\d+(?:[\.．]\d+)+)(?=[\s、\.．]|$)", str(text or ""))
+    return match.group(1).replace("．", ".") if match else ""
+
+
+def _is_6_3_section_number(section_number: str) -> bool:
+    return section_number == "6.3" or section_number.startswith("6.3.")
+
+
+def _is_after_6_3_section_number(section_number: str) -> bool:
+    if not section_number:
+        return False
+    parts = section_number.split(".")
+    try:
+        major = int(parts[0])
+        minor = int(parts[1]) if len(parts) > 1 else 0
+    except (TypeError, ValueError):
+        return False
+    return major > 6 or (major == 6 and minor >= 4)
+
+
+def _looks_like_structured_governance_annex(text: str) -> bool:
+    """要求降级文本至少保留表格/逐行清单结构，避免把说明性段落当成附表。"""
+
+    lines = _meaningful_lines(text)
+    if len(lines) < 2:
+        return False
+    structured_rows = sum(
+        1
+        for line in lines
+        if "|" in line or (
+            _looks_like_table_data_row(line)
+            and not re.match(r"^6(?:[\.．、\s]|$)", _compact(line))
+        )
+    )
+    return structured_rows >= 1
+
+
 def _missing_required_annex_fields(text: str) -> list[str]:
     compact = _compact(_annex_header_text(text))
     missing: list[str] = []
@@ -367,6 +666,162 @@ def _missing_required_annex_fields(text: str) -> list[str]:
         if not _has_any(compact, (_compact(alias) for alias in aliases)):
             missing.append(field)
     return missing
+
+
+def _missing_required_annex_fields_from_tables(tables: list[GovernanceAnnexTable]) -> list[str]:
+    header_texts = [_table_header_text(table) for table in tables if table.rows]
+    if header_texts:
+        return _missing_required_annex_fields("\n".join(header_texts))
+    return _missing_required_annex_fields("\n".join(table.text for table in tables))
+
+
+def _table_header_text(table: GovernanceAnnexTable) -> str:
+    if not table.rows:
+        return _annex_header_text(table.text)
+
+    header_rows: list[str] = []
+    for row in table.rows[:4]:
+        row_text = " | ".join(row)
+        if header_rows and _row_contains_service_item(row):
+            break
+        header_rows.append(row_text)
+    return "\n".join(header_rows)
+
+
+def _table_header_mapping(table: GovernanceAnnexTable) -> dict[str, int]:
+    combined_mapping: dict[str, int] = {}
+    for row in table.rows[:4]:
+        if combined_mapping and _row_contains_service_item(row):
+            break
+        for index, cell in enumerate(row):
+            for field, aliases in _REQUIRED_ANNEX_FIELDS:
+                if field in combined_mapping:
+                    continue
+                if _header_cell_matches(cell, aliases):
+                    combined_mapping[field] = index
+    return combined_mapping
+
+
+def _header_cell_matches(cell: str, aliases: Iterable[str]) -> bool:
+    compact_cell = _compact(cell)
+    for alias in aliases:
+        compact_alias = _compact(alias)
+        if not compact_alias:
+            continue
+        if compact_alias == "单位":
+            if compact_cell in {"单位", "测算单位", "计量单位", "工作量单位"}:
+                return True
+            continue
+        if compact_alias in compact_cell:
+            return True
+    return False
+
+
+def _find_annex_service_specs(
+    tables: list[GovernanceAnnexTable],
+    fallback_text: str,
+) -> list[DataGovernanceServiceSpec]:
+    service_cells = _annex_service_cells(tables)
+    if not service_cells:
+        return _find_service_specs(fallback_text)
+    return _find_service_specs("\n".join(service_cells))
+
+
+def _annex_service_cells(tables: list[GovernanceAnnexTable]) -> list[str]:
+    cells: list[str] = []
+    for table in tables:
+        mapping = _table_header_mapping(table)
+        service_index = mapping.get("服务事项")
+        if service_index is None:
+            continue
+        for row in table.rows:
+            if service_index >= len(row):
+                continue
+            cell = row[service_index]
+            if _header_cell_matches(cell, _SERVICE_FIELD_ALIASES):
+                continue
+            if cell:
+                cells.append(cell)
+    return cells
+
+
+def _find_annex_negative_hits(
+    tables: list[GovernanceAnnexTable],
+    fallback_text: str,
+) -> list[str]:
+    service_cells = _annex_service_cells(tables)
+    if not service_cells:
+        return _find_negative_hits(fallback_text)
+
+    hits: list[str] = []
+    for service_cell in service_cells:
+        allowed_specs = _find_service_specs(service_cell)
+        for hit in _find_negative_hits(service_cell):
+            if hit == "数据质量检查" and any(spec.name == "数据融合" for spec in allowed_specs):
+                # 数据质量检查可以作为数据融合的工作步骤，但不能作为独立服务事项申报。
+                continue
+            if hit not in hits:
+                hits.append(hit)
+    return hits
+
+
+def _annex_service_unit_status(
+    tables: list[GovernanceAnnexTable],
+    spec: DataGovernanceServiceSpec,
+) -> tuple[str, list[str]]:
+    observed_units: list[str] = []
+    matched_row = False
+    has_structured_unit_column = False
+
+    for table in tables:
+        mapping = _table_header_mapping(table)
+        service_index = mapping.get("服务事项")
+        unit_index = mapping.get("测算单位")
+        if service_index is None or unit_index is None:
+            continue
+        has_structured_unit_column = True
+        for row in table.rows:
+            if service_index >= len(row) or unit_index >= len(row):
+                continue
+            service_cell = row[service_index]
+            if not _service_text_matches_spec(service_cell, spec):
+                continue
+            matched_row = True
+            unit_cell = row[unit_index].strip()
+            if not _unit_cell_matches(unit_cell, spec.unit_aliases):
+                display_unit = unit_cell or "未填写"
+                if display_unit not in observed_units:
+                    observed_units.append(display_unit)
+
+    if observed_units:
+        return "invalid", observed_units
+    if matched_row:
+        return "valid", []
+    if has_structured_unit_column:
+        return "unknown", []
+    return "unknown", []
+
+
+def _row_contains_service_item(row: tuple[str, ...]) -> bool:
+    return any(_find_service_specs(cell) for cell in row)
+
+
+def _service_text_matches_spec(text: str, spec: DataGovernanceServiceSpec) -> bool:
+    compact_text = _compact(text)
+    return _has_any(compact_text, (_compact(alias) for alias in (spec.name, *spec.aliases)))
+
+
+def _unit_cell_matches(text: str, allowed_units: Iterable[str]) -> bool:
+    compact_text = _compact(text)
+    if not compact_text:
+        return False
+    parts = [part for part in re.split(r"[/／、,，;；]|(?:或)", compact_text) if part]
+    units = set(allowed_units)
+    if "个标签" in units:
+        units.add("个")  # 服务事项已明确为数据标签时，“个”仍是标签个数。
+    if "项" in units:
+        units.update(("项数据", "项数据集"))
+    return bool(parts) and all(any(part == u or part.startswith(u + "（") or part.startswith(u + "(") for u in units) for part in parts)
 
 
 def _annex_header_text(text: str) -> str:
@@ -448,13 +903,43 @@ def _dedupe_adjacent_cells(cells: list[str]) -> list[str]:
 
 def _find_negative_hits(compact_text: str) -> list[str]:
     hits: list[str] = []
-    for item in NEGATIVE_LIST_ITEMS:
-        compact_item = _compact(item)
-        if compact_item and compact_item in compact_text:
+    for line in _meaningful_lines(compact_text):
+        compact_line = _compact(line)
+        for item in NEGATIVE_LIST_ITEMS:
+            compact_item = _compact(item)
+            if not compact_item or compact_item not in compact_line:
+                continue
+            # “不包含/不涉及/不得申报”等说明性文字是在排除该事项，
+            # 不能把它当成项目实际申报的负面服务项。
+            if not _has_positive_phrase(line, (item,)):
+                continue
             canonical = _canonical_negative_item(item)
             if canonical not in hits:
                 hits.append(canonical)
     return hits
+
+
+def assess_data_governance_service_applicability(document, full_text=None):
+    from .project_scope import assess_project_applicability
+    return assess_project_applicability(document, 24, full_text)
+
+
+def _is_reference_or_non_municipal_material(document: dict[str, Any], full_text: str) -> bool:
+    """向后兼容旧调用；新代码应使用带原因的适用性判断。"""
+
+    return not assess_data_governance_service_applicability(document, full_text)["applies"]
+
+
+def _has_positive_governance_trigger(text: str) -> bool:
+    """识别项目实际涉及数据治理，而不是仅在正文中引用排除事项。"""
+
+    operational = ("申报", "采购", "服务费", "测算", "工作量", "服务事项", "附表", "预算", "项目建设包含")
+    for clause in positive_mentions(text, _TRIGGER_TERMS):
+        if any(t in clause for t in ("配置指引", "根据政策", "参考模板", "不得申报", "禁止申报")):
+            continue
+        if any(t in clause for t in operational):
+            return True
+    return False
 
 
 def _canonical_negative_item(item: str) -> str:

@@ -43,15 +43,18 @@ def run_resource_check_from_file(
     project = _get_or_create_project(db, project_id, project_name, department)
 
     selected = {str(item).strip() for item in selected_rule_ids or [] if str(item).strip()}
-    parsed_items = parse_resource_items(content, filename)
+    # Only rows 15/16 use the revised parser; maintenance-only requests retain the original path.
+    from app.modules.resource.quantity_parser import parse_resource_items as parse_revised_resources
+    from app.modules.resource.document_check import check_resource_document
+    parsed_items = (parse_revised_resources if _standard_resource_rules_selected(selected) else parse_resource_items)(content, filename)
 
     findings: list[ResourceRuleFinding] = []
     explicit_maintenance_rules_selected = _maintenance_rules_selected(selected)
     run_maintenance_rules = explicit_maintenance_rules_selected and is_maintenance_project_document(content, filename)
-    if parsed_items and _standard_resource_rules_selected(selected):
+    if _standard_resource_rules_selected(selected):
         findings.extend(
             finding
-            for finding in evaluate_resource_rules(parsed_items)
+            for finding in check_resource_document(content, filename, parsed_items)
             if _resource_finding_selected(finding, selected)
         )
 
@@ -64,25 +67,6 @@ def run_resource_check_from_file(
                 db=db,
             )
         )
-
-    if not parsed_items and _standard_resource_rules_selected(selected) and not run_maintenance_rules:
-        findings = [
-            *findings,
-            ResourceRuleFinding(
-                rule_code="RESOURCE_PARSE_SCOPE",
-                rule_name="资源申请清单解析",
-                resource_name="资源申请清单",
-                severity="需人工确认",
-                result_label="未找到资源清单",
-                reason=(
-                    "未在上传材料中识别到安全服务需求表、PaaS服务清单、密码服务资源内容清单、"
-                    "云资源申请表、计算资源清单或三大件清单等资源申请相关内容。"
-                ),
-                suggestion="建议上传结构化 .xlsx/.csv 资源清单，或在 Word/PDF 中保留清晰的资源相关章节标题和数量列。",
-                source_quantities={},
-                row_indexes=[],
-            )
-        ]
 
     # 当前实现采用“本次上传结果覆盖该项目旧资源清单”的策略。
     _replace_resource_items(db, project.id, parsed_items)
@@ -151,7 +135,14 @@ def _build_response(
             for item in items_by_row.get(row, [])
             if item.raw_text
         ) or None
-        return ResourceCheckFindingOut(
+        if finding.rule_code in {"R15_SECURITY_PAAS_CRYPTO_QUANTITY", "R16_SERVER_OS_QUANTITY", "R16_DB_SERVER_DATABASE_QUANTITY"} and getattr(finding, "source_locations", None):
+            evidence = "；".join(dict.fromkeys(str(loc.get("quote") or "") for loc in locations)) or None
+            location_hint = "；".join(dict.fromkeys(
+                f"{loc.get('sheet_name', '')}第{loc['row_index']}行" if loc.get('row_index') is not None
+                else str(loc.get('sheet_name') or '原文') for loc in locations))
+            if filename:
+                location_hint = f"{filename}，{location_hint}"
+        output = ResourceCheckFindingOut(
             rule_code=finding.rule_code,
             rule_name=finding.rule_name,
             resource_name=finding.resource_name,
@@ -175,6 +166,14 @@ def _build_response(
             evidence_examples=finding.evidence_examples,
             source_section=finding.source_section,
         )
+
+        location = getattr(finding, 'evidence_location', None)
+        if location and finding.rule_code in {"R15_SECURITY_PAAS_CRYPTO_QUANTITY", "R16_SERVER_OS_QUANTITY", "R16_DB_SERVER_DATABASE_QUANTITY"}:
+            output.source_locations = location['source_locations']
+            output.source_highlights = location['source_highlights']
+            output.location_hint = location['location_hint']
+            output.revision_target = location['revision_target']
+        return output
 
     return ResourceCheckResponse(
         project=ProjectOut.model_validate(project),
