@@ -261,7 +261,7 @@ class RuleGroupConfigurationTests(unittest.TestCase):
             )
 
             os_finding = next(item for item in result.findings if item.rule_code == "R16_SERVER_OS_QUANTITY")
-            self.assertEqual(os_finding.result_label, "不适用")
+            self.assertEqual(os_finding.result_label, "无法判断")
             self.assertEqual(os_finding.source_quantities["服务器数量"], 0.0)
             self.assertEqual(os_finding.source_quantities["操作系统数量"], 0.0)
         finally:

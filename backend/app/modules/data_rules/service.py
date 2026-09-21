@@ -360,227 +360,10 @@ def _evaluate_budget_consistency(
     content: bytes | None = None,
     filename: str | None = None,
 ) -> RuleResult:
-    lines = _meaningful_lines(document.raw_text)
-    amount_lines = [
-        (index, line, _extract_amounts_from_line(lines, index, document.raw_text))
-        for index, line in enumerate(lines)
-    ]
-    amount_lines = [
-        (index, line, amounts)
-        for index, line, amounts in amount_lines
-        if amounts
-    ]
+    from app.modules.data_rules.document_rules import _evaluate_budget_consistency as revised
+    return revised(document, content=content, filename=filename)
 
-    project_total_candidates = [
-        {
-            "line": line,
-            "amount_wan": _pick_representative_amount(amounts),
-        }
-        for _index, line, amounts in amount_lines
-        if _contains_project_total_keyword(line)
-    ]
-    project_totals = _distinct_amounts(
-        item["amount_wan"] for item in project_total_candidates
-    )
 
-    detail_total_candidates = [
-        {
-            "line": line,
-            "amount_wan": _pick_representative_amount(amounts),
-            "source": "文本行",
-            "kind": "text_total",
-        }
-        for index, line, amounts in amount_lines
-        if _is_detail_total_context(lines, index, line)
-    ]
-
-    arithmetic_issues = _find_total_row_arithmetic_issues(lines, amount_lines)
-    text_arithmetic_rows_checked = _count_total_row_arithmetic_checks(lines, amount_lines)
-    table_budget = (
-        _extract_docx_budget_table_checks(content, filename)
-        if content and (filename or document.filename).lower().endswith(".docx")
-        else _empty_budget_table_checks()
-    )
-    if table_budget["detail_total_candidates"]:
-        detail_total_candidates = _distinct_budget_candidates(
-            [*detail_total_candidates, *table_budget["detail_total_candidates"]]
-        )
-    arithmetic_issues.extend(table_budget["arithmetic_issues"])
-    issues: list[RuleIssue] = []
-    suggestions: list[str] = []
-
-    if len(project_totals) > 1:
-        issue_text = "、".join(_format_amount(item) for item in project_totals)
-        issues.append(
-            RuleIssue(
-                message=f"识别到多个不一致的项目总投资金额：{issue_text}。",
-                evidence=" | ".join(item["line"] for item in project_total_candidates[:5]),
-                section="项目总投资相关表述",
-            )
-        )
-        suggestions.append("请统一全文中的项目总投资、投资概况和预算编制说明金额。")
-
-    project_detail_total_checked = False
-    if project_totals and detail_total_candidates:
-        project_total = project_totals[0]
-        matching_detail_totals = [
-            item
-            for item in detail_total_candidates
-            if _amounts_close(item["amount_wan"], project_total)
-        ]
-        component_total_candidates = [
-            item
-            for item in detail_total_candidates
-            if _budget_candidate_is_component_total(item)
-        ]
-        component_total_sum = _sum_candidate_amounts(component_total_candidates)
-        if matching_detail_totals:
-            project_detail_total_checked = True
-        elif component_total_sum is not None and _amounts_close(component_total_sum, project_total):
-            project_detail_total_checked = True
-        else:
-            hard_mismatch_candidates = [
-                item
-                for item in detail_total_candidates
-                if _budget_candidate_is_grand_total(item)
-                or _amount_exceeds(item["amount_wan"], project_total)
-            ]
-            if component_total_sum is not None and _amount_exceeds(component_total_sum, project_total):
-                hard_mismatch_candidates.append(
-                    {
-                        "line": "已识别分项明细表合计",
-                        "amount_wan": component_total_sum,
-                        "source": "DOCX预算明细表",
-                        "kind": "component_total_sum",
-                    }
-                )
-            if hard_mismatch_candidates:
-                project_detail_total_checked = True
-                detail_preview = "、".join(
-                    _format_amount(item["amount_wan"])
-                    for item in hard_mismatch_candidates[:5]
-                )
-                issues.append(
-                    RuleIssue(
-                        message=(
-                            "预算合计/总计金额未与项目总投资金额匹配。"
-                            f"项目总投资为 {_format_amount(project_total)}，"
-                            f"识别到的可比合计/总计包括：{detail_preview}。"
-                        ),
-                        evidence=" | ".join(item["line"] for item in hard_mismatch_candidates[:5]),
-                        section="预算明细表 / 投资估算总表",
-                    )
-                )
-                suggestions.append("请核对投资估算总表、分项明细表合计与项目投资总预算是否一致。")
-
-    calculation_checks_performed = (
-        (1 if len(project_total_candidates) > 1 else 0)
-        + (1 if project_detail_total_checked else 0)
-        + text_arithmetic_rows_checked
-        + int(table_budget.get("table_internal_checks") or 0)
-        + int(table_budget.get("summary_internal_checks") or 0)
-    )
-
-    if not issues and calculation_checks_performed == 0:
-        if project_total_candidates and not detail_total_candidates:
-            issues.append(
-                RuleIssue(
-                    message=(
-                        "资料不足：仅识别到项目总投资金额，未识别到可用于计算校验的预算明细表合计、"
-                        "投资估算总表总计或可加总分项金额。"
-                    ),
-                    evidence=" | ".join(item["line"] for item in project_total_candidates[:3]),
-                    section="预算明细表 / 投资估算总表",
-                )
-            )
-        elif detail_total_candidates and not project_total_candidates:
-            issues.append(
-                RuleIssue(
-                    message=(
-                        "资料不足：已识别到预算分项或合计金额，但未识别到项目总投资/总预算，"
-                        "无法完成表间总和一致性校验。"
-                    ),
-                    evidence=" | ".join(item["line"] for item in detail_total_candidates[:3]),
-                    section="预算明细表 / 投资估算总表",
-                )
-            )
-        elif amount_lines:
-            detail_preview = "、".join(
-                line
-                for _index, line, _amounts in amount_lines[:3]
-            )
-            issues.append(
-                RuleIssue(
-                    message=(
-                        "资料不足：已识别到金额信息，但缺少项目总投资、合计/总计行或可加总明细，"
-                        "无法判断预算计算是否正确。"
-                    ),
-                    evidence=detail_preview,
-                    section="预算明细表 / 投资估算总表",
-                )
-            )
-        else:
-            issues.append(
-                RuleIssue(
-                    message="资料不足：未识别到可用于第18条计算校验的预算金额。",
-                    evidence=None,
-                    section="预算明细表 / 投资估算总表",
-                )
-            )
-        suggestions.append("请补充项目总投资、预算明细表合计/总计行或可加总分项金额，便于完成第18条计算校验。")
-
-    for issue in arithmetic_issues[:5]:
-        issues.append(issue)
-    if arithmetic_issues:
-        suggestions.append("请复核合计/总计行内部加总关系，确保表内计算无误。")
-
-    if issues:
-        insufficient_only = all(issue.message.startswith("资料不足") for issue in issues)
-        hard_fail = bool(project_totals and len(project_totals) > 1) or bool(arithmetic_issues)
-        if project_detail_total_checked and not insufficient_only:
-            hard_fail = True
-        status = "资料不足" if insufficient_only else "failed" if hard_fail else "warning"
-        severity = "risk" if hard_fail else "warning"
-        passed = False
-        summary = "第18条资料不足，无法完成预算计算校验。" if insufficient_only else "项目预算一致性存在需复核事项。"
-    else:
-        status = "passed"
-        severity = "pass"
-        passed = True
-        summary = "已完成可识别预算金额关系校验，未发现项目总投资、预算合计和可识别合计行之间的不一致。"
-
-    metrics = {
-        "project_total_candidates": project_total_candidates[:10],
-        "distinct_project_totals_wan": project_totals,
-        "detail_total_candidates": detail_total_candidates[:10],
-        "budget_tables_checked": table_budget["tables_checked"],
-        "budget_evidence_examples": table_budget["evidence_examples"][:10],
-        "text_arithmetic_rows_checked": text_arithmetic_rows_checked,
-        "docx_table_internal_checks": table_budget.get("table_internal_checks") or 0,
-        "docx_summary_internal_checks": table_budget.get("summary_internal_checks") or 0,
-        "calculation_checks_performed": calculation_checks_performed,
-        "component_detail_total_sum_wan": _sum_candidate_amounts(
-            [item for item in detail_total_candidates if _budget_candidate_is_component_total(item)]
-        ),
-    }
-
-    return RuleResult(
-        rule_excel_row=18,
-        rule_name="项目预算一致性校验规则",
-        rule_category="一致性校验规则",
-        rule_description="项目预算数据计算无误",
-        judgement_condition=(
-            "各分项的投资估算明细表内部计算无错误、表间的计算总和无错误，"
-            "所有分项明细表总计与项目投资总预算一致"
-        ),
-        passed=passed,
-        status=status,
-        severity=severity,
-        summary=summary,
-        metrics=metrics,
-        issues=issues,
-        suggestions=suggestions or ["保持全文项目投资金额、各分项明细表和总预算一致。"],
-    )
 
 
 def _evaluate_indicator_quantity(
@@ -589,171 +372,10 @@ def _evaluate_indicator_quantity(
     filename: str | None = None,
     project_name: str | None = None,
 ) -> RuleResult:
-    applicability = _rule_21_project_applicability(document, filename=filename, project_name=project_name)
-    if not applicability["applies"]:
-        return RuleResult(
-            rule_excel_row=21,
-            rule_name="项目成效考核目标数量设置合规性审查规则",
-            rule_category="内容合规性审查规则",
-            rule_description="指标设置数量应满足要求",
-            judgement_condition=(
-                "通用指标中至少设定3个效益指标，业务指标中至少设定4个产出指标或效益指标；"
-                "涉及智能化应用的需明确不少于2个成效指标"
-            ),
-            passed=True,
-            status="不适用",
-            severity="通过",
-            summary="本规则仅适用于市级项目，当前材料识别为非市级项目，未执行指标数量校验。",
-            metrics={
-                "common_benefit_indicator_count": 0,
-                "business_output_or_benefit_indicator_count": 0,
-                "intelligent_project_detected": _contains_intelligent_keyword(document.raw_text),
-                "achievement_indicator_count": 0,
-                "indicator_scope_source": "project_scope_not_applicable",
-                "indicator_lines_sample": [],
-                "project_scope_applicability": applicability,
-                "skipped_reason": applicability["reason"],
-            },
-            issues=[],
-            suggestions=["第21条仅适用于市级项目；非市级项目无需按本条补充指标数量。"],
-        )
+    from app.modules.data_rules.document_rules import _evaluate_indicator_quantity as revised
+    return revised(document, content=content, filename=filename, project_name=project_name)
 
-    section_lines, table_rows, section_source = _extract_indicator_quantity_source(
-        document,
-        content=content,
-        filename=filename,
-    )
-    if section_source == "2_6_section_not_found":
-        return RuleResult(
-            rule_excel_row=21,
-            rule_name="项目成效考核目标数量设置合规性审查规则",
-            rule_category="内容合规性审查规则",
-            rule_description="指标设置数量应满足要求",
-            judgement_condition=(
-                "通用指标中至少设定3个效益指标，业务指标中至少设定4个产出指标或效益指标；"
-                "涉及智能化应用的需明确不少于2个成效指标"
-            ),
-            passed=True,
-            status="通过",
-            severity="通过",
-            summary="未识别到 2.6 项目成效考核目标（规划指标）章节，本条规则不适用，自动通过。",
-            metrics={
-                "common_benefit_indicator_count": 0,
-                "business_output_or_benefit_indicator_count": 0,
-                "intelligent_project_detected": _contains_intelligent_keyword(document.raw_text),
-                "achievement_indicator_count": 0,
-                "indicator_scope_source": section_source,
-                "indicator_lines_sample": [],
-                "project_scope_applicability": applicability,
-                "skipped_reason": "未识别到 2.6 项目成效考核目标（规划指标）章节",
-            },
-            issues=[],
-            suggestions=["未识别到 2.6 章节，本条数量校验已按不适用处理。"],
-        )
 
-    lines = section_lines
-    indicator_lines = _collect_indicator_lines(lines)
-
-    if table_rows:
-        (
-            common_benefit_count,
-            business_output_or_benefit_count,
-            achievement_count,
-            counted_indicator_lines,
-        ) = _count_indicator_table_rows(table_rows)
-        if counted_indicator_lines:
-            indicator_lines = counted_indicator_lines
-    else:
-        common_benefit_count = _count_indicator_rows(
-            indicator_lines,
-            scope_keywords=("通用指标", "通用"),
-            type_keywords=("效益指标", "效益"),
-        )
-        business_output_or_benefit_count = _count_indicator_rows(
-            indicator_lines,
-            scope_keywords=("业务指标", "业务"),
-            type_keywords=("产出指标", "效益指标", "产出", "效益"),
-        )
-        achievement_count = _count_achievement_indicator_rows(indicator_lines)
-
-    intelligent_project = _contains_intelligent_keyword(document.raw_text)
-
-    issues: list[RuleIssue] = []
-    suggestions: list[str] = []
-
-    if common_benefit_count < 3:
-        issues.append(
-            RuleIssue(
-                message=f"通用指标中的效益指标识别到 {common_benefit_count} 个，少于规则要求的 3 个。",
-                evidence=_join_evidence(indicator_lines),
-            )
-        )
-        suggestions.append("请在通用指标中补足至少 3 个效益指标。")
-
-    if business_output_or_benefit_count < 4:
-        issues.append(
-            RuleIssue(
-                message=(
-                    "业务指标中的产出指标或效益指标识别到 "
-                    f"{business_output_or_benefit_count} 个，少于规则要求的 4 个。"
-                ),
-                evidence=_join_evidence(indicator_lines),
-            )
-        )
-        suggestions.append("请在业务指标中补足至少 4 个产出指标或效益指标。")
-
-    if intelligent_project and achievement_count < 2:
-        issues.append(
-            RuleIssue(
-                message=(
-                    "文档疑似涉及智能化应用，但成效指标识别到 "
-                    f"{achievement_count} 个，少于规则要求的 2 个。"
-                ),
-                evidence=_join_evidence(
-                    [line for line in lines if _contains_intelligent_keyword(line)]
-                ),
-            )
-        )
-        suggestions.append("涉及智能化应用时，请明确不少于 2 个成效指标。")
-
-    if issues:
-        status = "发现问题"
-        severity = "高"
-        passed = False
-        summary = "项目成效考核目标数量未完全满足规则要求。"
-    else:
-        status = "通过"
-        severity = "通过"
-        passed = True
-        summary = "项目成效考核目标数量满足规则要求。"
-
-    metrics = {
-        "common_benefit_indicator_count": common_benefit_count,
-        "business_output_or_benefit_indicator_count": business_output_or_benefit_count,
-        "intelligent_project_detected": intelligent_project,
-        "achievement_indicator_count": achievement_count,
-        "indicator_scope_source": section_source,
-        "indicator_lines_sample": indicator_lines[:20],
-        "project_scope_applicability": applicability,
-    }
-
-    return RuleResult(
-        rule_excel_row=21,
-        rule_name="项目成效考核目标数量设置合规性审查规则",
-        rule_category="内容合规性审查规则",
-        rule_description="指标设置数量应满足要求",
-        judgement_condition=(
-            "通用指标中至少设定3个效益指标，业务指标中至少设定4个产出指标或效益指标；"
-            "涉及智能化应用的需明确不少于2个成效指标"
-        ),
-        passed=passed,
-        status=status,
-        severity=severity,
-        summary=summary,
-        metrics=metrics,
-        issues=issues,
-        suggestions=suggestions or ["保持通用指标、业务指标和智能化应用成效指标数量满足规则要求。"],
-    )
 
 
 def _build_data_reporting_results(
@@ -761,24 +383,24 @@ def _build_data_reporting_results(
     filename: str,
     selected_rule_ids: list[str] | None = None,
 ) -> list[dict[str, Any]]:
+    selected_governance = {str(item).strip() for item in selected_rule_ids or [] if str(item).strip()}
+    governance_rule = next(rule for rule in DATA_REPORTING_RULES if str(rule["rule_id"]) == "DATA_REASON_024")
+    if selected_governance and all(_rule_selected(governance_rule, {item}) for item in selected_governance):
+        from app.modules.data_rules.document_rules import _build_data_reporting_results as revised_governance
+        return revised_governance(content, filename, selected_rule_ids=["24"])
     document = BaseValidator.parse_document(content, filename)
     validation = DataReportingValidator().validate(document)
     validation_errors = list(validation.errors)
-    validation_errors.extend(
-        validate_data_governance_service_design(
-            {
-                **document,
-                "_content": content,
-                "_filename": filename,
-            }
-        )
-    )
     grouped_errors = _group_validation_errors_by_rule(validation_errors)
     selected = {str(item).strip() for item in selected_rule_ids or [] if str(item).strip()}
 
     results: list[dict[str, Any]] = []
     for rule in DATA_REPORTING_RULES:
         if selected and not _rule_selected(rule, selected):
+            continue
+        if str(rule["rule_id"]) == "DATA_REASON_024":
+            from app.modules.data_rules.document_rules import _build_data_reporting_results as revised_governance
+            results.extend(revised_governance(content, filename, selected_rule_ids=["24"]))
             continue
         issues = grouped_errors.get(str(rule["rule_id"]), [])
         suggestions = _unique_texts(

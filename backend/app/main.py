@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import evaluate, projects
+from app.api import evaluate, projects, completeness
 from app.core.config import settings
 from app.db.session import init_db
 
@@ -33,3 +33,4 @@ def health() -> dict[str, str]:
 
 app.include_router(projects.router, prefix="/api/projects", tags=["projects"])
 app.include_router(evaluate.router, prefix="/api/evaluate", tags=["evaluate"])
+app.include_router(completeness.router, prefix="/api/completeness", tags=["completeness"])

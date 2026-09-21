@@ -30,6 +30,9 @@ public partial class MainWindow : Window
     private readonly Dictionary<string, List<RuleDisplayItem>> _rulesByModule = new();
     private Grid? _contentHost;
     private Grid? _reportPage;
+    private Grid? _specialistPage;
+    private UIElement? _projectSelectionCard;
+    private UIElement? _reportSelectionCard;
     private UIElement? _recordsPage;
     private UIElement? _rulesPage;
     private UIElement? _settingsPage;
@@ -49,6 +52,7 @@ public partial class MainWindow : Window
     private string _activeRuleModule = "function_correspondence";
     private string? _activeRecordId;
     private Button? _reportNavButton;
+    private Button? _specialistNavButton;
     private Button? _recordsNavButton;
     private Button? _rulesNavButton;
     private Button? _settingsNavButton;
@@ -242,12 +246,14 @@ public partial class MainWindow : Window
         WorkbenchPage.Children.Remove(_reportPage);
         WorkbenchPage.Children.Add(_contentHost);
         InsertCompletenessPrecheck();
+        SplitReportCheckPages();
 
         _recordsPage = BuildRecordsPage();
         _rulesPage = BuildRulesPage();
         _settingsPage = ScrollablePage(BuildSettingsPage(), showScrollBar: true);
 
-        _reportNavButton = FindNavButton("可研报告检测", "Report");
+        _reportNavButton = FindNavButton("完整性检查", "Report");
+        _specialistNavButton = FindNavButton("可研报告专项检查", "Specialist");
         _recordsNavButton = FindNavButton("审查记录", "Records");
         _rulesNavButton = FindNavButton("规则库配置", "Rules");
         _settingsNavButton = FindNavButton("系统设置", "Settings");
@@ -257,7 +263,7 @@ public partial class MainWindow : Window
             _rulesNavButton.Content = "规则库配置";
         }
 
-        foreach (var button in new[] { _reportNavButton, _recordsNavButton, _rulesNavButton, _settingsNavButton })
+        foreach (var button in new[] { _reportNavButton, _specialistNavButton, _recordsNavButton, _rulesNavButton, _settingsNavButton })
         {
             if (button != null)
             {
@@ -297,15 +303,29 @@ public partial class MainWindow : Window
         _contentHost.Children.Clear();
         var page = tag switch
         {
+            "Specialist" => _specialistPage!,
             "Records" => _recordsPage!,
             "Rules" => _rulesPage!,
             "Settings" => _settingsPage!,
             _ => _reportPage
         };
+        if (page == _reportPage || page == _specialistPage)
+        {
+            // Both pages use the same selection controls/state. Reparenting
+            // preserves project events, file choice and in-flight task state.
+            var target = (Grid)page;
+            foreach (var (card, row) in new[] { (_projectSelectionCard, 1), (_reportSelectionCard, 2) })
+            {
+                if (card == null) continue;
+                DetachFromParent(card);
+                Grid.SetRow(card, row);
+                target.Children.Add(card);
+            }
+        }
         DetachFromParent(page);
-        _contentHost.Children.Add(page == _reportPage ? ScrollablePage(page) : page);
+        _contentHost.Children.Add(page == _reportPage || page == _specialistPage ? ScrollablePage(page) : page);
 
-        foreach (var button in new[] { _reportNavButton, _recordsNavButton, _rulesNavButton, _settingsNavButton })
+        foreach (var button in new[] { _reportNavButton, _specialistNavButton, _recordsNavButton, _rulesNavButton, _settingsNavButton })
         {
             if (button != null)
             {
@@ -381,58 +401,36 @@ public partial class MainWindow : Window
         _reportPage.Children.Add(section);
     }
 
-    private Border BuildCompletenessPrecheck()
-    {
-        var root = new Grid();
-        root.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1.35, GridUnitType.Star) });
-        root.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+    private Border BuildCompletenessPrecheck() => BuildRealCompletenessPrecheck();
 
-        var left = new StackPanel();
-        left.Children.Add(Text("前置完整性检查", 18, FontWeights.Bold, FindBrush("TextBrush")));
-        left.Children.Add(Text("检查可研报告文本、附件材料、表格数据和关键章节是否齐全。该项作为专项检测前置项，完成后再进入九项专项检测。", 14, null, FindBrush("MutedBrush"), new Thickness(0, 6, 0, 12), true));
-        var tags = new WrapPanel { Margin = new Thickness(0, 0, 0, 12) };
-        tags.Children.Add(Pill("前置项", Brush(37, 99, 235), Brush(239, 246, 255)));
-        tags.Children.Add(Pill("材料基础", Brush(2, 122, 72), Brush(236, 253, 243)));
-        tags.Children.Add(Pill("结果可查看", Brush(181, 71, 8), Brush(255, 250, 235)));
-        left.Children.Add(tags);
-        _llmReviewCheckBox = new CheckBox
+    private void SplitReportCheckPages()
+    {
+        if (_reportPage == null) return;
+        var children = _reportPage.Children.Cast<UIElement>().ToArray();
+        _projectSelectionCard = children.Single(item => Grid.GetRow(item) == 2);
+        _reportSelectionCard = children.Single(item => Grid.GetRow(item) == 3);
+        var completeness = children.Single(item => Grid.GetRow(item) == 4);
+        var specialistContent = children.Where(item => Grid.GetRow(item) >= 5).OrderBy(Grid.GetRow).ToArray();
+        foreach (var item in specialistContent) _reportPage.Children.Remove(item);
+        Grid.SetRow(completeness, 3);
+        _reportPage.RowDefinitions.Clear();
+        for (var i = 0; i < 4; i++) _reportPage.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+        _specialistPage = new Grid();
+        for (var i = 0; i < 4 + specialistContent.Length; i++)
+            _specialistPage.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        var heading = new StackPanel();
+        heading.Children.Add(Text("可研报告专项检查", 28, FontWeights.Bold, FindBrush("TextBrush")));
+        heading.Children.Add(Text("选择项目、报告和专项检测范围，创建任务并查看进度。", 13, null, FindBrush("MutedBrush"), new Thickness(0, 6, 0, 0), true));
+        _specialistPage.Children.Add(heading);
+        _llmReviewCheckBox = new CheckBox { Content = "专项检测启用大模型辅助复核", IsChecked = false, Margin = new Thickness(0, 16, 0, 0) };
+        Grid.SetRow(_llmReviewCheckBox, 3);
+        _specialistPage.Children.Add(_llmReviewCheckBox);
+        for (var i = 0; i < specialistContent.Length; i++)
         {
-            Content = "启用大模型辅助复核",
-            IsChecked = false,
-            Margin = new Thickness(0, 0, 0, 12)
-        };
-        left.Children.Add(_llmReviewCheckBox);
-        var runButton = Button("执行完整性检查", true);
-        runButton.Click += OnRunCompletenessCheckClicked;
-        left.Children.Add(ActionRow(runButton, CompletenessResultButton()));
-        root.Children.Add(left);
-
-        var right = new StackPanel { Margin = new Thickness(20, 0, 0, 0) };
-        Grid.SetColumn(right, 1);
-        var statusHeader = new Grid();
-        statusHeader.ColumnDefinitions.Add(new ColumnDefinition());
-        statusHeader.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        statusHeader.Children.Add(Text("完整性检查结果", 16, FontWeights.SemiBold, FindBrush("TextBrush")));
-        _completenessStatusTextBlock = Text("未检查", 13, FontWeights.SemiBold, Brush(181, 71, 8));
-        Grid.SetColumn(_completenessStatusTextBlock, 1);
-        statusHeader.Children.Add(_completenessStatusTextBlock);
-        right.Children.Add(statusHeader);
-        right.Children.Add(CompletenessItem("报告文本", "未检查", Brush(181, 71, 8), item => _reportTextCompletenessTextBlock = item));
-        right.Children.Add(CompletenessItem("附件材料", "未检查", Brush(181, 71, 8), item => _attachmentCompletenessTextBlock = item));
-        right.Children.Add(CompletenessItem("表格数据", "未检查", Brush(181, 71, 8), item => _tableCompletenessTextBlock = item));
-        right.Children.Add(CompletenessItem("关键章节", "未检查", Brush(181, 71, 8), item => _chapterCompletenessTextBlock = item));
-        _completenessSummaryTextBlock = Text("请选择报告后执行完整性检查。", 13, null, FindBrush("MutedBrush"), new Thickness(0, 8, 0, 0), true);
-        right.Children.Add(_completenessSummaryTextBlock);
-        root.Children.Add(right);
-
-        return Card(root, new Thickness(18, 16, 18, 16), new Thickness(0, 16, 0, 0));
+            Grid.SetRow(specialistContent[i], i + 4);
+            _specialistPage.Children.Add(specialistContent[i]);
     }
-
-    private Button CompletenessResultButton()
-    {
-        var button = Button("查看完整性结果", false);
-        button.Click += OnViewCompletenessResultClicked;
-        return button;
     }
 
     private Border CompletenessItem(string title, string status, Brush statusBrush, Action<TextBlock> capture)
@@ -446,37 +444,6 @@ public partial class MainWindow : Window
         Grid.SetColumn(statusText, 1);
         row.Children.Add(statusText);
         return new Border { BorderBrush = Brush(234, 236, 240), BorderThickness = new Thickness(0, 0, 0, 1), Padding = new Thickness(0, 0, 0, 8), Child = row };
-    }
-
-    private void OnRunCompletenessCheckClicked(object sender, RoutedEventArgs e)
-    {
-        if (ReportPathTextBlock.Text == "尚未选择可研报告")
-        {
-            MessageBox.Show(this, "请先选择可研报告文件，再执行完整性检查。", "缺少报告", MessageBoxButton.OK, MessageBoxImage.Warning);
-            return;
-        }
-
-        _isCompletenessChecked = true;
-        SetCompletenessText(_completenessStatusTextBlock, "已完成", Brush(2, 122, 72));
-        SetCompletenessText(_reportTextCompletenessTextBlock, "齐全", Brush(2, 122, 72));
-        SetCompletenessText(_attachmentCompletenessTextBlock, "齐全", Brush(2, 122, 72));
-        SetCompletenessText(_tableCompletenessTextBlock, "需复核", Brush(181, 71, 8));
-        SetCompletenessText(_chapterCompletenessTextBlock, "齐全", Brush(2, 122, 72));
-        if (_completenessSummaryTextBlock != null)
-        {
-            _completenessSummaryTextBlock.Text = "完整性检查完成：报告文本、附件材料和关键章节齐全，表格数据建议复核后继续专项检测。";
-            _completenessSummaryTextBlock.Foreground = Brush(71, 84, 103);
-        }
-
-        StatusTextBlock.Text = "前置完整性检查已完成，可继续选择专项检测范围。";
-    }
-
-    private void OnViewCompletenessResultClicked(object sender, RoutedEventArgs e)
-    {
-        var message = _isCompletenessChecked
-            ? "完整性检查结果：报告文本齐全；附件材料齐全；表格数据建议复核；关键章节齐全。"
-            : "完整性检查尚未执行。请先选择报告并点击“执行完整性检查”。";
-        MessageBox.Show(this, message, "完整性检查结果", MessageBoxButton.OK, MessageBoxImage.Information);
     }
 
     private void SetCompletenessText(TextBlock? textBlock, string text, Brush brush)
@@ -591,14 +558,16 @@ public partial class MainWindow : Window
         }
     }
 
-    private void OnProjectSelectionChanged(object sender, SelectionChangedEventArgs e)
+    private async void OnProjectSelectionChanged(object sender, SelectionChangedEventArgs e)
     {
+        ResetCompletenessResult();
         if (ProjectComboBox.SelectedItem is not ProjectOption project)
         {
             _selectedProjectId = null;
             _selectedProjectName = null;
             _selectedCheckRunId = null;
             UpdateDeleteSelectionButtonState();
+            await LoadCompletenessHistoryAsync();
             return;
         }
 
@@ -606,6 +575,7 @@ public partial class MainWindow : Window
         _selectedProjectName = project.Name;
         _selectedCheckRunId = null;
         UpdateDeleteSelectionButtonState();
+        await LoadCompletenessHistoryAsync();
         StatusTextBlock.Text = $"已选择项目：{project.Name}。请选择报告并开始检测。";
     }
 
@@ -1592,6 +1562,9 @@ public partial class MainWindow : Window
         if (dialog.ShowDialog(this) == true)
         {
             ReportPathTextBlock.Text = dialog.FileName;
+            _completenessAttachments.Clear();
+            UpdateCompletenessAttachmentLabel();
+            ResetCompletenessResult();
             StatusTextBlock.Text = "已选择报告，请确认需要检测的审查项。";
         }
     }
@@ -3443,6 +3416,14 @@ public partial class MainWindow : Window
         stack.Children.Add(Text($"风险等级：{GetString(finding, "risk_level")}", 13, FontWeights.SemiBold, Brush(181, 71, 8), new Thickness(0, 5, 0, 0), true));
         stack.Children.Add(Text(llmRefined ? "AI辅助整理" : "规则审查结果", 12, FontWeights.SemiBold, llmRefined ? Brush(37, 99, 235) : Brush(102, 112, 133), new Thickness(0, 5, 0, 0), true));
         AddTextIf(stack, "审查意见", opinion, FindBrush("TextBrush"));
+        if (UsesCompactReportEvidence(finding))
+        {
+            AddCompactDocumentBasis(stack, evidence, finding);
+            AddRevisionAdvice(stack, advice, string.Empty);
+            AddCompactReportEvidence(stack, finding);
+        }
+        else
+        {
         AddTextIf(stack, "文档依据", evidence, FindBrush("MutedBrush"));
         AddRevisionAdvice(stack, advice, location);
         AddSourceHighlights(stack, finding);
@@ -3466,6 +3447,7 @@ public partial class MainWindow : Window
             sourceButtons.Children.Add(relatedButton);
             stack.Children.Add(sourceButtons);
         }
+        }
         AddTextIf(stack, "涉及规则", rule, FindBrush("MutedBrush"));
         if (mergedCount > 1)
         {
@@ -3485,6 +3467,142 @@ public partial class MainWindow : Window
         };
         card.MouseLeftButtonUp += async (_, _) => await NavigateToFindingAsync(findingSnapshot);
         return card;
+    }
+
+    // Only the five rules opt in. Other modules retain their existing cards.
+    private static bool UsesCompactReportEvidence(JsonElement finding) => GetString(finding, "rule_id") is
+        "R15_SECURITY_PAAS_CRYPTO_QUANTITY" or "R16_SERVER_OS_QUANTITY" or "R16_DB_SERVER_DATABASE_QUANTITY"
+        or "DATA_REASON_001" or "DATA_REASON_002" or "DATA_REASON_024";
+
+    private static string EvidencePreview(string value, int limit = 180) =>
+        value.Length <= limit ? value : value[..limit] + "…";
+
+    private TextBox SelectableEvidence(string text) => new()
+    {
+        Text = text, IsReadOnly = true, TextWrapping = TextWrapping.Wrap, AcceptsReturn = true,
+        BorderThickness = new Thickness(0), Background = Brushes.Transparent,
+        Foreground = FindBrush("TextBrush"), FontSize = 13, Padding = new Thickness(0),
+        Margin = new Thickness(0, 5, 0, 3), HorizontalAlignment = HorizontalAlignment.Stretch
+    };
+
+    private void AddCompactDocumentBasis(StackPanel panel, string evidence, JsonElement finding)
+    {
+        if (string.IsNullOrWhiteSpace(evidence)) return;
+        panel.Children.Add(Text("文档依据", 13, FontWeights.SemiBold, FindBrush("TextBrush"), new Thickness(0, 8, 0, 0)));
+        // Show the actual basis, replacing internal table addresses with the
+        // report's own title where available. Do not replace it with a pointer.
+        var sources = ReportEvidenceSources(finding);
+        var readable = System.Text.RegularExpressions.Regex.Replace(evidence, @"DOCX表格(\d+)(?:行(\d+))?", match =>
+        {
+            var source = sources.FirstOrDefault(x => GetInt(x, "table_index").ToString() == match.Groups[1].Value);
+            var caption = GetString(source, "table_caption");
+            if (string.IsNullOrWhiteSpace(caption)) return match.Value;
+            return caption + (match.Groups[2].Success ? $"，表内第{match.Groups[2].Value}行" : "");
+        });
+        var points = readable.Split(new[] { '；', '\n' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Distinct().ToList();
+        var shown = string.Join("\n", points.Select(x => points.Count > 1 ? "• " + x : x));
+        panel.Children.Add(SelectableEvidence(EvidencePreview(shown, 1200)));
+        if (shown.Length > 1200) panel.Children.Add(new Expander { Header = "查看完整文档依据", IsExpanded = false,
+            Margin = new Thickness(0, 5, 0, 0), Content = SelectableEvidence(shown) });
+    }
+
+    private static List<JsonElement> ReportEvidenceSources(JsonElement finding)
+    {
+        var sources = new List<JsonElement>();
+        if (finding.TryGetProperty("source_locations", out var locations) && locations.ValueKind == JsonValueKind.Array)
+            sources.AddRange(locations.EnumerateArray());
+        if (sources.Count == 0 && finding.TryGetProperty("source_location", out var location) && location.ValueKind == JsonValueKind.Object
+            && location.TryGetProperty("entries", out var entries) && entries.ValueKind == JsonValueKind.Array)
+            sources.AddRange(entries.EnumerateArray());
+        if (sources.Count == 0 && finding.TryGetProperty("source_highlights", out var highlights) && highlights.ValueKind == JsonValueKind.Array)
+            sources.AddRange(highlights.EnumerateArray());
+        return sources.Where(x => x.ValueKind == JsonValueKind.Object && !string.IsNullOrWhiteSpace(GetString(x, "quote")))
+            .DistinctBy(x => (EvidenceGroupKey(x), GetInt(x, "row_index"), GetInt(x, "paragraph"),
+                GetInt(x, "line_start"), GetInt(x, "column_start"), GetString(x, "quote"))).ToList();
+    }
+
+    private static string EvidenceGroupKey(JsonElement source) => string.Join("\u001f", new[] {
+        GetString(source, "file_name"), GetString(source, "section"), GetString(source, "table_index"),
+        GetString(source, "table_path"), GetString(source, "sheet_name"), GetString(source, "page"),
+        GetString(source, "role") == "scope" ? "scope" : "evidence" });
+
+    private static string EvidenceRows(IEnumerable<JsonElement> sources)
+    {
+        var numbers = sources.Select(x => GetInt(x, "row_index")).Where(x => x > 0).Distinct().Order().ToArray();
+        var ranges = new List<string>();
+        for (var i = 0; i < numbers.Length; i++)
+        {
+            var start = numbers[i]; var end = start;
+            while (i + 1 < numbers.Length && numbers[i + 1] == end + 1) end = numbers[++i];
+            ranges.Add(start == end ? start.ToString() : $"{start}—{end}");
+        }
+        return ranges.Count == 0 ? "" : "表内第 " + string.Join("、", ranges) + " 行（含表头，非序号列）";
+    }
+
+    private void AddCompactReportEvidence(StackPanel panel, JsonElement finding)
+    {
+        panel.Children.Add(Text("报告原文", 14, FontWeights.SemiBold, FindBrush("TextBrush"), new Thickness(0, 12, 0, 4)));
+        var sources = ReportEvidenceSources(finding);
+        if (sources.Count == 0)
+        {
+            panel.Children.Add(Text("尚无可核验的具体原文位置，请按核查范围人工查找。", 12, null, FindBrush("MutedBrush"), null, true));
+            var hint = FirstNonEmpty(GetString(finding, "location_hint"), GetString(finding, "source_section"));
+            if (!string.IsNullOrWhiteSpace(hint)) panel.Children.Add(SelectableEvidence(hint));
+            return;
+        }
+        var groups = sources.GroupBy(EvidenceGroupKey).Select(x => x.ToList()).ToList();
+        panel.Children.Add(Text("以下按报告章节和表格列出对应原文。表内行号含表头，不等同于序号列。", 12, null, FindBrush("MutedBrush"), null, true));
+        var ambiguous = sources.Any(x => GetString(x, "match_status") == "ambiguous");
+        if (ambiguous) panel.Children.Add(Text("原文存在多处匹配：以下为候选位置，需要结合章节和表名确认。", 12, FontWeights.SemiBold, Brush(181, 71, 8), null, true));
+        for (var i = 0; i < groups.Count; i++) panel.Children.Add(BuildReportEvidenceGroup(groups[i], i + 1));
+    }
+
+    private Border BuildReportEvidenceGroup(List<JsonElement> sources, int number)
+    {
+        var first = sources[0];
+        var section = GetString(first, "section");
+        var leaf = section.Split('→', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).LastOrDefault() ?? "未识别章节标题";
+        var caption = GetString(first, "table_caption");
+        var sheet = GetString(first, "sheet_name");
+        var scope = GetString(first, "role") == "scope" || GetString(first, "match_status") == "scope";
+        var body = new StackPanel();
+        body.Children.Add(Text($"{number}. {leaf}" + (scope ? "（核查范围）" : ""), 13, FontWeights.SemiBold, FindBrush("TextBrush"), null, true));
+        if (section != leaf && !string.IsNullOrWhiteSpace(section)) body.Children.Add(Text(section, 12, null, FindBrush("MutedBrush"), new Thickness(0, 3, 0, 3), true));
+        if (!string.IsNullOrWhiteSpace(caption)) body.Children.Add(Text(caption, 13, FontWeights.SemiBold, Brush(146, 64, 14), null, true));
+        else if (!string.IsNullOrWhiteSpace(sheet)) body.Children.Add(Text(sheet + (GetInt(first, "table_index") > 0 ? "（程序解析编号，以报告章节为准）" : ""), 12, null, FindBrush("MutedBrush"), null, true));
+        var rows = EvidenceRows(sources);
+        if (!string.IsNullOrEmpty(rows)) body.Children.Add(Text(rows, 12, null, FindBrush("MutedBrush"), null, true));
+        if (GetInt(first, "page") > 0) body.Children.Add(Text($"第{GetInt(first, "page")}页", 12, null, FindBrush("MutedBrush")));
+        if (scope) body.Children.Add(Text("这里只标明已核查的范围，不代表此处文字本身有错误。", 12, null, FindBrush("MutedBrush"), null, true));
+        var filename = GetString(first, "file_name");
+        if (!string.IsNullOrWhiteSpace(filename)) body.Children.Add(Text("文件：" + filename, 11, null, FindBrush("MutedBrush"), null, true));
+        if (!string.IsNullOrWhiteSpace(GetString(first, "table_path"))) body.Children.Add(Text("嵌套表位置：" + GetString(first, "table_path"), 12, null, FindBrush("MutedBrush"), null, true));
+        // Small comparisons stay fully visible. Large aggregate tables retain
+        // several representative rows without repeating the heading 40 times.
+        var visibleCount = sources.Count <= 6 ? sources.Count : 4;
+        for (var i = 0; i < visibleCount; i++) body.Children.Add(BuildReportExcerpt(sources[i]));
+        if (sources.Count > visibleCount)
+        {
+            var rest = new StackPanel();
+            foreach (var source in sources.Skip(visibleCount)) rest.Children.Add(BuildReportExcerpt(source));
+            body.Children.Add(Text($"该表共涉及{sources.Count}处原文，以上展示{visibleCount}处；汇总数量的核验还涉及下方其余行。", 12, null, FindBrush("MutedBrush"), null, true));
+            body.Children.Add(new Expander { Header = $"查看其余 {sources.Count - visibleCount} 处原文", Content = rest });
+        }
+        return new Border { Background = Brush(255, 251, 235), BorderBrush = Brush(245, 218, 148), BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(6), Padding = new Thickness(10), Margin = new Thickness(0, 6, 0, 4), Child = body };
+    }
+
+    private StackPanel BuildReportExcerpt(JsonElement source)
+    {
+        var panel = new StackPanel { Margin = new Thickness(0, 5, 0, 7) };
+        var row = GetInt(source, "row_index"); var paragraph = GetInt(source, "paragraph"); var column = GetInt(source, "column_start");
+        var address = row > 0 ? $"表内第{row}行" : paragraph > 0 ? $"正文第{paragraph}段（解析顺序）" : "原文摘录";
+        if (column > 0) address += $"，第{column}列";
+        panel.Children.Add(Text(address, 12, FontWeights.SemiBold, Brush(146, 64, 14)));
+        var quote = GetString(source, "quote");
+        panel.Children.Add(SelectableEvidence(EvidencePreview(quote, 900)));
+        if (quote.Length > 900) panel.Children.Add(new Expander { Header = "展开本处完整摘录", Content = SelectableEvidence(quote) });
+        return panel;
     }
 
     private void AddRevisionAdvice(StackPanel stack, string advice, string location)

@@ -1,0 +1,151 @@
+{
+  "version": "2026-trial-user-provided",
+  "source_file": "05.2026年度市级数字化项目数据治理服务配置.pdf",
+  "sha256": "e5ea4089027bbda9f17e8c0ef084ab91aa0dc1771735904db25f89008eedfcf6",
+  "scope_page": 3,
+  "services_pages": [
+    8,
+    9
+  ],
+  "negative_list_page": 10,
+  "acceptance_pages": [
+    6,
+    7
+  ],
+  "services": [
+    {
+      "name": "数据购买",
+      "category": "数据采集",
+      "unit_aliases": [
+        "项"
+      ],
+      "stage_aliases": [
+        "建设/运维",
+        "建设",
+        "运维"
+      ],
+      "aliases": [
+        "购买数据",
+        "第三方数据集"
+      ],
+      "category_aliases": [
+        "数据采集类"
+      ]
+    },
+    {
+      "name": "历史数据迁移",
+      "category": "数据采集",
+      "unit_aliases": [
+        "千万条",
+        "百万个"
+      ],
+      "stage_aliases": [
+        "建设"
+      ],
+      "aliases": [
+        "数据迁移"
+      ],
+      "category_aliases": [
+        "数据采集类"
+      ]
+    },
+    {
+      "name": "数据标签",
+      "category": "数据加工",
+      "unit_aliases": [
+        "个标签"
+      ],
+      "stage_aliases": [
+        "建设/运维",
+        "建设",
+        "运维"
+      ],
+      "aliases": [
+        "标签数据",
+        "数据字段标签",
+        "目录标签"
+      ],
+      "category_aliases": [
+        "数据加工类"
+      ]
+    },
+    {
+      "name": "数据融合",
+      "category": "数据加工",
+      "unit_aliases": [
+        "万条"
+      ],
+      "stage_aliases": [
+        "建设/运维",
+        "建设",
+        "运维"
+      ],
+      "aliases": [
+        "融合数据"
+      ],
+      "category_aliases": [
+        "数据加工类"
+      ]
+    },
+    {
+      "name": "历史数据归档及销毁",
+      "category": "数据退役",
+      "unit_aliases": [
+        "张"
+      ],
+      "stage_aliases": [
+        "运维"
+      ],
+      "aliases": [
+        "历史数据归档",
+        "数据归档及销毁",
+        "归档及销毁"
+      ],
+      "category_aliases": [
+        "数据退役类"
+      ]
+    },
+    {
+      "name": "数据安全风险评估",
+      "category": "数据安全管理",
+      "unit_aliases": [
+        "项"
+      ],
+      "stage_aliases": [
+        "运维"
+      ],
+      "aliases": [
+        "安全风险评估"
+      ],
+      "category_aliases": [
+        "数据安全风险评估类",
+        "数据安全管理类",
+        "数据安全与治理类"
+      ]
+    }
+  ],
+  "negative_list": [
+    "数据采集接入",
+    "数据抽取服务",
+    "时空数据转换与处理",
+    "数据质量检查",
+    "数据共享/开放/授权订阅服务",
+    "数据共享开放授权订阅服务",
+    "数据统计分析及报表服务",
+    "数据挖掘建模",
+    "数据加密、脱敏等控制",
+    "数据加密脱敏等控制",
+    "作业调度",
+    "数据开放运营接入服务",
+    "公共数据上链服务",
+    "主(专)题数据库建设",
+    "主题数据库建设",
+    "专题数据库建设",
+    "数据可视化展现工作",
+    "能力迭代服务"
+  ],
+  "review_notes": {
+    "basis": "按用户提供的2026年试行培训材料测试；不据此追溯判定2025年报告违法或违规",
+    "label_scope": "数据标签指分类分级上链的数据字段或目录标签，不自动等同于大模型训练数据标注"
+  }
+}

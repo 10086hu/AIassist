@@ -17,7 +17,7 @@ from app.modules.data_rules.service import (  # noqa: E402
 
 def _run_rule_24(text: str) -> dict:
     return run_data_reporting_check_from_document(
-        content=text.encode("utf-8"),
+        content=("预算单位：上海市市级预算单位\n" + text).encode("utf-8"),
         filename="sample.txt",
         project_name="数据治理测试项目",
         selected_rule_ids=["24"],
@@ -52,7 +52,7 @@ class DataGovernanceServiceRuleTests(unittest.TestCase):
 5 数据退役 历史数据归档及销毁 张 周期内归档销毁的数据表数 运维 满足退役要求
 6 数据安全管理 数据安全风险评估 项 按预算单位评估工作计为1项 运维 开展安全风险评估
 6.4 数据上链内容
-本项目按政务目录链要求完成新数据资源归集和上链。
+本项目按政务目录链要求完成新数据资源归集和上链。\n数据购买、历史数据迁移和数据融合服务交付数据质量自评估报告。\n数据标签和历史数据归档及销毁服务交付执行日志。\n数据安全风险评估由具备信息安全服务资质的第三方交付评估报告和整改报告。
 """
         result = _run_rule_24(text)
         self.assertEqual(len(result["results"]), 1)
@@ -77,12 +77,12 @@ class DataGovernanceServiceRuleTests(unittest.TestCase):
         self.assertIn("数据抽取服务", messages)
         self.assertIn("负面清单", messages)
         self.assertIn("数据融合", messages)
-        self.assertIn("计量单位", messages)
+        self.assertIn("测算单位", messages)
 
     def test_missing_6_3_annex_is_reported_when_governance_service_is_in_scope(self) -> None:
         text = """
 5.1 建设内容
-本项目涉及数据治理服务，包括数据融合和历史数据迁移。
+本项目申报数据治理服务，包括数据融合和历史数据迁移。
 6.4 数据上链内容
 本项目将按政务目录链要求完成数据上链。
 """
@@ -90,7 +90,7 @@ class DataGovernanceServiceRuleTests(unittest.TestCase):
         rule = result["results"][0]
         self.assertFalse(rule["passed"])
         self.assertEqual(rule["issues"][0]["section"], "6.3")
-        self.assertIn("未识别到第6.3节", rule["issues"][0]["message"])
+        self.assertIn("未识别到可核验的服务附表", rule["issues"][0]["message"])
 
     def test_6_3_table_candidate_is_detected_without_6_3_2_heading(self) -> None:
         text = """
@@ -105,8 +105,8 @@ class DataGovernanceServiceRuleTests(unittest.TestCase):
         rule = result["results"][0]
         messages = "\n".join(issue["message"] for issue in rule["issues"])
         self.assertFalse(rule["passed"])
-        self.assertIn("缺少指引要求字段", messages)
-        self.assertIn("标准", messages)
+        self.assertNotIn("申报核验信息", messages)
+        self.assertNotIn("服务类型、标准、适用项目阶段、申报条件", messages)
         self.assertIn("历史数据迁移", messages)
         self.assertIn("千万条 / 百万个", messages)
         self.assertIn("数据融合", messages)
@@ -120,6 +120,7 @@ class DataGovernanceServiceRuleTests(unittest.TestCase):
             self.skipTest(f"python-docx is unavailable: {exc}")
 
         document = Document()
+        document.add_paragraph("预算单位：上海市市级预算单位")
         document.add_paragraph("6.3 数据库建设和数据治理内容")
         document.add_paragraph("6.3.1 数据内容分析")
         other_table = document.add_table(rows=2, cols=3)
@@ -158,8 +159,8 @@ class DataGovernanceServiceRuleTests(unittest.TestCase):
         rule = result["results"][0]
         messages = "\n".join(issue["message"] for issue in rule["issues"])
         self.assertFalse(rule["passed"])
-        self.assertIn("缺少指引要求字段", messages)
-        self.assertIn("标准", messages)
+        self.assertNotIn("申报核验信息", messages)
+        self.assertNotIn("服务类型、标准、适用项目阶段、申报条件", messages)
         self.assertIn("历史数据迁移", messages)
         self.assertIn("千万条 / 百万个", messages)
         self.assertIn("数据融合", messages)

@@ -115,7 +115,7 @@ def get_project(project_id: str, db: Session = Depends(get_db)) -> Project:
 def _project_tree_to_dict(project: Project) -> dict[str, object]:
     runs = {run.id: _check_run_to_dict(run) for run in project.check_runs}
     for result in project.check_results:
-        if result.check_run_id:
+        if result.check_run_id or result.check_subtype != "aggregate":
             continue
         report_name = _legacy_report_name(result)
         created_day = result.created_at.date().isoformat() if result.created_at else "unknown"
@@ -155,7 +155,7 @@ def _check_run_to_dict(run: CheckRun) -> dict[str, object]:
         "status": run.status,
         "created_at": run.created_at.isoformat() if run.created_at else "",
         "updated_at": run.updated_at.isoformat() if run.updated_at else "",
-        "results": [_result_to_dict(result) for result in sorted(run.check_results, key=lambda item: item.created_at or 0)],
+        "results": [_result_to_dict(result) for result in sorted(run.check_results, key=lambda item: item.created_at or 0) if result.check_subtype == "aggregate"],
     }
 
 

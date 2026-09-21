@@ -228,7 +228,8 @@
                         <TextBlock Text="AI 审查助手" Foreground="White" FontSize="20" FontWeight="Bold"/>
                         <TextBlock x:Name="UserTextBlock" Text="当前用户：演示用户" Foreground="#D0D5DD" Margin="0,8,0,28"/>
 
-                        <Button Content="可研报告检测" Style="{StaticResource ActiveNavButton}" Margin="0,0,0,8"/>
+                        <Button Content="完整性检查" Style="{StaticResource ActiveNavButton}" Margin="0,0,0,8"/>
+                        <Button Content="可研报告专项检查" Style="{StaticResource NavButton}" Margin="0,0,0,8"/>
                         <Button Content="审查记录" Style="{StaticResource NavButton}" Margin="0,0,0,8"/>
                         <Button Content="规则库配置" Style="{StaticResource NavButton}" Margin="0,0,0,8"/>
                         <Button Content="系统设置" Style="{StaticResource NavButton}"/>
@@ -255,38 +256,9 @@
 
                 <Grid>
                     <StackPanel>
-                        <TextBlock Text="可研报告智能检测工作台" FontSize="28" FontWeight="Bold" Foreground="{StaticResource TextBrush}"/>
-                        <TextBlock Text="上传报告后，先完成前置完整性检查，再选择需要 AI 助手检测的审查点。" Foreground="{StaticResource MutedBrush}" Margin="0,6,0,0"/>
+                        <TextBlock Text="完整性检查" FontSize="28" FontWeight="Bold" Foreground="{StaticResource TextBrush}"/>
+                        <TextBlock Text="选择项目和报告，检查材料完整性并查看历史报告。" Foreground="{StaticResource MutedBrush}" Margin="0,6,0,0"/>
                     </StackPanel>
-                </Grid>
-
-                <Grid Grid.Row="1" Margin="0,18,0,0">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition/>
-                        <ColumnDefinition/>
-                        <ColumnDefinition/>
-                    </Grid.ColumnDefinitions>
-                    <Border Style="{StaticResource CardBorder}" Padding="18,14" Margin="0,0,12,0">
-                        <StackPanel>
-                            <TextBlock Text="9" FontSize="30" FontWeight="Bold" Foreground="{StaticResource PrimaryBrush}"/>
-                            <TextBlock Text="检测模块" FontSize="17" FontWeight="SemiBold"/>
-                            <TextBlock Text="覆盖九项审查要求" Foreground="{StaticResource MutedBrush}" Margin="0,4,0,0"/>
-                        </StackPanel>
-                    </Border>
-                    <Border Grid.Column="1" Style="{StaticResource CardBorder}" Padding="18,14" Margin="0,0,12,0">
-                        <StackPanel>
-                            <TextBlock Text="1" FontSize="30" FontWeight="Bold" Foreground="#027A48"/>
-                            <TextBlock Text="报告入口" FontSize="17" FontWeight="SemiBold"/>
-                            <TextBlock Text="可选择本地可研文件" Foreground="{StaticResource MutedBrush}" Margin="0,4,0,0"/>
-                        </StackPanel>
-                    </Border>
-                    <Border Grid.Column="2" Style="{StaticResource CardBorder}" Padding="18,14">
-                        <StackPanel>
-                            <TextBlock Text="0" FontSize="30" FontWeight="Bold" Foreground="#B54708"/>
-                            <TextBlock Text="审查任务" FontSize="17" FontWeight="SemiBold"/>
-                            <TextBlock Text="当前等待创建" Foreground="{StaticResource MutedBrush}" Margin="0,4,0,0"/>
-                        </StackPanel>
-                    </Border>
                 </Grid>
 
                 <Border Grid.Row="2" Style="{StaticResource CardBorder}" Padding="18,16" Margin="0,16,0,0">

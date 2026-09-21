@@ -1819,7 +1819,7 @@ def _normalize_document_rule_result(result: dict[str, Any], module: str, use_llm
         suggestions = rule_result.get("suggestions") or []
         if not issues and not rule_result.get("passed", False):
             issues = [{"message": rule_result.get("summary") or "该规则需要人工复核"}]
-        for issue in issues:
+        for issue_index, issue in enumerate(issues):
             issue_type = issue.get("issue_type") or rule_result.get("issue_type")
             item = issue.get("item")
             evidence = issue.get("evidence")
@@ -1848,6 +1848,9 @@ def _normalize_document_rule_result(result: dict[str, Any], module: str, use_llm
                     "source_section": issue.get("section") or module,
                     "evidence_examples": [item for item in [issue.get("evidence"), rule_result.get("summary")] if item],
                     "merged_count": 1,
+                    **(rule_result['evidence_locations'][issue_index]
+                       if module == 'data_reasonableness' and rule_id in {'18', '21', '24', 'DATA_REASON_001', 'DATA_REASON_002', 'DATA_REASON_024'}
+                       and issue_index < len(rule_result.get('evidence_locations', [])) else {}),
                 }
             )
     findings, llm_meta = refine_findings(
@@ -1953,6 +1956,10 @@ def _normalize_resource_result(result: ResourceCheckResponse, use_llm: bool = Fa
                 "location_hint": item.get("location_hint"),
                 "evidence_examples": [value for value in [evidence, item.get("reason")] if value],
                 "merged_count": 1,
+                **({key: (item.get('revision_target') or {}).get('source_location') if key == 'source_location' else item.get(key)
+                    for key in ('source_location', 'source_locations', 'source_highlights', 'location_hint', 'revision_target')}
+                   if item.get('rule_code') in {'R15_SECURITY_PAAS_CRYPTO_QUANTITY', 'R16_SERVER_OS_QUANTITY', 'R16_DB_SERVER_DATABASE_QUANTITY'}
+                   and (item.get('revision_target') or {}).get('source_location', {}).get('precision') in {'scope', 'document_blocks'} else {}),
             }
         )
     findings, llm_meta = refine_findings(
@@ -2111,6 +2118,15 @@ def _attach_finding_locations(
 
     def enrich(finding: dict[str, Any]) -> None:
         if not isinstance(finding, dict):
+            return
+        # The five rules already carry verified document coordinates. Preserve
+        # them through the public display layer; do not parse their evidence again.
+        rule_id = str(finding.get('rule_id') or '')
+        target = (result.get('module_code') == 'resource' and rule_id in {'R15_SECURITY_PAAS_CRYPTO_QUANTITY', 'R16_SERVER_OS_QUANTITY', 'R16_DB_SERVER_DATABASE_QUANTITY'}
+                  or result.get('module_code') == 'data_reasonableness' and rule_id in {'18', '21', '24', 'DATA_REASON_001', 'DATA_REASON_002', 'DATA_REASON_024'})
+        if target and (finding.get('source_location') or {}).get('precision') in {'scope', 'document_blocks'}:
+            if isinstance(finding.get('revision_target'), dict):
+                finding['revision_target']['advice'] = finding.get('revision_advice') or finding.get('suggestion') or ''
             return
         existing = finding.get("source_location")
         location = dict(existing) if isinstance(existing, dict) else {}
