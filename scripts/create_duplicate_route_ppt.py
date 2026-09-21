@@ -134,7 +134,7 @@ def build_slide_1(slide):
     panel_title(slide, "规则（系统）实现方式", 6.02, 2.34, 8.9)
     steps = [
         ("输入与关联", "当前报告 + 可选往期报告；记录项目、阶段和报告关系"),
-        ("解析与抽取", "DOCX/PDF/XLSX/CSV 解析，形成结构化功能点"),
+        ("解析与抽取", "DOCX/XLSX/CSV 解析，形成结构化功能点"),
         ("候选筛选", "向量、关键词、同义词混合相似度，阈值 0.50"),
         ("语义复核", "DeepSeek 判断：重复 / 高度相似 / 无关"),
         ("双范围比对", "当前报告内部两两比对；当前 vs 往期跨报告比对"),
@@ -151,7 +151,7 @@ def build_slide_2(slide):
     rect(slide, 0.55, 2.15, 4.95, 4.25, WHITE, LINE)
     rect(slide, 5.72, 2.15, 9.73, 4.25, WHITE, LINE)
     panel_title(slide, "输入范围", 0.78, 2.34, 4.4)
-    bullet_list(slide, ["当前可研报告：DOCX / PDF / XLSX / CSV", "往期、一期、二期、续建、补充或历史版本", "项目阶段、报告名称和关联关系作为上下文"], 0.82, 2.80, 4.2, 0.40, 10.8)
+    bullet_list(slide, ["当前可研报告：DOCX / XLSX / CSV", "往期、一期、二期、续建、补充或历史版本", "项目阶段、报告名称和关联关系作为上下文"], 0.82, 2.80, 4.2, 0.40, 10.8)
     panel_title(slide, "功能点字段", 0.78, 4.15, 4.4)
     text(slide, "名称 · 描述 · 分类 · 来源章节 · 报告 · 阶段 · 行号", 0.78, 4.58, 4.2, 0.34, 11.5, INK, True)
     panel_title(slide, "抽取策略", 0.78, 5.18, 4.4)
@@ -176,7 +176,7 @@ def build_slide_2(slide):
     rect(slide, 6.05, 5.18, 8.98, 0.88, LIGHT, LIGHT, radius=True)
     text(slide, "统一对象 ReportPoint", 6.28, 5.33, 2.20, 0.25, 11, NAVY_DARK, True)
     text(slide, "point_id = hash(source + report + row + name + description)；用于跨报告稳定关联和结果留痕。", 8.38, 5.30, 6.35, 0.44, 10.5, INK)
-    footer_band(slide, ("解析", "Word/PDF/表格"), ("抽取", "结构化功能点"), ("上下文", "项目 + 阶段 + 来源"))
+    footer_band(slide, ("解析", "Word/表格"), ("抽取", "结构化功能点"), ("上下文", "项目 + 阶段 + 来源"))
 
 
 def build_slide_3(slide):
@@ -260,7 +260,7 @@ def build_slide_6(slide):
     rect(slide, 0.55, 2.15, 4.95, 4.25, WHITE, LINE)
     rect(slide, 5.72, 2.15, 9.73, 4.25, WHITE, LINE)
     panel_title(slide, "已实现", 0.78, 2.34, 4.4)
-    bullet_list(slide, ["当前报告内部功能点检查", "当前报告与一个或多个往期报告比对", "Word/PDF 解析后功能点抽取", "DeepSeek 复核 + 本地规则降级", "后端接口、数据库、WPF 入口已接通"], 0.82, 2.80, 4.2, 0.37, 10.6)
+    bullet_list(slide, ["当前报告内部功能点检查", "当前报告与一个或多个往期报告比对", "Word/表格解析后功能点抽取", "DeepSeek 复核 + 本地规则降级", "后端接口、数据库、WPF 入口已接通"], 0.82, 2.80, 4.2, 0.37, 10.6)
     panel_title(slide, "验证样例", 0.78, 5.02, 4.4)
     text(slide, "current_feasibility_report.docx\nhistory_phase1_feasibility_report.docx", 0.78, 5.44, 4.20, 0.55, 10.8, INK, True)
     panel_title(slide, "验证结果", 6.02, 2.34, 8.9)

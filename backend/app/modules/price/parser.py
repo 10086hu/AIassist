@@ -11,7 +11,6 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, Iterable
 
-import pdfplumber
 from openpyxl import load_workbook
 
 
@@ -124,11 +123,8 @@ def parse_price_document(content: bytes, filename: str) -> ParsedPriceDocument:
     elif suffix == ".docx":
         items, full_text, table_count, relevant_table_count, doc_warnings = _parse_docx(content, started)
         warnings.extend(doc_warnings)
-    elif suffix == ".pdf":
-        items, full_text, table_count, relevant_table_count, pdf_warnings = _parse_pdf(content, started)
-        warnings.extend(pdf_warnings)
     else:
-        raise ValueError("价格检查支持 .xlsx、.xlsm、.csv、.docx 或 .pdf 文件")
+        raise ValueError("价格检查支持 .xlsx、.xlsm、.csv 或 .docx 文件")
 
     deduped = _dedupe(items)
     context = _build_project_context(deduped, full_text)
@@ -231,32 +227,6 @@ def _parse_docx(
     if len(full_text) > MAX_TEXT_CHARS:
         full_text = full_text[:MAX_TEXT_CHARS]
         warnings.append("文档文本超过价格解析上限，项目指标抽取仅使用前段内容")
-    return items, full_text, table_count, relevant_count, warnings
-
-
-def _parse_pdf(
-    content: bytes,
-    started: float,
-) -> tuple[list[ParsedPriceItem], str, int, int, list[str]]:
-    items: list[ParsedPriceItem] = []
-    text_parts: list[str] = []
-    warnings: list[str] = []
-    table_count = 0
-    relevant_count = 0
-    with pdfplumber.open(BytesIO(content)) as pdf:
-        for page_index, page in enumerate(pdf.pages, 1):
-            _check_deadline(started)
-            if page_index > 300:
-                warnings.append("PDF 超过 300 页，价格解析已停止扫描后续页面")
-                break
-            text_parts.append(page.extract_text() or "")
-            for table_index, table in enumerate(page.extract_tables() or [], 1):
-                table_count += 1
-                parsed = _parse_rows(table, f"第{page_index}页表{table_index}")
-                if parsed:
-                    relevant_count += 1
-                    items.extend(parsed)
-    full_text = "\n".join(text_parts)[:MAX_TEXT_CHARS]
     return items, full_text, table_count, relevant_count, warnings
 
 

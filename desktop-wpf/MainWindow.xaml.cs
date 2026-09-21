@@ -1,5 +1,6 @@
 using Microsoft.Win32;
 using System.IO;
+using System.Globalization;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
@@ -10,7 +11,9 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
 using System.Windows.Documents;
+using System.Windows.Input;
 using System.Windows.Media;
+using Microsoft.Web.WebView2.Wpf;
 
 namespace AiReportDesktop;
 
@@ -30,9 +33,16 @@ public partial class MainWindow : Window
     private UIElement? _recordsPage;
     private UIElement? _rulesPage;
     private UIElement? _settingsPage;
-    private StackPanel? _recordsListPanel;
     private StackPanel? _projectTreePanel;
+    private Button? _deleteSelectionButton;
     private StackPanel? _recordDetailPanel;
+    private WebView2? _documentWebView;
+    private TextBlock? _documentTitleTextBlock;
+    private TextBlock? _documentLocationTextBlock;
+    private string? _activePreviewUrl;
+    private string? _activePreviewExtension;
+    private readonly Dictionary<string, string> _previewUrlsByRole = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, string> _previewNamesByRole = new(StringComparer.OrdinalIgnoreCase);
     private StackPanel? _rulesDirectoryPanel;
     private StackPanel? _rulesEditorPanel;
     private TextBlock? _ruleStatsTextBlock;
@@ -573,6 +583,7 @@ public partial class MainWindow : Window
                 _selectedProjectId = null;
                 _selectedProjectName = null;
             }
+            UpdateDeleteSelectionButtonState();
         }
         catch (Exception exc)
         {
@@ -586,11 +597,15 @@ public partial class MainWindow : Window
         {
             _selectedProjectId = null;
             _selectedProjectName = null;
+            _selectedCheckRunId = null;
+            UpdateDeleteSelectionButtonState();
             return;
         }
 
         _selectedProjectId = project.Id;
         _selectedProjectName = project.Name;
+        _selectedCheckRunId = null;
+        UpdateDeleteSelectionButtonState();
         StatusTextBlock.Text = $"已选择项目：{project.Name}。请选择报告并开始检测。";
     }
 
@@ -735,11 +750,13 @@ public partial class MainWindow : Window
                 _selectedProjectId = null;
                 _selectedProjectName = null;
                 _selectedCheckRunId = null;
+                _activeRecordId = null;
                 _runResults.Clear();
                 ResetRecordDetail("请选择一个项目和报告检查查看结果。");
-                RenderCheckModules(Array.Empty<RunResultInfo>());
+                ResetDocumentPreview("选择检查项后加载完整原文。");
             }
 
+            UpdateDeleteSelectionButtonState();
             await LoadProjectsAsync();
             await LoadRecordsAsync();
             StatusTextBlock.Text = $"项目“{projectName}”已删除。";
@@ -845,9 +862,9 @@ public partial class MainWindow : Window
         page.Children.Add(stats);
 
         var body = new Grid { Margin = new Thickness(0, 18, 0, 0) };
-        body.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(0.82, GridUnitType.Star) });
-        body.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1.15, GridUnitType.Star) });
-        body.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1.7, GridUnitType.Star) });
+        body.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(0.9, GridUnitType.Star), MinWidth = 210 });
+        body.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1.25, GridUnitType.Star), MinWidth = 300 });
+        body.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1.55, GridUnitType.Star), MinWidth = 350 });
         Grid.SetRow(body, 2);
 
         var projectPanel = new StackPanel();
@@ -861,29 +878,66 @@ public partial class MainWindow : Window
         createProjectButton.Click += OnCreateProjectClicked;
         Grid.SetColumn(createProjectButton, 1);
         projectHeader.Children.Add(createProjectButton);
+        var deleteSelectionButton = Button("删除", false);
+        deleteSelectionButton.Padding = new Thickness(10, 7, 10, 7);
+        deleteSelectionButton.Margin = new Thickness(8, 0, 0, 0);
+        deleteSelectionButton.ToolTip = "删除当前选中的项目或检查记录";
+        deleteSelectionButton.IsEnabled = false;
+        deleteSelectionButton.Click += async (_, _) => await DeleteSelectedProjectOrRunAsync();
+        Grid.SetColumn(deleteSelectionButton, 2);
+        projectHeader.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        projectHeader.Children.Add(deleteSelectionButton);
+        _deleteSelectionButton = deleteSelectionButton;
         projectPanel.Children.Add(projectHeader);
-        projectPanel.Children.Add(Text("展开项目后选择一次报告检查。", 12, null, FindBrush("MutedBrush"), new Thickness(0, 0, 0, 12), true));
+        projectPanel.Children.Add(Text("依次展开项目、报告和检查项。", 12, null, FindBrush("MutedBrush"), new Thickness(0, 0, 0, 12), true));
         projectPanel.Children.Add(Text("正在加载项目...", 13, null, FindBrush("MutedBrush"), null, true));
         var projectScroller = new ScrollViewer { VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Content = projectPanel };
         body.Children.Add(Card(projectScroller, new Thickness(14), new Thickness(0, 0, 14, 0)));
 
-        _recordsListPanel = new StackPanel();
-        _recordsListPanel.Children.Add(Text("九项检查", 18, FontWeights.Bold));
-        _recordsListPanel.Children.Add(Text("请选择左侧的一次报告检查。", 13, null, FindBrush("MutedBrush"), new Thickness(0, 6, 0, 0), true));
-        var listScroller = new ScrollViewer { VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Content = _recordsListPanel };
-        var moduleCard = Card(listScroller, new Thickness(16), new Thickness(0, 0, 14, 0));
-        Grid.SetColumn(moduleCard, 1);
-        body.Children.Add(moduleCard);
-
         _recordDetailPanel = new StackPanel();
         ResetRecordDetail();
         var detailScroller = new ScrollViewer { VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled, Content = _recordDetailPanel };
-        var detailCard = Card(detailScroller, new Thickness(16), new Thickness(0));
-        Grid.SetColumn(detailCard, 2);
+        var detailCard = Card(detailScroller, new Thickness(16), new Thickness(0, 0, 14, 0));
+        Grid.SetColumn(detailCard, 1);
         body.Children.Add(detailCard);
+
+        var previewCard = Card(BuildDocumentPreviewPane(), new Thickness(0), new Thickness(0));
+        Grid.SetColumn(previewCard, 2);
+        body.Children.Add(previewCard);
 
         page.Children.Add(body);
         return page;
+    }
+
+    private Grid BuildDocumentPreviewPane()
+    {
+        var grid = new Grid();
+        grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+
+        var header = new Grid
+        {
+            Background = Brush(248, 250, 252),
+            Margin = new Thickness(0)
+        };
+        header.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        header.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        _documentTitleTextBlock = Text("报告原文", 16, FontWeights.Bold, FindBrush("TextBrush"), new Thickness(14, 10, 14, 0), true);
+        header.Children.Add(_documentTitleTextBlock);
+        _documentLocationTextBlock = Text("选择左侧检查项后加载 Word 原文。", 12, null, FindBrush("MutedBrush"), new Thickness(14, 4, 14, 10), true);
+        Grid.SetRow(_documentLocationTextBlock, 1);
+        header.Children.Add(_documentLocationTextBlock);
+        grid.Children.Add(header);
+
+        _documentWebView = new WebView2
+        {
+            DefaultBackgroundColor = System.Drawing.Color.FromArgb(238, 242, 247),
+            Margin = new Thickness(1, 0, 1, 1)
+        };
+        Grid.SetRow(_documentWebView, 1);
+        grid.Children.Add(_documentWebView);
+        _ = ShowPreviewPlaceholderAsync("选择一条审查结果后，可在这里查看并定位完整原文。");
+        return grid;
     }
 
     private Grid BuildRulesPage()
@@ -1532,7 +1586,7 @@ public partial class MainWindow : Window
         var dialog = new OpenFileDialog
         {
             Title = "选择可研报告",
-            Filter = "报告文件|*.docx;*.doc;*.pdf;*.txt;*.xlsx;*.xls|所有文件|*.*"
+            Filter = "报告文件|*.docx;*.txt;*.xlsx;*.xlsm|所有文件|*.*"
         };
 
         if (dialog.ShowDialog(this) == true)
@@ -1793,7 +1847,7 @@ public partial class MainWindow : Window
         var dialog = new OpenFileDialog
         {
             Title = "选择往期可研报告或历史功能点清单",
-            Filter = "可研报告/功能点清单|*.docx;*.pdf;*.xlsx;*.csv|Word 文档|*.docx|PDF 文件|*.pdf|Excel/CSV 清单|*.xlsx;*.csv|所有文件|*.*",
+            Filter = "可研报告/功能点清单|*.docx;*.xlsx;*.csv|Word 文档|*.docx|Excel/CSV 清单|*.xlsx;*.csv|所有文件|*.*",
             Multiselect = true
         };
 
@@ -2019,11 +2073,12 @@ public partial class MainWindow : Window
 
         var header = _projectTreePanel.Children.OfType<Grid>().FirstOrDefault();
         _projectTreePanel.Children.Clear();
+        UpdateDeleteSelectionButtonState();
         if (header != null)
         {
             _projectTreePanel.Children.Add(header);
         }
-        _projectTreePanel.Children.Add(Text("展开项目后选择一次报告检查。", 12, null, FindBrush("MutedBrush"), new Thickness(0, 0, 0, 12), true));
+        _projectTreePanel.Children.Add(Text("依次展开项目、报告和检查项。", 12, null, FindBrush("MutedBrush"), new Thickness(0, 0, 0, 12), true));
         _projectTreePanel.Children.Add(Text("正在加载项目...", 13, null, FindBrush("MutedBrush"), null, true));
 
         try
@@ -2061,7 +2116,7 @@ public partial class MainWindow : Window
         {
             _projectTreePanel.Children.Add(header);
         }
-        _projectTreePanel.Children.Add(Text("展开项目后选择一次报告检查。", 12, null, FindBrush("MutedBrush"), new Thickness(0, 0, 0, 12), true));
+        _projectTreePanel.Children.Add(Text("依次展开项目、报告和检查项。", 12, null, FindBrush("MutedBrush"), new Thickness(0, 0, 0, 12), true));
 
         if (!root.TryGetProperty("items", out var items) || items.ValueKind != JsonValueKind.Array || items.GetArrayLength() == 0)
         {
@@ -2106,6 +2161,18 @@ public partial class MainWindow : Window
         {
             _selectedProjectId = expanded ? null : projectId;
             _selectedProjectName = projectName;
+            if (expanded)
+            {
+                _selectedCheckRunId = null;
+                _activeRecordId = null;
+                ResetRecordDetail("请选择一个项目和报告检查查看结果。");
+                ResetDocumentPreview("选择检查项后加载完整原文。");
+            }
+            else if (_selectedCheckRunId != null)
+            {
+                _selectedCheckRunId = null;
+            }
+            UpdateDeleteSelectionButtonState();
             RenderProjectTreeFromCurrentData();
         };
         var projectRow = new Grid { Margin = new Thickness(0, 0, 0, 4) };
@@ -2113,13 +2180,6 @@ public partial class MainWindow : Window
         projectRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         projectButton.Margin = new Thickness(0);
         projectRow.Children.Add(projectButton);
-        var deleteProjectButton = Button("删除", false);
-        deleteProjectButton.Padding = new Thickness(9, 8, 9, 8);
-        deleteProjectButton.Margin = new Thickness(6, 0, 0, 0);
-        deleteProjectButton.ToolTip = "删除项目及其全部检查记录";
-        deleteProjectButton.Click += async (_, _) => await DeleteProjectAsync(projectId, projectName);
-        Grid.SetColumn(deleteProjectButton, 1);
-        projectRow.Children.Add(deleteProjectButton);
         _projectTreePanel.Children.Add(projectRow);
 
         if (!expanded)
@@ -2143,7 +2203,7 @@ public partial class MainWindow : Window
                 ? resultItems.GetArrayLength()
                 : 0;
             var runStack = new StackPanel();
-            runStack.Children.Add(Text(runName, 13, FontWeights.SemiBold, FindBrush("TextBrush"), null, true));
+            runStack.Children.Add(Text($"{(isSelected ? "▼" : "▶")}  {runName}", 13, FontWeights.SemiBold, FindBrush("TextBrush"), null, true));
             runStack.Children.Add(Text($"{createdAt} · {resultCount}/9 项检查", 12, null, FindBrush("MutedBrush"), new Thickness(0, 3, 0, 0), true));
             var runButton = new Button
             {
@@ -2159,22 +2219,76 @@ public partial class MainWindow : Window
             // JsonElement is backed by the response JsonDocument, which is disposed
             // when LoadRecordsAsync returns. Keep an owned snapshot for the click handler.
             var runSnapshot = run.Clone();
-            runButton.Click += (_, _) => SelectCheckRun(runId, runSnapshot);
-            var runRow = new Grid { Margin = new Thickness(24, 0, 0, 5) };
-            runRow.ColumnDefinitions.Add(new ColumnDefinition());
-            runRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            runButton.Margin = new Thickness(0);
-            runRow.Children.Add(runButton);
-            var deleteRunButton = Button("删除", false);
-            deleteRunButton.Padding = new Thickness(9, 8, 9, 8);
-            deleteRunButton.Margin = new Thickness(6, 0, 0, 0);
-            deleteRunButton.ToolTip = runId.StartsWith("legacy:", StringComparison.OrdinalIgnoreCase)
-                ? "删除这组历史检查结果"
-                : "删除这一次九项检查及其全部模块结果";
-            deleteRunButton.Click += async (_, _) => await DeleteCheckRunAsync(projectId, runId, runName);
-            Grid.SetColumn(deleteRunButton, 1);
-            runRow.Children.Add(deleteRunButton);
-            _projectTreePanel.Children.Add(runRow);
+            runButton.Click += (_, _) =>
+            {
+                if (isSelected)
+                {
+                    _selectedCheckRunId = null;
+                    _activeRecordId = null;
+                    UpdateDeleteSelectionButtonState();
+                    RenderProjectTreeFromCurrentData();
+                    ResetRecordDetail("请展开一份报告并选择检查项。");
+                    ResetDocumentPreview("选择检查项后加载完整原文。");
+                    return;
+                }
+                SelectCheckRun(runId, runSnapshot);
+            };
+            _projectTreePanel.Children.Add(runButton);
+
+            if (isSelected)
+            {
+                RenderRunResultNodes(ParseRunResults(run));
+            }
+        }
+    }
+
+    private void RenderRunResultNodes(IReadOnlyCollection<RunResultInfo> results)
+    {
+        if (_projectTreePanel == null)
+        {
+            return;
+        }
+
+        var orderedResults = results
+            .Where(item => !string.IsNullOrWhiteSpace(item.Module))
+            .OrderBy(item =>
+            {
+                var index = Array.FindIndex(_checkItems, checkItem => checkItem.ModuleCode == item.Module);
+                return index < 0 ? int.MaxValue : index;
+            })
+            .ToList();
+
+        foreach (var result in orderedResults)
+        {
+            var moduleTitle = !string.IsNullOrWhiteSpace(result.ModuleName) && result.ModuleName != result.Module
+                ? result.ModuleName
+                : ModuleDisplayName(result.Module);
+            var isActive = result.Id == _activeRecordId;
+            var content = new StackPanel();
+            content.Children.Add(Text(moduleTitle, 12, FontWeights.SemiBold, FindBrush("TextBrush"), null, true));
+            content.Children.Add(Text($"{FirstNonEmpty(result.Status, "已完成")} · 问题：{result.FindingsCount}", 11, null, Brush(2, 122, 72), new Thickness(0, 3, 0, 0), true));
+            var button = new Button
+            {
+                Content = content,
+                Style = (Style)FindResource("SecondaryButton"),
+                Background = isActive ? Brush(239, 246, 255) : Brushes.White,
+                BorderBrush = isActive ? Brush(96, 165, 250) : Brush(234, 236, 240),
+                HorizontalContentAlignment = HorizontalAlignment.Left,
+                Padding = new Thickness(10, 7, 10, 7),
+                Margin = new Thickness(48, 0, 0, 5),
+                IsEnabled = !string.IsNullOrWhiteSpace(result.Id),
+                ToolTip = "查看审查结果和报告原文"
+            };
+            if (!string.IsNullOrWhiteSpace(result.Id))
+            {
+                button.Click += async (_, _) => await LoadRecordDetailAsync(result.Id);
+            }
+            _projectTreePanel.Children.Add(button);
+        }
+
+        if (orderedResults.Count == 0)
+        {
+            _projectTreePanel.Children.Add(Text("本次报告暂无已完成的检查结果。", 12, null, FindBrush("MutedBrush"), new Thickness(48, 2, 0, 8), true));
         }
     }
 
@@ -2212,11 +2326,13 @@ public partial class MainWindow : Window
             if (_selectedCheckRunId == runId)
             {
                 _selectedCheckRunId = null;
+                _activeRecordId = null;
                 _runResults.Remove(runId);
                 ResetRecordDetail("请选择一个项目和报告检查查看结果。");
-                RenderCheckModules(Array.Empty<RunResultInfo>());
+                ResetDocumentPreview("选择检查项后加载完整原文。");
             }
 
+            UpdateDeleteSelectionButtonState();
             await LoadRecordsAsync();
             StatusTextBlock.Text = $"检查“{runName}”已删除。";
         }
@@ -2224,6 +2340,69 @@ public partial class MainWindow : Window
         {
             MessageBox.Show(this, $"删除本次检查失败：{exc.Message}", "删除失败", MessageBoxButton.OK, MessageBoxImage.Warning);
         }
+    }
+
+    private async Task DeleteSelectedProjectOrRunAsync()
+    {
+        if (!string.IsNullOrWhiteSpace(_selectedCheckRunId)
+            && !string.IsNullOrWhiteSpace(_selectedProjectId))
+        {
+            var runName = FindSelectedRunName(_selectedProjectId, _selectedCheckRunId);
+            await DeleteCheckRunAsync(_selectedProjectId, _selectedCheckRunId, runName);
+            return;
+        }
+
+        if (!string.IsNullOrWhiteSpace(_selectedProjectId))
+        {
+            await DeleteProjectAsync(
+                _selectedProjectId,
+                FirstNonEmpty(_selectedProjectName ?? string.Empty, "未命名项目"));
+        }
+    }
+
+    private string FindSelectedRunName(string projectId, string runId)
+    {
+        if (_projectTreeRoot.HasValue
+            && _projectTreeRoot.Value.TryGetProperty("items", out var items)
+            && items.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var project in items.EnumerateArray())
+            {
+                if (!string.Equals(GetString(project, "id"), projectId, StringComparison.OrdinalIgnoreCase)
+                    || !project.TryGetProperty("check_runs", out var runs)
+                    || runs.ValueKind != JsonValueKind.Array)
+                {
+                    continue;
+                }
+
+                foreach (var run in runs.EnumerateArray())
+                {
+                    if (string.Equals(GetString(run, "id"), runId, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return FirstNonEmpty(GetString(run, "report_name"), "未命名报告");
+                    }
+                }
+            }
+        }
+
+        return "未命名报告";
+    }
+
+    private void UpdateDeleteSelectionButtonState()
+    {
+        if (_deleteSelectionButton == null)
+        {
+            return;
+        }
+
+        var hasRun = !string.IsNullOrWhiteSpace(_selectedCheckRunId);
+        var hasProject = !string.IsNullOrWhiteSpace(_selectedProjectId);
+        _deleteSelectionButton.IsEnabled = hasRun || hasProject;
+        _deleteSelectionButton.ToolTip = hasRun
+            ? "删除当前选中的检查记录"
+            : hasProject
+                ? "删除当前选中的项目及其全部检查记录"
+                : "请先选择项目或检查记录";
     }
 
     private JsonElement? _projectTreeRoot;
@@ -2239,10 +2418,11 @@ public partial class MainWindow : Window
     private void SelectCheckRun(string runId, JsonElement run)
     {
         _selectedCheckRunId = runId;
+        UpdateDeleteSelectionButtonState();
         _runResults[runId] = ParseRunResults(run);
         RenderProjectTreeFromCurrentData();
-        RenderCheckModules(_runResults[runId]);
         ResetRecordDetail("请选择一项检查查看详细结果。");
+        ResetDocumentPreview("选择第三级检查项后加载完整原文。");
     }
 
     private List<RunResultInfo> ParseRunResults(JsonElement run)
@@ -2266,56 +2446,7 @@ public partial class MainWindow : Window
 
     private void RenderCheckModules(IReadOnlyCollection<RunResultInfo> results)
     {
-        if (_recordsListPanel == null)
-        {
-            return;
-        }
-
-        _recordsListPanel.Children.Clear();
-        _recordsListPanel.Children.Add(Text("九项检查", 18, FontWeights.Bold));
-        _recordsListPanel.Children.Add(Text("点击本次报告已执行的检查项，在右侧查看详细结果。", 13, null, FindBrush("MutedBrush"), new Thickness(0, 6, 0, 14), true));
-        var orderedResults = results
-            .Where(item => !string.IsNullOrWhiteSpace(item.Module))
-            .OrderBy(item =>
-            {
-                var index = Array.FindIndex(_checkItems, checkItem => checkItem.ModuleCode == item.Module);
-                return index < 0 ? int.MaxValue : index;
-            })
-            .ToList();
-        foreach (var result in orderedResults)
-        {
-            var moduleTitle = ModuleDisplayName(result.Module);
-            if (!string.IsNullOrWhiteSpace(result.ModuleName) && result.ModuleName != result.Module)
-            {
-                moduleTitle = result.ModuleName;
-            }
-
-            var status = FirstNonEmpty(result.Status, "已完成");
-            var details = $"{status} · 问题：{result.FindingsCount}";
-            var stack = new StackPanel();
-            stack.Children.Add(Text(moduleTitle, 14, FontWeights.SemiBold, FindBrush("TextBrush"), null, true));
-            stack.Children.Add(Text(details, 12, null, Brush(2, 122, 72), new Thickness(0, 4, 0, 0), true));
-            var button = new Button
-            {
-                Content = stack,
-                Style = (Style)FindResource("SecondaryButton"),
-                HorizontalContentAlignment = HorizontalAlignment.Left,
-                Padding = new Thickness(12, 10, 12, 10),
-                Margin = new Thickness(0, 0, 0, 8),
-                Tag = result.Id,
-                IsEnabled = !string.IsNullOrWhiteSpace(result.Id)
-            };
-            if (!string.IsNullOrWhiteSpace(result.Id))
-            {
-                button.Click += async (_, _) => await LoadRecordDetailAsync(result.Id);
-            }
-            _recordsListPanel.Children.Add(button);
-        }
-
-        if (orderedResults.Count == 0)
-        {
-            _recordsListPanel.Children.Add(Text("本次报告暂无已完成的检查结果。", 13, null, FindBrush("MutedBrush"), null, true));
-        }
+        RenderProjectTreeFromCurrentData();
     }
 
     private async Task LoadRecordDetailAsync(string resultId)
@@ -2341,6 +2472,8 @@ public partial class MainWindow : Window
 
             using var document = JsonDocument.Parse(responseBody);
             RenderRecordDetail(document.RootElement);
+            RenderProjectTreeFromCurrentData();
+            await LoadDocumentPreviewAsync(document.RootElement);
         }
         catch (Exception exc)
         {
@@ -2376,11 +2509,6 @@ public partial class MainWindow : Window
         _recordDetailPanel.Children.Add(Text(projectName, 18, FontWeights.Bold, FindBrush("TextBrush"), null, true));
         _recordDetailPanel.Children.Add(Text($"检查模块：{moduleName}", 13, FontWeights.SemiBold, FindBrush("TextBrush"), new Thickness(0, 6, 0, 0), true));
         _recordDetailPanel.Children.Add(Text($"风险等级：{risk}｜问题数量：{count}", 13, null, FindBrush("MutedBrush"), new Thickness(0, 4, 0, 8), true));
-
-        var deleteButton = Button("删除当前记录", false);
-        deleteButton.Margin = new Thickness(0, 0, 0, 12);
-        deleteButton.Click += async (_, _) => await DeleteRecordAsync(id);
-        _recordDetailPanel.Children.Add(deleteButton);
 
         if (root.TryGetProperty("summary", out var summary) && summary.ValueKind == JsonValueKind.Object)
         {
@@ -2423,6 +2551,247 @@ public partial class MainWindow : Window
             Content = BuildTechnicalJsonViewer(root)
         };
         _recordDetailPanel.Children.Add(expander);
+    }
+
+    private async Task LoadDocumentPreviewAsync(JsonElement root)
+    {
+        if (_documentWebView == null)
+        {
+            return;
+        }
+
+        if (!root.TryGetProperty("source_documents", out var sources)
+            || sources.ValueKind != JsonValueKind.Array
+            || sources.GetArrayLength() == 0)
+        {
+            ResetDocumentPreview("这条历史记录没有保存原文件，请重新执行一次检查后预览。");
+            return;
+        }
+
+        var source = sources.EnumerateArray()
+            .FirstOrDefault(item => GetString(item, "role") == "current");
+        if (source.ValueKind != JsonValueKind.Object)
+        {
+            source = sources.EnumerateArray().First();
+        }
+
+        _previewUrlsByRole.Clear();
+        _previewNamesByRole.Clear();
+        foreach (var sourceItem in sources.EnumerateArray())
+        {
+            var role = FirstNonEmpty(GetString(sourceItem, "role"), "current");
+            var path = GetString(sourceItem, "preview_url");
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                var download = GetString(sourceItem, "download_url");
+                path = string.IsNullOrWhiteSpace(download) ? string.Empty : $"{download}/preview";
+            }
+            if (!string.IsNullOrWhiteSpace(path))
+            {
+                _previewUrlsByRole[role] = BuildBackendUrl(path);
+                _previewNamesByRole[role] = FirstNonEmpty(GetString(sourceItem, "filename"), "原始报告");
+                if (role.Equals("history", StringComparison.OrdinalIgnoreCase))
+                {
+                    _previewUrlsByRole["related"] = _previewUrlsByRole[role];
+                    _previewNamesByRole["related"] = _previewNamesByRole[role];
+                }
+            }
+        }
+
+        var filename = FirstNonEmpty(GetString(source, "filename"), "原始报告");
+        var previewPath = GetString(source, "preview_url");
+        if (string.IsNullOrWhiteSpace(previewPath))
+        {
+            var downloadPath = GetString(source, "download_url");
+            previewPath = string.IsNullOrWhiteSpace(downloadPath) ? string.Empty : $"{downloadPath}/preview";
+        }
+        if (string.IsNullOrWhiteSpace(previewPath))
+        {
+            ResetDocumentPreview("原文预览地址不可用。");
+            return;
+        }
+
+        _activePreviewUrl = BuildBackendUrl(previewPath);
+        _previewUrlsByRole["current"] = _activePreviewUrl;
+        _previewNamesByRole["current"] = filename;
+        _activePreviewExtension = Path.GetExtension(filename).ToLowerInvariant();
+        if (_documentTitleTextBlock != null)
+        {
+            _documentTitleTextBlock.Text = filename;
+        }
+        if (_documentLocationTextBlock != null)
+        {
+            _documentLocationTextBlock.Text = "Word 完整原文预览";
+        }
+
+        try
+        {
+            await _documentWebView.EnsureCoreWebView2Async();
+            _documentWebView.Source = new Uri(_activePreviewUrl);
+        }
+        catch (Exception exc)
+        {
+            ResetDocumentPreview($"原文加载失败：{exc.Message}");
+        }
+    }
+
+    private async Task SwitchPreviewSourceAsync(string role)
+    {
+        if (_documentWebView == null || !_previewUrlsByRole.TryGetValue(role, out var url))
+        {
+            return;
+        }
+
+        _activePreviewUrl = url;
+        _activePreviewExtension = Path.GetExtension(_previewNamesByRole.GetValueOrDefault(role, "原始报告")).ToLowerInvariant();
+        if (_documentTitleTextBlock != null)
+        {
+            _documentTitleTextBlock.Text = _previewNamesByRole.GetValueOrDefault(role, "原始报告");
+        }
+        if (_documentLocationTextBlock != null)
+        {
+            _documentLocationTextBlock.Text = role.Equals("related", StringComparison.OrdinalIgnoreCase)
+                ? "关联 Word 原文预览"
+                : "Word 完整原文预览";
+        }
+        await _documentWebView.EnsureCoreWebView2Async();
+        _documentWebView.Source = new Uri(url);
+        await Task.Delay(120);
+    }
+
+    private async Task NavigateToFindingAsync(JsonElement finding, string? preferredRole = null)
+    {
+        if (_documentWebView == null || string.IsNullOrWhiteSpace(_activePreviewUrl))
+        {
+            return;
+        }
+
+        var quote = string.Empty;
+        var section = GetString(finding, "source_section");
+        var page = 0;
+        var paragraph = 0;
+        var line = 0;
+
+        var requestedRole = string.IsNullOrWhiteSpace(preferredRole) ? "current" : preferredRole;
+        if (finding.TryGetProperty("source_highlights", out var highlights) && highlights.ValueKind == JsonValueKind.Array)
+        {
+            var highlight = highlights.EnumerateArray()
+                .FirstOrDefault(item => !string.IsNullOrWhiteSpace(requestedRole)
+                    && string.Equals(GetString(item, "role"), requestedRole, StringComparison.OrdinalIgnoreCase));
+            if (highlight.ValueKind != JsonValueKind.Object)
+            {
+                highlight = highlights.EnumerateArray()
+                    .FirstOrDefault(item => GetString(item, "role") is "current" or "evidence_1");
+            }
+            if (highlight.ValueKind != JsonValueKind.Object)
+            {
+                highlight = highlights.EnumerateArray().FirstOrDefault();
+            }
+            if (highlight.ValueKind == JsonValueKind.Object)
+            {
+                quote = GetString(highlight, "quote");
+                section = FirstNonEmpty(GetString(highlight, "section"), section);
+                page = GetInt(highlight, "page");
+                paragraph = GetInt(highlight, "paragraph");
+                line = GetInt(highlight, "line_start");
+            }
+        }
+
+        if (finding.TryGetProperty("source_location", out var location) && location.ValueKind == JsonValueKind.Object)
+        {
+            if (!string.Equals(requestedRole, "related", StringComparison.OrdinalIgnoreCase)
+                && location.TryGetProperty("current", out var currentLocation) && currentLocation.ValueKind == JsonValueKind.Object)
+            {
+                location = currentLocation;
+            }
+            else if (string.Equals(requestedRole, "related", StringComparison.OrdinalIgnoreCase)
+                && location.TryGetProperty("related", out var relatedLocation) && relatedLocation.ValueKind == JsonValueKind.Object)
+            {
+                location = relatedLocation;
+            }
+            quote = FirstNonEmpty(quote, GetString(location, "quote"));
+            section = FirstNonEmpty(section, GetString(location, "section"));
+            page = page > 0 ? page : GetInt(location, "page");
+            paragraph = paragraph > 0 ? paragraph : GetInt(location, "paragraph");
+            line = line > 0 ? line : GetInt(location, "line_start");
+        }
+
+        quote = FirstNonEmpty(
+            quote,
+            GetString(finding, "item_source_excerpt"),
+            GetString(finding, "evidence"),
+            GetString(finding, "context"),
+            GetString(finding, "hit_text"));
+
+        try
+        {
+            await _documentWebView.EnsureCoreWebView2Async();
+            if (!string.IsNullOrWhiteSpace(requestedRole)
+                && _previewUrlsByRole.TryGetValue(requestedRole, out var requestedUrl)
+                && !string.Equals(_activePreviewUrl, requestedUrl, StringComparison.OrdinalIgnoreCase))
+            {
+                await SwitchPreviewSourceAsync(requestedRole);
+            }
+            var script = $"window.locateSource({JsonSerializer.Serialize(quote)}, {paragraph}, {line}, {JsonSerializer.Serialize(section)})";
+            var result = await _documentWebView.ExecuteScriptAsync(script);
+            if (_documentLocationTextBlock != null)
+            {
+                _documentLocationTextBlock.Text = result.Contains("true", StringComparison.OrdinalIgnoreCase)
+                    ? "已定位并高亮对应原文"
+                    : "未匹配到完整摘录，已保留章节或最近原文位置";
+            }
+        }
+        catch (Exception exc)
+        {
+            if (_documentLocationTextBlock != null)
+            {
+                _documentLocationTextBlock.Text = $"定位失败：{exc.Message}";
+            }
+        }
+    }
+
+    private void ResetDocumentPreview(string message)
+    {
+        _activePreviewUrl = null;
+        _activePreviewExtension = null;
+        _previewUrlsByRole.Clear();
+        _previewNamesByRole.Clear();
+        if (_documentTitleTextBlock != null)
+        {
+            _documentTitleTextBlock.Text = "报告原文";
+        }
+        if (_documentLocationTextBlock != null)
+        {
+            _documentLocationTextBlock.Text = message;
+        }
+        _ = ShowPreviewPlaceholderAsync(message);
+    }
+
+    private async Task ShowPreviewPlaceholderAsync(string message)
+    {
+        if (_documentWebView == null)
+        {
+            return;
+        }
+        try
+        {
+            await _documentWebView.EnsureCoreWebView2Async();
+            var encoded = System.Net.WebUtility.HtmlEncode(message);
+            _documentWebView.NavigateToString($"<!doctype html><html><body style='margin:0;background:#eef2f7;font-family:Microsoft YaHei,Segoe UI,sans-serif;color:#64748b;display:grid;place-items:center;height:100vh'><div style='padding:28px;text-align:center'>{encoded}</div></body></html>");
+        }
+        catch
+        {
+            // The status header still reports the preview state when WebView2 is unavailable.
+        }
+    }
+
+    private static string BuildBackendUrl(string path)
+    {
+        if (Uri.TryCreate(path, UriKind.Absolute, out var absolute))
+        {
+            return absolute.ToString();
+        }
+        return new Uri(new Uri("http://127.0.0.1:8000"), path).ToString();
     }
 
     private UIElement BuildTechnicalJsonViewer(JsonElement root)
@@ -3068,6 +3437,7 @@ public partial class MainWindow : Window
         var rule = FirstNonEmpty(GetString(finding, "rule_basis"), GetString(finding, "rule_name"), GetString(finding, "matched_rule"));
         var mergedCount = GetInt(finding, "merged_count");
         var llmRefined = GetBool(finding, "llm_refined");
+        var findingSnapshot = finding.Clone();
         var stack = new StackPanel();
         stack.Children.Add(Text(title, 15, FontWeights.SemiBold, FindBrush("TextBrush"), null, true));
         stack.Children.Add(Text($"风险等级：{GetString(finding, "risk_level")}", 13, FontWeights.SemiBold, Brush(181, 71, 8), new Thickness(0, 5, 0, 0), true));
@@ -3076,12 +3446,45 @@ public partial class MainWindow : Window
         AddTextIf(stack, "文档依据", evidence, FindBrush("MutedBrush"));
         AddRevisionAdvice(stack, advice, location);
         AddSourceHighlights(stack, finding);
+        if (string.Equals(GetString(finding, "comparison_type"), "cross_report", StringComparison.OrdinalIgnoreCase))
+        {
+            var sourceButtons = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 8, 0, 0) };
+            var currentButton = Button("定位当前报告", false);
+            currentButton.Margin = new Thickness(0, 0, 8, 0);
+            currentButton.Click += async (_, e) =>
+            {
+                e.Handled = true;
+                await NavigateToFindingAsync(findingSnapshot, "current");
+            };
+            var relatedButton = Button("定位关联报告", false);
+            relatedButton.Click += async (_, e) =>
+            {
+                e.Handled = true;
+                await NavigateToFindingAsync(findingSnapshot, "related");
+            };
+            sourceButtons.Children.Add(currentButton);
+            sourceButtons.Children.Add(relatedButton);
+            stack.Children.Add(sourceButtons);
+        }
         AddTextIf(stack, "涉及规则", rule, FindBrush("MutedBrush"));
         if (mergedCount > 1)
         {
             stack.Children.Add(Text($"同类问题数量：{mergedCount}", 12, null, FindBrush("MutedBrush"), new Thickness(0, 3, 0, 0), true));
         }
-        return new Border { Background = Brush(248, 250, 252), BorderBrush = Brush(234, 236, 240), BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), Padding = new Thickness(12), Margin = new Thickness(0, 0, 0, 10), Child = stack };
+        var card = new Border
+        {
+            Background = Brush(248, 250, 252),
+            BorderBrush = Brush(234, 236, 240),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(8),
+            Padding = new Thickness(12),
+            Margin = new Thickness(0, 0, 0, 10),
+            Child = stack,
+            Cursor = Cursors.Hand,
+            ToolTip = "在右侧原文中定位此问题"
+        };
+        card.MouseLeftButtonUp += async (_, _) => await NavigateToFindingAsync(findingSnapshot);
+        return card;
     }
 
     private void AddRevisionAdvice(StackPanel stack, string advice, string location)
@@ -3369,9 +3772,24 @@ public partial class MainWindow : Window
 
     private static string FormatDateTime(string value)
     {
-        return DateTimeOffset.TryParse(value, out var parsed)
-            ? parsed.ToLocalTime().ToString("yyyy-MM-dd HH:mm")
-            : "未记录时间";
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return "未记录时间";
+        }
+
+        // SQLAlchemy stores UTC values without an offset. Treat offset-less
+        // timestamps as UTC, while preserving explicit offsets from newer API
+        // responses, then display in the user's local timezone.
+        if (DateTimeOffset.TryParse(
+                value,
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.AllowWhiteSpaces | DateTimeStyles.AssumeUniversal,
+                out var parsed))
+        {
+            return parsed.ToLocalTime().ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture);
+        }
+
+        return "未记录时间";
     }
 
     private static string FirstNonEmpty(params string[] values) =>

@@ -1,6 +1,10 @@
 import json
+import base64
+import html
+import io
 import mimetypes
 import os
+import re
 import tempfile
 import threading
 import traceback
@@ -12,6 +16,7 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Form, HTTPException, Response, UploadFile
 from fastapi.encoders import jsonable_encoder
+from fastapi.responses import HTMLResponse
 from sqlalchemy.orm import Session
 
 from app.db.models import CheckResult, CheckRun, Project, SourceArtifact
@@ -50,12 +55,12 @@ from app.services.llm_client import get_llm_status, ping_llm
 router = APIRouter()
 
 
-FUNCTION_CORRESPONDENCE_EXTENSIONS = {".docx", ".pdf", ".txt"}
-SENSITIVE_WORD_EXTENSIONS = {".docx", ".pdf", ".txt", ".xlsx", ".xlsm"}
-DUPLICATE_EXTENSIONS = {".xlsx", ".csv", ".docx", ".pdf"}
-DOCUMENT_RULE_EXTENSIONS = {".docx", ".pdf"}
-BASIS_EXTENSIONS = {".docx", ".pdf", ".txt"}
-RESOURCE_EXTENSIONS = {".csv", ".xlsx", ".docx", ".pdf"}
+FUNCTION_CORRESPONDENCE_EXTENSIONS = {".docx", ".txt"}
+SENSITIVE_WORD_EXTENSIONS = {".docx", ".txt", ".xlsx", ".xlsm"}
+DUPLICATE_EXTENSIONS = {".xlsx", ".csv", ".docx"}
+DOCUMENT_RULE_EXTENSIONS = {".docx", ".txt"}
+BASIS_EXTENSIONS = {".docx", ".txt"}
+RESOURCE_EXTENSIONS = {".csv", ".xlsx", ".docx"}
 TASK_FILE_EXTENSIONS = (
     FUNCTION_CORRESPONDENCE_EXTENSIONS
     | SENSITIVE_WORD_EXTENSIONS
@@ -215,6 +220,35 @@ def evaluate_result_source(result_id: str, source_id: str, db: Session = Depends
     )
 
 
+@router.get("/results/{result_id}/sources/{source_id}/preview")
+def evaluate_result_source_preview(result_id: str, source_id: str, db: Session = Depends(get_db)) -> Response:
+    """Render a source inside the desktop review pane while retaining the original download endpoint."""
+    artifact = (
+        db.query(SourceArtifact)
+        .filter(
+            SourceArtifact.id == source_id,
+            SourceArtifact.check_result_id == result_id,
+        )
+        .first()
+    )
+    if artifact is None:
+        raise HTTPException(status_code=404, detail="原始报告附件不存在")
+
+    suffix = Path(artifact.filename).suffix.lower()
+    if suffix == ".docx":
+        try:
+            return HTMLResponse(
+                content=_render_docx_preview(artifact.content, artifact.filename),
+                headers={"Cache-Control": "no-store"},
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"Word 原文预览生成失败：{exc}") from exc
+    return HTMLResponse(
+        content=_render_plain_source_preview(artifact.content, artifact.filename),
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 @router.delete("/results/{result_id}")
 def delete_evaluate_result(result_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
     row = db.get(CheckResult, result_id)
@@ -329,6 +363,8 @@ async def evaluate_content_consistency_document(
     file: UploadFile = File(...),
     project_name: str = Form(default="未命名可研项目"),
     use_llm: bool = Form(default=False),
+    project_id: str | None = Form(default=None),
+    db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     filename = file.filename or ""
     content = await _read_upload(file, DOCUMENT_RULE_EXTENSIONS)
@@ -338,7 +374,13 @@ async def evaluate_content_consistency_document(
             filename=filename,
             project_name=project_name,
         )
-        return _attach_finding_locations(_normalize_document_rule_result(raw, "content_consistency", use_llm=use_llm), content, filename)
+        normalized = _attach_finding_locations(_normalize_document_rule_result(raw, "content_consistency", use_llm=use_llm), content, filename)
+        project = _get_or_create_project(db, project_id, project_name, None)
+        result_id = _store_check_result(db, project, "content_consistency", normalized, _highest_result_severity(normalized), _first_finding_value(normalized.get("findings") or [], "revision_advice"), report_name=filename)
+        _store_result_source_artifact(db, result_id, content, filename)
+        db.commit()
+        normalized["source_documents"] = _source_artifacts_to_list(db.get(CheckResult, result_id))
+        return normalized
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -350,6 +392,8 @@ async def evaluate_basis_document(
     project_name: str = Form(default="未命名可研项目"),
     use_llm: bool = Form(default=False),
     selected_rule_ids: str | None = Form(default=None),
+    project_id: str | None = Form(default=None),
+    db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     filename = file.filename or ""
     content = await _read_upload(file, BASIS_EXTENSIONS)
@@ -360,7 +404,13 @@ async def evaluate_basis_document(
             project_name=project_name,
             selected_rule_ids=_parse_selected_rule_ids(selected_rule_ids),
         )
-        return _attach_finding_locations(_normalize_document_rule_result(raw, "basis", use_llm=use_llm), content, filename)
+        normalized = _attach_finding_locations(_normalize_document_rule_result(raw, "basis", use_llm=use_llm), content, filename)
+        project = _get_or_create_project(db, project_id, project_name, None)
+        result_id = _store_check_result(db, project, "basis", normalized, _highest_result_severity(normalized), _first_finding_value(normalized.get("findings") or [], "revision_advice"), report_name=filename)
+        _store_result_source_artifact(db, result_id, content, filename)
+        db.commit()
+        normalized["source_documents"] = _source_artifacts_to_list(db.get(CheckResult, result_id))
+        return normalized
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -371,6 +421,8 @@ async def evaluate_security_document(
     project_name: str = Form(default="未命名可研项目"),
     use_llm: bool = Form(default=True),
     selected_rule_ids: str | None = Form(default=None),
+    project_id: str | None = Form(default=None),
+    db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     filename = file.filename or ""
     content = await _read_upload(file, DOCUMENT_RULE_EXTENSIONS)
@@ -382,7 +434,13 @@ async def evaluate_security_document(
             selected_rule_ids=_parse_selected_rule_ids(selected_rule_ids),
             use_llm=use_llm,
         )
-        return _attach_finding_locations(_normalize_security_result(raw), content, filename)
+        normalized = _attach_finding_locations(_normalize_security_result(raw), content, filename)
+        project = _get_or_create_project(db, project_id, project_name, None)
+        result_id = _store_check_result(db, project, "security", normalized, _highest_result_severity(normalized), _first_finding_value(normalized.get("findings") or [], "revision_advice"), report_name=filename)
+        _store_result_source_artifact(db, result_id, content, filename)
+        db.commit()
+        normalized["source_documents"] = _source_artifacts_to_list(db.get(CheckResult, result_id))
+        return normalized
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -392,6 +450,8 @@ async def evaluate_data_rules_document(
     project_name: str = Form(default="未命名可研项目"),
     use_llm: bool = Form(default=False),
     selected_rule_ids: str | None = Form(default=None),
+    project_id: str | None = Form(default=None),
+    db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     filename = file.filename or ""
     content = await _read_upload(file, DOCUMENT_RULE_EXTENSIONS)
@@ -402,7 +462,13 @@ async def evaluate_data_rules_document(
             project_name=project_name,
             selected_rule_ids=_parse_selected_rule_ids(selected_rule_ids),
         )
-        return _attach_finding_locations(_normalize_document_rule_result(raw, "data_reasonableness", use_llm=use_llm), content, filename)
+        normalized = _attach_finding_locations(_normalize_document_rule_result(raw, "data_reasonableness", use_llm=use_llm), content, filename)
+        project = _get_or_create_project(db, project_id, project_name, None)
+        result_id = _store_check_result(db, project, "data_reasonableness", normalized, _highest_result_severity(normalized), _first_finding_value(normalized.get("findings") or [], "revision_advice"), report_name=filename)
+        _store_result_source_artifact(db, result_id, content, filename)
+        db.commit()
+        normalized["source_documents"] = _source_artifacts_to_list(db.get(CheckResult, result_id))
+        return normalized
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -413,6 +479,8 @@ async def evaluate_data_reporting_document(
     project_name: str = Form(default="未命名可研项目"),
     use_llm: bool = Form(default=False),
     selected_rule_ids: str | None = Form(default=None),
+    project_id: str | None = Form(default=None),
+    db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     filename = file.filename or ""
     content = await _read_upload(file, DOCUMENT_RULE_EXTENSIONS)
@@ -423,7 +491,13 @@ async def evaluate_data_reporting_document(
             project_name=project_name,
             selected_rule_ids=_parse_selected_rule_ids(selected_rule_ids),
         )
-        return _attach_finding_locations(_normalize_document_rule_result(raw, "data_reasonableness", use_llm=use_llm), content, filename)
+        normalized = _attach_finding_locations(_normalize_document_rule_result(raw, "data_reasonableness", use_llm=use_llm), content, filename)
+        project = _get_or_create_project(db, project_id, project_name, None)
+        result_id = _store_check_result(db, project, "data_reasonableness", normalized, _highest_result_severity(normalized), _first_finding_value(normalized.get("findings") or [], "revision_advice"), report_name=filename)
+        _store_result_source_artifact(db, result_id, content, filename)
+        db.commit()
+        normalized["source_documents"] = _source_artifacts_to_list(db.get(CheckResult, result_id))
+        return normalized
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -486,15 +560,18 @@ async def evaluate_function_correspondence(
         )
         _attach_finding_locations(normalized, Path(temp_path).read_bytes(), original_filename)
         project = _get_or_create_project(db, project_id, project_name, department)
-        _store_check_result(
+        result_id = _store_check_result(
             db=db,
             project=project,
             module="function_correspondence",
             result=normalized,
             severity=_highest_risk((normalized.get("summary") or {}).get("risk_count") or {}),
             suggestion=_first_finding_value(normalized.get("findings") or [], "revision_advice"),
+            report_name=original_filename,
         )
+        _store_result_source_artifact(db, result_id, Path(temp_path).read_bytes(), original_filename)
         db.commit()
+        normalized["source_documents"] = _source_artifacts_to_list(db.get(CheckResult, result_id))
         return normalized
     except ValueError as exc:
         db.rollback()
@@ -535,15 +612,18 @@ async def evaluate_sensitive_word(
         )
         project = _get_or_create_project(db, project_id, project_name, department)
         summary = normalized.get("risk_summary") or normalized.get("summary") or {}
-        _store_check_result(
+        result_id = _store_check_result(
             db=db,
             project=project,
             module="sensitive_word",
             result=normalized,
             severity=_highest_risk(summary.get("risk_distribution") or summary.get("risk_count") or {}),
             suggestion=_first_finding_value(normalized.get("findings") or [], "revision_advice"),
+            report_name=original_filename,
         )
+        _store_result_source_artifact(db, result_id, Path(temp_path).read_bytes(), original_filename)
         db.commit()
+        normalized["source_documents"] = _source_artifacts_to_list(db.get(CheckResult, result_id))
         return normalized
     except ValueError as exc:
         db.rollback()
@@ -632,7 +712,7 @@ async def _evaluate_price_document_for_module(
     selected_rule_ids: str | None,
     db: Session,
 ) -> dict[str, Any]:
-    content = await _read_upload(file, {".xlsx", ".xlsm", ".csv", ".docx", ".pdf"})
+    content = await _read_upload(file, {".xlsx", ".xlsm", ".csv", ".docx"})
     rule_ids = _parse_selected_rule_ids(selected_rule_ids)
     if not rule_ids:
         rule_ids = ["PRICE_REASON_001"] if module == "price" else ["PRICE_REF_001", "PRICE_REF_002"]
@@ -650,7 +730,9 @@ async def _evaluate_price_document_for_module(
         normalized = _attach_finding_locations(_normalize_price_result(result, module), content, file.filename or "price.xlsx")
         project = db.get(Project, result["project_id"])
         if project is not None:
-            _store_check_result(db, project, module, normalized, _highest_result_severity(normalized), _first_finding_value(normalized.get("findings") or [], "suggestion"))
+            result_id = _store_check_result(db, project, module, normalized, _highest_result_severity(normalized), _first_finding_value(normalized.get("findings") or [], "suggestion"), report_name=file.filename or "price.xlsx")
+            _store_result_source_artifact(db, result_id, content, file.filename or "price.xlsx")
+            normalized["source_documents"] = _source_artifacts_to_list(db.get(CheckResult, result_id))
         db.commit()
         return normalized
     except ValueError as exc:
@@ -770,6 +852,12 @@ def _run_evaluate_task(
                     suggestion=suggestion,
                     check_run_id=check_run.id,
                     report_name=original_filename,
+                )
+                _store_current_source_artifact(
+                    db=db,
+                    result_id=result_id,
+                    content=Path(temp_path).read_bytes(),
+                    filename=original_filename,
                 )
                 db.commit()
                 result_ids.append(result_id)
@@ -934,7 +1022,7 @@ def _run_module_check(
             return _fallback_resource_result(raw, exc)
 
     if module in {"price", "price_reference"}:
-        _ensure_extension(suffix, {".xlsx", ".xlsm", ".csv", ".docx", ".pdf"}, module)
+        _ensure_extension(suffix, {".xlsx", ".xlsm", ".csv", ".docx"}, module)
         rule_ids = selected_rule_ids
         if not rule_ids:
             rule_ids = ["PRICE_REASON_001"] if module == "price" else ["PRICE_REF_001", "PRICE_REF_002"]
@@ -979,7 +1067,7 @@ def _run_duplicate_module(
             department=department,
             use_llm=use_llm,
         )
-    if lower.endswith((".docx", ".pdf")):
+    if lower.endswith(".docx"):
         return run_duplicate_check_from_document(
             db=db,
             content=content,
@@ -989,7 +1077,7 @@ def _run_duplicate_module(
             department=department,
             use_llm=use_llm,
         )
-    raise ValueError("不支持的文件格式。重复建设检查支持：.xlsx, .csv, .docx, .pdf")
+    raise ValueError("不支持的文件格式。重复建设检查支持：.xlsx, .csv, .docx")
 
 
 def _merge_content_consistency_result(
@@ -1109,7 +1197,7 @@ def _build_content_consistency_rule_result(
             source="content_consistency",
             findings=[],
             status="跳过",
-            message="第五条建设内容一致性专项校验仅支持 Word .docx 和 PDF .pdf 文件。",
+            message="第五条建设内容一致性专项校验仅支持 Word .docx 文件。",
         )
 
     try:
@@ -1425,9 +1513,181 @@ def _store_duplicate_source_artifacts(
                 "filename": safe_filename,
                 "media_type": media_type,
                 "download_url": f"/api/evaluate/results/{result_id}/sources/{artifact.id}",
+                "preview_url": f"/api/evaluate/results/{result_id}/sources/{artifact.id}/preview",
             }
         )
     return result
+
+
+def _store_current_source_artifact(
+    db: Session,
+    result_id: str,
+    content: bytes,
+    filename: str,
+) -> SourceArtifact:
+    safe_filename = filename or "未命名报告"
+    artifact = SourceArtifact(
+        check_result_id=result_id,
+        role="current",
+        stage="本期",
+        filename=safe_filename,
+        media_type=mimetypes.guess_type(safe_filename)[0] or "application/octet-stream",
+        content=content,
+    )
+    db.add(artifact)
+    db.flush()
+    return artifact
+
+
+def _store_result_source_artifact(
+    db: Session,
+    result_id: str,
+    content: bytes,
+    filename: str,
+) -> None:
+    """Attach the original Word/text/spreadsheet snapshot to every standalone result."""
+    _store_current_source_artifact(db, result_id, content, filename)
+
+
+def _render_docx_preview(content: bytes, filename: str) -> str:
+    from docx import Document
+    from docx.oxml.ns import qn
+    from docx.oxml.table import CT_Tbl
+    from docx.oxml.text.paragraph import CT_P
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    document = Document(io.BytesIO(content))
+    blocks: list[str] = []
+    paragraph_index = 0
+    line_index = 0
+
+    def render_run(run: Any) -> str:
+        value = html.escape(run.text or "").replace("\n", "<br>")
+        if value and run.bold:
+            value = f"<strong>{value}</strong>"
+        if value and run.italic:
+            value = f"<em>{value}</em>"
+        images: list[str] = []
+        for blip in run._element.xpath(".//a:blip"):
+            relationship_id = blip.get(qn("r:embed"))
+            if not relationship_id:
+                continue
+            part = document.part.related_parts.get(relationship_id)
+            if part is None:
+                continue
+            encoded = base64.b64encode(part.blob).decode("ascii")
+            images.append(f'<img src="data:{part.content_type};base64,{encoded}" alt="文档图片">')
+        return value + "".join(images)
+
+    def render_paragraph(paragraph: Any) -> str:
+        nonlocal paragraph_index, line_index
+        paragraph_index += 1
+        raw_text = paragraph.text.strip()
+        if raw_text:
+            line_index += 1
+        body = "".join(render_run(run) for run in paragraph.runs)
+        if not body and not raw_text:
+            body = "&nbsp;"
+        style_name = str(getattr(paragraph.style, "name", "") or "").lower()
+        tag = "p"
+        if "heading 1" in style_name or "标题 1" in style_name:
+            tag = "h1"
+        elif "heading 2" in style_name or "标题 2" in style_name:
+            tag = "h2"
+        elif "heading" in style_name or "标题" in style_name:
+            tag = "h3"
+        return (
+            f'<{tag} class="source-block" data-paragraph="{paragraph_index}" '
+            f'data-line="{line_index if raw_text else 0}" data-text="{html.escape(raw_text, quote=True)}">'
+            f"{body}</{tag}>"
+        )
+
+    for child in document.element.body.iterchildren():
+        if isinstance(child, CT_P):
+            blocks.append(render_paragraph(Paragraph(child, document)))
+        elif isinstance(child, CT_Tbl):
+            table = Table(child, document)
+            rows: list[str] = []
+            for row in table.rows:
+                cells: list[str] = []
+                for cell in row.cells:
+                    cell_html = "".join(render_paragraph(paragraph) for paragraph in cell.paragraphs)
+                    cells.append(f'<td class="source-block table-cell" data-text="{html.escape(cell.text.strip(), quote=True)}">{cell_html}</td>')
+                rows.append(f"<tr>{''.join(cells)}</tr>")
+            blocks.append(f'<table class="document-table"><tbody>{"".join(rows)}</tbody></table>')
+
+    return _source_preview_page(filename, "".join(blocks))
+
+
+def _render_plain_source_preview(content: bytes, filename: str) -> str:
+    text = content.decode("utf-8-sig", errors="replace")
+    blocks = []
+    for index, line in enumerate(text.splitlines(), start=1):
+        blocks.append(
+            f'<p class="source-block" data-line="{index}" data-paragraph="{index}" '
+            f'data-text="{html.escape(line, quote=True)}">{html.escape(line) or "&nbsp;"}</p>'
+        )
+    return _source_preview_page(filename, "".join(blocks))
+
+
+def _source_preview_page(filename: str, body: str) -> str:
+    safe_title = html.escape(filename)
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{safe_title}</title>
+<style>
+  * {{ box-sizing: border-box; }}
+  html {{ scroll-behavior: smooth; background: #eef2f7; }}
+  body {{ margin: 0; color: #172033; font-family: "Microsoft YaHei", "Segoe UI", sans-serif; }}
+  .paper {{ width: min(920px, calc(100% - 32px)); min-height: calc(100vh - 32px); margin: 16px auto; padding: 54px 60px 72px; background: white; box-shadow: 0 2px 14px rgba(15,23,42,.12); }}
+  p {{ margin: 0 0 12px; font-size: 15px; line-height: 1.8; white-space: pre-wrap; }}
+  h1, h2, h3 {{ margin: 22px 0 12px; line-height: 1.45; letter-spacing: 0; }}
+  h1 {{ font-size: 24px; }} h2 {{ font-size: 20px; }} h3 {{ font-size: 17px; }}
+  img {{ display: block; max-width: 100%; height: auto; margin: 12px auto; }}
+  .document-table {{ width: 100%; margin: 16px 0; border-collapse: collapse; table-layout: fixed; }}
+  .document-table td {{ padding: 7px 8px; border: 1px solid #aeb8c6; vertical-align: top; overflow-wrap: anywhere; }}
+  .document-table p {{ margin: 0; font-size: 13px; line-height: 1.55; }}
+  .source-block.source-target {{ background: #fff0a6; outline: 3px solid #f59e0b; outline-offset: 3px; border-radius: 2px; transition: background .2s ease; }}
+  .location-note {{ position: fixed; right: 18px; bottom: 18px; z-index: 5; max-width: min(440px, calc(100% - 36px)); padding: 9px 12px; color: #713f12; background: #fffbeb; border: 1px solid #f59e0b; border-radius: 6px; box-shadow: 0 4px 18px rgba(15,23,42,.16); font-size: 13px; opacity: 0; pointer-events: none; transition: opacity .18s ease; }}
+  .location-note.show {{ opacity: 1; }}
+  @media (max-width: 720px) {{ .paper {{ width: 100%; margin: 0; padding: 32px 24px 56px; box-shadow: none; }} }}
+</style>
+</head>
+<body>
+<main class="paper">{body}</main>
+<div id="location-note" class="location-note">已定位到审查依据原文</div>
+<script>
+  const normalize = value => (value || '').replace(/\\s+/g, '').replace(/[，。；：、“”‘’（）()]/g, '').toLowerCase();
+  window.locateSource = function(quote, paragraph, line, section) {{
+    const blocks = Array.from(document.querySelectorAll('.source-block'));
+    blocks.forEach(block => block.classList.remove('source-target'));
+    const candidates = [quote, section].map(normalize).filter(value => value.length >= 2);
+    let target = null;
+    for (const candidate of candidates) {{
+      target = blocks.find(block => {{
+        const value = normalize(block.dataset.text || block.innerText);
+        return value.includes(candidate) || (value.length >= 8 && candidate.includes(value));
+      }});
+      if (target) break;
+    }}
+    if (!target && paragraph) target = document.querySelector(`[data-paragraph="${{paragraph}}"]`);
+    if (!target && line) target = document.querySelector(`[data-line="${{line}}"]`);
+    if (!target) return false;
+    target.classList.add('source-target');
+    target.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
+    const note = document.getElementById('location-note');
+    note.classList.add('show');
+    window.clearTimeout(window.__locationTimer);
+    window.__locationTimer = window.setTimeout(() => note.classList.remove('show'), 1800);
+    return true;
+  }};
+</script>
+</body>
+</html>"""
 
 
 def _json_dumps(value: Any) -> str:
@@ -1572,6 +1832,10 @@ def _normalize_document_rule_result(result: dict[str, Any], module: str, use_llm
                     "feature": item or issue.get("feature"),
                     "risk_level": _normalize_issue_degree(issue.get("severity") or rule_result.get("severity") or "需人工确认"),
                     "review_opinion": issue.get("message") or rule_result.get("summary") or "规则检查发现需复核事项。",
+                    # Keep the parser's original evidence separate from the
+                    # generated display summary. The former is the only safe
+                    # value to use for exact Word source matching.
+                    "evidence": evidence,
                     "evidence_summary": (
                         f"系统在“{issue.get('section') or module}”中识别到该功能点对应关系不足；原始条目已保留在证据明细。"
                         if item and evidence
@@ -1855,6 +2119,7 @@ def _attach_finding_locations(
             finding.get("evidence"),
             finding.get("context"),
             finding.get("hit_text"),
+            finding.get("item_name"),
             finding.get("item"),
             finding.get("raw_item"),
             finding.get("item_source_excerpt"),
@@ -1897,21 +2162,95 @@ def _attach_finding_locations(
         if section:
             location.setdefault("section", section)
 
-        match = _find_location_line(lines, quote)
+        match = None
+        row_hint = finding.get("source_row") or finding.get("item_row_index")
+        if row_hint is None and finding.get("row_indexes"):
+            row_hint = (finding.get("row_indexes") or [None])[0]
+        if row_hint is not None:
+            try:
+                row_number = int(row_hint)
+            except (TypeError, ValueError):
+                row_number = 0
+            if row_number > 0:
+                match = next((entry for entry in lines if entry.get("table_row") == row_number), None)
+        # Prefer evidence that really occurs in the document. A generated
+        # summary or section label may also match, but only after concrete
+        # hit text, item names, and excerpts have had a chance.
+        concrete_candidates = [
+            str(value or "").strip()
+            for value in quote_values
+            if str(value or "").strip()
+        ]
+        # Evidence summaries may contain several source lines joined by a
+        # delimiter. Try each bounded fragment so a real line can be matched
+        # without treating the whole generated summary as document text.
+        evidence_summary = str(finding.get("evidence_summary") or "").strip()
+        if evidence_summary:
+            for fragment in re.split(r"\s*(?:\||；|;|\n)\s*", evidence_summary):
+                fragment = fragment.strip()
+                if fragment and fragment not in concrete_candidates:
+                    concrete_candidates.append(fragment)
+        for candidate in concrete_candidates:
+            if match:
+                break
+            if candidate:
+                match = _find_location_line(lines, candidate)
+            if match:
+                break
+        # Rule engines often emit a generated summary as evidence. It is not
+        # expected to occur verbatim in the report, so fall back to the real
+        # section heading before exposing a text-only location.
+        if match is None and section:
+            match = _find_section_location_line(lines, section)
         if match:
-            location.setdefault("line_start", match[0])
-            location.setdefault("line_end", match[1])
-            location.setdefault("quote", match[2])
+            location.setdefault("line_start", match["line"])
+            location.setdefault("line_end", match["line"])
+            if match.get("page") is not None:
+                location.setdefault("page", match["page"])
+            if match.get("paragraph") is not None:
+                location.setdefault("paragraph", match["paragraph"])
+            location.setdefault("quote", match["text"])
             location.setdefault("precision", "line")
         elif quote and quote not in {section, "全文"}:
             # Keep a bounded excerpt even when the parser cannot resolve a
             # concrete line. Clients can render this as a text highlight.
             location.setdefault("quote", quote[:500])
             location.setdefault("precision", "text")
+        elif section and len("".join(section.split())) >= 2:
+            section_match = _find_section_location_line(lines, section)
+            if section_match:
+                location.setdefault("line_start", section_match["line"])
+                location.setdefault("line_end", section_match["line"])
+                if section_match.get("paragraph") is not None:
+                    location.setdefault("paragraph", section_match["paragraph"])
+                location.setdefault("quote", section_match["text"])
+                location.setdefault("precision", "line")
+            else:
+                location.setdefault("precision", "section")
         else:
             location.setdefault("precision", "section" if section else "unknown")
 
         if location:
+            for location_key, excerpt_key in (
+                ("current", "item_source_excerpt"),
+                ("related", "related_source_excerpt"),
+            ):
+                nested = location.get(location_key)
+                if not isinstance(nested, dict):
+                    continue
+                nested_location = dict(nested)
+                nested_quote = str(finding.get(excerpt_key) or nested_location.get("quote") or "").strip()
+                nested_match = _find_location_line(lines, nested_quote, allow_short=True) if nested_quote else None
+                if nested_match:
+                    nested_location.setdefault("line_start", nested_match["line"])
+                    nested_location.setdefault("line_end", nested_match["line"])
+                    if nested_match.get("page") is not None:
+                        nested_location.setdefault("page", nested_match["page"])
+                    if nested_match.get("paragraph") is not None:
+                        nested_location.setdefault("paragraph", nested_match["paragraph"])
+                    nested_location.setdefault("quote", nested_match["text"])
+                    nested_location.setdefault("precision", "line")
+                location[location_key] = nested_location
             finding["source_location"] = location
             finding["location_hint"] = _format_location_hint(location)
             highlights = _build_source_highlights(finding, location)
@@ -2020,31 +2359,87 @@ def _build_source_highlights(
     return highlights
 
 
-def _extract_location_lines(content: bytes, filename: str) -> list[str]:
+def _extract_location_lines(content: bytes, filename: str) -> list[dict[str, Any]]:
     suffix = Path(filename).suffix.lower()
     try:
         if suffix in {".txt", ".md", ".csv"}:
-            return content.decode("utf-8-sig", errors="replace").splitlines()
-        if suffix in {".docx", ".pdf"}:
-            document = BaseValidator.parse_document(content, filename)
-            return str(document.get("_full_text") or "").splitlines()
+            return [
+                {"text": line, "line": index, "page": None, "paragraph": index}
+                for index, line in enumerate(content.decode("utf-8-sig", errors="replace").splitlines(), start=1)
+                if line.strip()
+            ]
+        if suffix == ".docx":
+            from docx import Document
+
+            document = Document(io.BytesIO(content))
+            entries: list[dict[str, Any]] = []
+            line_index = 0
+            for paragraph_index, paragraph in enumerate(document.paragraphs, start=1):
+                text = paragraph.text.strip()
+                if not text:
+                    continue
+                line_index += 1
+                entries.append({"text": text, "line": line_index, "page": None, "paragraph": paragraph_index})
+            for table in document.tables:
+                for row_index, row in enumerate(table.rows, start=1):
+                    text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
+                    if text:
+                        line_index += 1
+                        entries.append({
+                            "text": text,
+                            "line": line_index,
+                            "page": None,
+                            "paragraph": None,
+                            "table_row": row_index,
+                        })
+            return entries
     except Exception:
         return []
     return []
 
 
-def _find_location_line(lines: list[str], quote: str) -> tuple[int, int, str] | None:
+def _find_location_line(
+    lines: list[dict[str, Any]],
+    quote: str,
+    allow_short: bool = False,
+) -> dict[str, Any] | None:
     compact_quote = "".join(str(quote or "").split())
-    if len(compact_quote) < 4:
+    if len(compact_quote) < (2 if allow_short else 4):
         return None
-    for index, line in enumerate(lines, start=1):
+    for entry in lines:
+        line = str(entry.get("text") or "")
         if quote in line:
-            return index, index, line.strip()
+            return entry
         compact_line = "".join(line.split())
         if compact_quote in compact_line:
-            return index, index, line.strip()
+            return entry
         if len(compact_line) >= 8 and compact_line in compact_quote:
-            return index, index, line.strip()
+            return entry
+    return None
+
+
+def _find_section_location_line(
+    lines: list[dict[str, Any]],
+    section: str,
+) -> dict[str, Any] | None:
+    """Resolve a section label, including validators' comma-joined labels."""
+    text = str(section or "").strip()
+    if not text:
+        return None
+    candidates = [text]
+    candidates.extend(
+        fragment.strip()
+        for fragment in re.split(r"\s*(?:,|，|、|;|；|/|\\)\s*", text)
+        if fragment.strip()
+    )
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        match = _find_location_line(lines, candidate, allow_short=True)
+        if match:
+            return match
     return None
 
 
@@ -2205,6 +2600,7 @@ def _source_artifacts_to_list(row: CheckResult) -> list[dict[str, Any]]:
             "filename": artifact.filename,
             "media_type": artifact.media_type,
             "download_url": f"/api/evaluate/results/{row.id}/sources/{artifact.id}",
+            "preview_url": f"/api/evaluate/results/{row.id}/sources/{artifact.id}/preview",
         }
         for artifact in (row.source_artifacts or [])
     ]

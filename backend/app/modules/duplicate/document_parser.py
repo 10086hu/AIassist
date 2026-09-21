@@ -3,8 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from io import BytesIO
 from typing import List, Optional
-
-import pdfplumber
 from docx import Document
 
 
@@ -19,7 +17,7 @@ class DocumentSection:
 
 @dataclass(frozen=True)
 class DocumentContent:
-    format: str  # "docx" | "pdf"
+    format: str  # "docx"
     raw_text: str
     sections: List[DocumentSection]
     filename: str
@@ -29,8 +27,6 @@ def parse_document(content: bytes, filename: str) -> DocumentContent:
     """根据文件扩展名选择合适的解析器"""
     if filename.lower().endswith(".docx"):
         return _parse_docx(content, filename)
-    elif filename.lower().endswith(".pdf"):
-        return _parse_pdf(content, filename)
     else:
         raise ValueError(f"不支持的文件格式: {filename}")
 
@@ -101,43 +97,3 @@ def _extract_docx_table_text(doc: Document) -> list[str]:
             if values:
                 rows.append(" | ".join(values))
     return rows
-
-
-def _parse_pdf(content: bytes, filename: str) -> DocumentContent:
-    """解析 PDF 文档"""
-    try:
-        pdf = pdfplumber.open(BytesIO(content))
-    except Exception as e:
-        raise ValueError(f"PDF 文档解析失败: {e}") from e
-
-    sections: List[DocumentSection] = []
-    raw_text_parts = []
-
-    line_index = 0
-    for page_num, page in enumerate(pdf.pages, 1):
-        text = page.extract_text()
-        if text:
-            raw_text_parts.append(text.strip())
-            page_lines = [line for line in text.splitlines() if line.strip()]
-            start_line = line_index + 1
-            line_index += len(page_lines)
-            sections.append(
-                DocumentSection(
-                    title=f"第 {page_num} 页",
-                    content=text.strip(),
-                    start_line=start_line,
-                    end_line=line_index,
-                    page_no=page_num,
-                )
-            )
-
-    pdf.close()
-
-    raw_text = "\n".join(raw_text_parts)
-
-    return DocumentContent(
-        format="pdf",
-        raw_text=raw_text,
-        sections=sections,
-        filename=filename,
-    )

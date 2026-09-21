@@ -85,7 +85,7 @@ def run_duplicate_check_from_document(
     use_llm: bool = True,
 ) -> DuplicateInternalResponse:
     """
-    从上传的文档（Word/PDF）进行内部去重检查
+    从上传的 Word 文档进行内部去重检查
     流程：文档解析 → 功能点提取 → 向量化 → 去重判定 → 存储
     """
     # 1. 解析文档
@@ -426,7 +426,7 @@ def _parse_points_from_file(content: bytes, filename: str, project_context: str,
     lower = filename.lower()
     if lower.endswith((".xlsx", ".csv")):
         return parse_function_points(content, filename)
-    if lower.endswith((".docx", ".pdf")):
+    if lower.endswith(".docx"):
         document = parse_document(content, filename)
         return _annotate_document_points(
             _parse_document_function_points(document, project_context=project_context, use_llm=use_llm),

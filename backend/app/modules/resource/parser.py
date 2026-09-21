@@ -18,7 +18,7 @@ HEADER_ALIASES = {
     "spec": {"规格", "规格型号", "配置", "参数", "描述", "说明", "备注", "配置说明", "用途", "型号"},
 }
 
-# Word/PDF 通常不是标准表格。这里定义文档文本中可能出现的资源名称别名，
+# Word 通常不是标准表格。这里定义文档文本中可能出现的资源名称别名，
 # 解析器会把这些别名统一映射成规则引擎能识别的标准资源名称。
 DOCUMENT_RESOURCE_ALIASES = {
     "安全防病毒服务": ("安全防病毒服务", "防病毒服务", "病毒防护服务", "杀毒服务"),
@@ -35,7 +35,7 @@ DOCUMENT_RESOURCE_ALIASES = {
 }
 
 # 文档章节/上下文到第 15 行“三类清单”的映射。
-# 解析 Word/PDF 时，会根据当前行或章节标题推断资源来自哪一类依据。
+# 解析 Word 时，会根据当前行或章节标题推断资源来自哪一类依据。
 DOCUMENT_SOURCE_ALIASES = {
     "安全服务需求表": ("安全服务需求表", "安全服务需求", "安全建设内容", "6.6", "六.六", "第六章安全建设"),
     "PaaS服务清单": ("PaaS服务清单", "PaaS服务", "PaaS 服务", "服务工具箱", "同行业成熟产品", "6.7", "六.七"),
@@ -165,9 +165,7 @@ def parse_resource_items(content: bytes, filename: str) -> list[ParsedResourceIt
         return _dedupe_items(_parse_xlsx(content))
     if lower_name.endswith(".docx"):
         return _dedupe_items(_parse_docx(content))
-    if lower_name.endswith(".pdf"):
-        return _dedupe_items(_parse_pdf(content))
-    raise ValueError("资源申请合理性检查支持 .xlsx、.csv、.docx 或 .pdf 文件")
+    raise ValueError("资源申请合理性检查支持 .xlsx、.csv、.docx 文件")
 
 
 def _parse_xlsx(content: bytes) -> list[ParsedResourceItem]:
@@ -229,34 +227,6 @@ def _parse_docx(content: bytes) -> list[ParsedResourceItem]:
     return items
 
 
-def _parse_pdf(content: bytes) -> list[ParsedResourceItem]:
-    """解析 PDF 文档中的资源项。
-
-    PDF 的表格结构经常丢失，所以这里同时尝试：
-    - extract_tables：能识别出表格时按二维表解析。
-    - extract_text：无法稳定识别表格时按文本行解析。
-    """
-
-    import pdfplumber
-
-    items: list[ParsedResourceItem] = []
-    with pdfplumber.open(BytesIO(content)) as pdf:
-        for page_index, page in enumerate(pdf.pages, start=1):
-            sheet_name = f"PDF第{page_index}页"
-
-            for table_index, table in enumerate(page.extract_tables() or [], start=1):
-                if not _is_resource_related_table(table):
-                    continue
-                table_items = _parse_rows(table, f"{sheet_name}表格{table_index}", require_resource_context=True)
-                items.extend(table_items)
-
-            text = page.extract_text() or ""
-            lines = [line.strip() for line in text.splitlines() if line.strip()]
-            items.extend(_parse_text_lines(lines, sheet_name, require_resource_context=True))
-
-    return items
-
-
 def _parse_rows(
     rows: Iterable[Iterable[object]],
     sheet_name: str,
@@ -297,8 +267,8 @@ def _parse_rows(
             continue
         unit = _value_at(row, mapping.get("unit")) or _guess_unit(quantity_text) or "项"
         if require_resource_context:
-            # Word/PDF 表格经常包含序号、单价、合价和规格参数。只有明确数量列才读取数量，
-            # 避免把预算金额、章节号或规格指标误当成资源申请数量。若 PDF/Word 表格丢失表头，
+            # Word 表格经常包含序号、单价、合价和规格参数。只有明确数量列才读取数量，
+            # 避免把预算金额、章节号或规格指标误当成资源申请数量。若 Word 表格丢失表头，
             # 再在资源名称附近做一次严格兜底，只接受“台/套/个/项”等数量单位或数量上下文。
             quantity = _parse_quantity(quantity_text) if has_explicit_quantity_column else None
             if quantity is None:
@@ -331,7 +301,7 @@ def _parse_text_lines(
     sheet_name: str,
     require_resource_context: bool = False,
 ) -> list[ParsedResourceItem]:
-    """从 Word/PDF 的自然语言文本中抽取资源项。
+    """从 Word 的自然语言文本中抽取资源项。
 
     文本解析是启发式的，不要求固定表头。它主要服务于第 15/16 行规则：
     - 先根据章节或行内容识别来源，例如 6.6、6.7、密码服务资源内容清单。
@@ -477,7 +447,7 @@ def _guess_unit(value: str) -> str:
 
 
 def _normalize_line(value: str) -> str:
-    """标准化 Word/PDF 文本行，减少换行、空格和标点差异。"""
+    """标准化 Word 文本行，减少换行、空格和标点差异。"""
 
     return re.sub(r"\s+", " ", value).strip()
 
@@ -617,7 +587,7 @@ def _is_reasonable_resource_quantity(value: float) -> bool:
 def _dedupe_items(items: list[ParsedResourceItem]) -> list[ParsedResourceItem]:
     """去除重复解析结果。
 
-    Word/PDF 可能同时从表格和文本层读到同一行内容；这里按核心字段去重，
+    Word 可能同时从表格和文本层读到同一行内容；这里按核心字段去重，
     避免同一资源数量被重复累计。
     """
 
@@ -638,7 +608,7 @@ def _dedupe_items(items: list[ParsedResourceItem]) -> list[ParsedResourceItem]:
 
 
 def _detect_explicit_header_fields(rows: list[list[object]]) -> set[str]:
-    """识别真实表头字段，不使用兜底列位，供 Word/PDF 表格范围判断使用。"""
+    """识别真实表头字段，不使用兜底列位，供 Word 表格范围判断使用。"""
 
     normalized_aliases = {
         field: {_normalize_header(alias) for alias in aliases}

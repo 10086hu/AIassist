@@ -53,7 +53,7 @@ LLM_MODEL
 - 支持上传一个或多个往期文件。
 - 支持当前报告内部重复功能点检查。
 - 支持当前报告与往期报告之间重复功能点检查。
-- 支持 Word/PDF 文档解析后，通过大模型抽取功能点。
+- 支持 Word 文档解析后，通过大模型抽取功能点。
 - 支持使用大模型判断功能点是否“重复 / 高度相似 / 无关”。
 - 支持输出重复项标题、风险等级、原因、证据、修改建议、模型名称。
 
@@ -71,7 +71,7 @@ POST /api/evaluate/duplicate/compare
 WPF 前端已接入重复建设检查模块：
 
 - 用户选择“重复建设检查”后，会弹窗询问是否上传往期文件。
-- 如果选择有往期文件，可以多选 `.docx/.pdf/.xlsx/.csv`。
+- 如果选择有往期文件，可以多选 `.docx/.xlsx/.csv`。
 - 前端会调用后端 `/api/evaluate/duplicate/compare`。
 - 如果没有往期文件，则仍可走当前报告内部重复检查逻辑。
 
@@ -221,7 +221,7 @@ dotnet build desktop-wpf\AiReportDesktop.csproj
 1. 将重复建设检查结果在 WPF 前端做更细的结果展示，例如按“内部重复 / 与往期重复”分组。
 2. 给大模型抽取结果增加缓存，避免同一报告重复调用模型。
 3. 对长篇可研报告增加分章抽取、合并去重和失败重试队列。
-4. 给 `/duplicate/compare` 增加自动化测试用例，覆盖 Word、PDF、Excel/CSV 混合输入。
+4. 给 `/duplicate/compare` 增加自动化测试用例，覆盖 Word、Excel/CSV 混合输入。
 5. 继续完善未完成的价格、安全、信创相关模块。
 
 ## 九、当前 Git 分支
@@ -231,5 +231,4 @@ dotnet build desktop-wpf\AiReportDesktop.csproj
 ```text
 duplicate-check-completion
 ```
-
 

@@ -436,14 +436,12 @@ def parse_maintenance_document(content: bytes, filename: str) -> MaintenanceDocu
     lower = filename.lower()
     if lower.endswith(".docx"):
         raw_text, rows = _parse_docx(content)
-    elif lower.endswith(".pdf"):
-        raw_text, rows = _parse_pdf(content)
     elif lower.endswith(".xlsx"):
         raw_text, rows = _parse_xlsx(content)
     elif lower.endswith(".csv"):
         raw_text, rows = _parse_csv(content)
     else:
-        raise ValueError("运维项目规则支持 .docx、.pdf、.xlsx、.csv 文件")
+        raise ValueError("运维项目规则支持 .docx、.xlsx、.csv 文件")
 
     lines = [line.strip() for line in re.split(r"[\r\n]+", raw_text) if line.strip()]
     return MaintenanceDocument(filename=filename, raw_text=raw_text, lines=lines, table_rows=rows)
@@ -462,25 +460,6 @@ def _parse_docx(content: bytes) -> tuple[str, list[list[str]]]:
                 rows.append(values)
                 lines.append(" | ".join(values))
     return "\n".join(lines), rows
-
-
-def _parse_pdf(content: bytes) -> tuple[str, list[list[str]]]:
-    import pdfplumber
-
-    text_parts: list[str] = []
-    rows: list[list[str]] = []
-    with pdfplumber.open(BytesIO(content)) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text() or ""
-            if text.strip():
-                text_parts.append(text.strip())
-            for table in page.extract_tables() or []:
-                for row in table:
-                    values = [str(cell).strip() for cell in row if cell is not None and str(cell).strip()]
-                    if values:
-                        rows.append(values)
-                        text_parts.append(" | ".join(values))
-    return "\n".join(text_parts), rows
 
 
 def _parse_xlsx(content: bytes) -> tuple[str, list[list[str]]]:

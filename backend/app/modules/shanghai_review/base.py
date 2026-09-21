@@ -79,19 +79,6 @@ class BaseValidator(ABC):
                     parts.append(tab.join(cell.text.strip() for cell in row.cells))
                 parts.append("===/TABLE_%d===" % ti)
             ft = nl.join(parts)
-        elif ext == "pdf":
-            import pdfplumber
-            chunks = []
-            with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-                for page in pdf.pages:
-                    t = page.extract_text()
-                    if t and t.strip():
-                        chunks.append(t)
-                    for table in page.extract_tables():
-                        if table:
-                            rts = [tab.join(str(c) if c else "" for c in row) for row in table if any(row)]
-                            chunks.append("===TABLE===|" + "|".join(rts) + "|===/TABLE===")
-            ft = nl.join(chunks)
         else:
             ft = file_bytes.decode("utf-8", errors="replace")
         doc = {"_full_text": ft}
@@ -122,7 +109,7 @@ class BaseValidator(ABC):
             if not content:
                 raise HTTPException(status_code=400, detail="empty file")
             extt = fname.lower().rsplit(".", 1)[-1] if "." in fname else ""
-            if extt not in ("docx", "doc", "pdf", "txt"):
+            if extt not in ("docx", "doc", "txt"):
                 raise HTTPException(status_code=400, detail="unsupported: ." + extt)
             try:
                 document = BaseValidator.parse_document(content, fname)

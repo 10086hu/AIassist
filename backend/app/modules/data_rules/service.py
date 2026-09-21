@@ -274,7 +274,7 @@ def run_data_rules_check_from_document(
     project_name: str = "未命名可研项目",
     selected_rule_ids: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Run all data reasonableness rules against an uploaded Word/PDF report."""
+    """Run all data reasonableness rules against an uploaded Word report."""
     selected = {str(item).strip() for item in selected_rule_ids or [] if str(item).strip()}
     budget_rule_only = _selected_is_budget_rule_only(selected)
     if budget_rule_only and filename.lower().endswith(".docx"):

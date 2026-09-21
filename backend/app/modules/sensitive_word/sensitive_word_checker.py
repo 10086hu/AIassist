@@ -684,7 +684,7 @@ def deduplicate_terms(terms: List[SensitiveTerm]) -> List[SensitiveTerm]:
 
 
 # ============================================================
-# 5. 报告解析：docx / pdf / txt / xlsx
+# 5. 报告解析：docx / txt / xlsx
 # ============================================================
 
 def extract_docx_text(path: Path) -> List[TextSegment]:
@@ -743,64 +743,6 @@ def extract_docx_text(path: Path) -> List[TextSegment]:
     return segments
 
 
-def extract_pdf_text(path: Path) -> List[TextSegment]:
-    segments: List[TextSegment] = []
-
-    # 优先 pdfplumber
-    try:
-        import pdfplumber
-        with pdfplumber.open(str(path)) as pdf:
-            current_section = "全文"
-            idx = 0
-            for page_no, page in enumerate(pdf.pages, start=1):
-                text = page.extract_text() or ""
-                for line in text.splitlines():
-                    line = normalize_text(line)
-                    if not line:
-                        continue
-                    if is_heading(line):
-                        current_section = clean_heading(line)
-                    idx += 1
-                    segments.append(TextSegment(
-                        segment_id=f"page-{page_no}-line-{idx}",
-                        section=current_section,
-                        text=line,
-                        source_type="paragraph",
-                        page_no=page_no,
-                        paragraph_index=idx,
-                    ))
-        return segments
-    except Exception:
-        pass
-
-    # fallback: pypdf
-    try:
-        from pypdf import PdfReader
-        reader = PdfReader(str(path))
-        current_section = "全文"
-        idx = 0
-        for page_no, page in enumerate(reader.pages, start=1):
-            text = page.extract_text() or ""
-            for line in text.splitlines():
-                line = normalize_text(line)
-                if not line:
-                    continue
-                if is_heading(line):
-                    current_section = clean_heading(line)
-                idx += 1
-                segments.append(TextSegment(
-                    segment_id=f"page-{page_no}-line-{idx}",
-                    section=current_section,
-                    text=line,
-                    source_type="paragraph",
-                    page_no=page_no,
-                    paragraph_index=idx,
-                ))
-        return segments
-    except Exception as exc:
-        raise RuntimeError("PDF 解析失败：请安装 pdfplumber 或 pypdf，或将 PDF 转为 Word 后再检查。") from exc
-
-
 def extract_txt_text(path: Path) -> List[TextSegment]:
     content = path.read_text(encoding="utf-8", errors="ignore")
     segments = []
@@ -854,14 +796,12 @@ def parse_report(report_path: str) -> List[TextSegment]:
     ext = path.suffix.lower()
     if ext == ".docx":
         segments = extract_docx_text(path)
-    elif ext == ".pdf":
-        segments = extract_pdf_text(path)
     elif ext in [".txt", ".md"]:
         segments = extract_txt_text(path)
     elif ext in [".xlsx", ".xlsm"]:
         segments = extract_xlsx_text(path)
     else:
-        raise ValueError(f"暂不支持的文件格式：{ext}，建议使用 docx/pdf/txt/xlsx")
+        raise ValueError(f"暂不支持的文件格式：{ext}，建议使用 docx/txt/xlsx")
 
     # 如果章节都没识别出来，做一次章节传播
     return normalize_sections(segments)
@@ -1302,7 +1242,7 @@ def check_sensitive_words(
     """敏感词检查主函数。
 
     参数：
-        report_path: 可研报告文件路径，支持 docx/pdf/txt/xlsx。
+        report_path: 可研报告文件路径，支持 docx/txt/xlsx。
         rules_xlsx_path: 敏感词检查规则 Excel。
         rule_api_url: 规则库网站 API 根地址或 /api/rule-library/list 地址。
         rule_api_tag: 从规则库网站按标签筛选。
@@ -1412,7 +1352,7 @@ def save_json(result: Dict[str, Any], out_path: str) -> None:
 
 def cli_main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="敏感词检查模块：检查可研报告中的敏感词、限制性表述和需关注内容。")
-    parser.add_argument("report_path", help="可研报告路径，支持 docx/pdf/txt/xlsx")
+    parser.add_argument("report_path", help="可研报告路径，支持 docx/txt/xlsx")
     parser.add_argument("--rules-xlsx", default=None, help="敏感词检查规则 Excel 路径")
     parser.add_argument("--rule-api-url", default=None, help="规则库网站地址或 /api/rule-library/list 接口地址")
     parser.add_argument("--rule-api-tag", default=None, help="规则库标签筛选")

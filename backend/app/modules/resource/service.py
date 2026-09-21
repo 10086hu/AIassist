@@ -78,7 +78,7 @@ def run_resource_check_from_file(
                     "未在上传材料中识别到安全服务需求表、PaaS服务清单、密码服务资源内容清单、"
                     "云资源申请表、计算资源清单或三大件清单等资源申请相关内容。"
                 ),
-                suggestion="建议上传结构化 .xlsx/.csv 资源清单，或在 Word/PDF 中保留清晰的资源相关章节标题和数量列。",
+                suggestion="建议上传结构化 .xlsx/.csv 资源清单，或在 Word 中保留清晰的资源相关章节标题和数量列。",
                 source_quantities={},
                 row_indexes=[],
             )

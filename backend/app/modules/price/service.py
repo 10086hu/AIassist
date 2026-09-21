@@ -36,7 +36,7 @@ PRICE_REF_002 = {
     "rule_detail": "产品价格按名称、品牌、型号和规格匹配价格参考库，比较申报单价与参考价格差异。",
 }
 PRICE_RULES = (PRICE_REASON_001, PRICE_REF_001, PRICE_REF_002)
-PRICE_EXTENSIONS = {".xlsx", ".xlsm", ".csv", ".docx", ".pdf"}
+PRICE_EXTENSIONS = {".xlsx", ".xlsm", ".csv", ".docx"}
 SOFTWARE_UNIT_PRICE = 25000.0
 NEW_TECH_UNIT_PRICE = 30000.0
 NEW_TECH_KEYWORDS = (

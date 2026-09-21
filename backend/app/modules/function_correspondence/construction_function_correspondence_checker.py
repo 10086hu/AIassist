@@ -185,7 +185,7 @@ DEFAULT_RULES: List[Rule] = [
 ]
 
 # =============================
-# 3. 文档解析：DOCX / PDF / TXT
+# 3. 文档解析：DOCX / TXT
 # =============================
 
 _XML_NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
@@ -235,46 +235,6 @@ def _extract_docx_paragraphs_and_tables(path: str) -> Tuple[List[str], List[List
     return paragraphs, tables
 
 
-def _extract_pdf_text(path: str) -> Tuple[List[str], List[List[List[str]]]]:
-    """读取 PDF 文本。优先 pdfplumber；其次 PyMuPDF。"""
-    paragraphs: List[str] = []
-    tables: List[List[List[str]]] = []
-
-    try:
-        import pdfplumber  # type: ignore
-        with pdfplumber.open(path) as pdf:
-            for page in pdf.pages:
-                text = page.extract_text() or ""
-                for line in text.splitlines():
-                    line = _clean_text(line)
-                    if line:
-                        paragraphs.append(line)
-                try:
-                    for tb in page.extract_tables() or []:
-                        rows = [[_clean_text(str(c or "")) for c in row] for row in tb]
-                        rows = [row for row in rows if any(row)]
-                        if rows:
-                            tables.append(rows)
-                except Exception:
-                    pass
-        return paragraphs, tables
-    except Exception:
-        pass
-
-    try:
-        import fitz  # type: ignore
-        doc = fitz.open(path)
-        for page in doc:
-            text = page.get_text() or ""
-            for line in text.splitlines():
-                line = _clean_text(line)
-                if line:
-                    paragraphs.append(line)
-        return paragraphs, tables
-    except Exception as exc:
-        raise RuntimeError("PDF 解析失败：请安装 pdfplumber 或 PyMuPDF，或转换为 Word 后再检测") from exc
-
-
 def parse_report_file(path: str) -> Tuple[List[str], List[List[List[str]]]]:
     p = Path(path)
     if not p.exists():
@@ -283,14 +243,12 @@ def parse_report_file(path: str) -> Tuple[List[str], List[List[List[str]]]]:
     suffix = p.suffix.lower()
     if suffix == ".docx":
         return _extract_docx_paragraphs_and_tables(str(p))
-    if suffix == ".pdf":
-        return _extract_pdf_text(str(p))
     if suffix in {".txt", ".md"}:
         text = p.read_text(encoding="utf-8", errors="ignore")
         lines = [_clean_text(x) for x in text.splitlines()]
         return [x for x in lines if x], []
 
-    raise ValueError(f"暂不支持的报告格式：{suffix}，请使用 .docx/.pdf/.txt")
+    raise ValueError(f"暂不支持的报告格式：{suffix}，请使用 .docx/.txt")
 
 
 # =============================
@@ -1028,7 +986,7 @@ def check_construction_function_correspondence(
     建设功能对应关系检查主函数。
 
     参数：
-        report_path: 可研报告路径，支持 .docx/.pdf/.txt。
+        report_path: 可研报告路径，支持 .docx/.txt。
         rules_xlsx_path: 建设功能对应关系检查规则 Excel，可为空；为空时使用内置规则。
         rule_api_base: 规则库网站基础地址，例如 https://xxx.ngrok-free.dev，可为空。
         project_level: 市级项目 / 区级项目 / 所有项目。
@@ -1113,7 +1071,7 @@ def check(report_path: str, **kwargs: Any) -> Dict[str, Any]:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="建设功能对应关系检查模块")
-    parser.add_argument("report", help="可研报告路径，支持 .docx/.pdf/.txt")
+    parser.add_argument("report", help="可研报告路径，支持 .docx/.txt")
     parser.add_argument("--rules-xlsx", default=None, help="建设功能对应关系检查规则 Excel 路径")
     parser.add_argument("--rule-api", default=None, help="规则库网站地址，例如 https://xxx.ngrok-free.dev")
     parser.add_argument("--project-level", default="市级项目", choices=["市级项目", "区级项目", "所有项目"], help="项目层级")
