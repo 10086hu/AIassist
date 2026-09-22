@@ -815,8 +815,8 @@ public partial class MainWindow : Window
 
     private Grid BuildRecordsPage()
     {
-        var page = PageGrid(3);
-        page.RowDefinitions[2].Height = new GridLength(1, GridUnitType.Star);
+        var page = PageGrid(2);
+        page.RowDefinitions[1].Height = new GridLength(1, GridUnitType.Star);
         var header = Header("审查记录", "查看报告审查任务、执行状态和结果摘要。", "刷新记录", false);
         if (header.Children.OfType<Button>().FirstOrDefault() is Button refreshButton)
         {
@@ -824,18 +824,11 @@ public partial class MainWindow : Window
         }
         page.Children.Add(header);
 
-        var stats = new UniformGrid { Columns = 3, Margin = new Thickness(0, 18, 0, 0) };
-        Grid.SetRow(stats, 1);
-        stats.Children.Add(StatCard("实时", "全部记录", "来自后端 CheckResult", Brush(37, 99, 235)));
-        stats.Children.Add(StatCard("真实", "结果摘要", "展示最近 50 条", Brush(2, 122, 72)));
-        stats.Children.Add(StatCard("可点选", "问题详情", "查看 findings 明细", Brush(181, 71, 8)));
-        page.Children.Add(stats);
-
         var body = new Grid { Margin = new Thickness(0, 18, 0, 0) };
         body.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(0.9, GridUnitType.Star), MinWidth = 210 });
         body.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1.25, GridUnitType.Star), MinWidth = 300 });
         body.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1.55, GridUnitType.Star), MinWidth = 350 });
-        Grid.SetRow(body, 2);
+        Grid.SetRow(body, 1);
 
         var projectPanel = new StackPanel();
         _projectTreePanel = projectPanel;
