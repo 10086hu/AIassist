@@ -54,6 +54,14 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+try:
+    from app.core.direct_http import urlopen_direct
+except ImportError:
+    _DIRECT_URL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def urlopen_direct(request: urllib.request.Request, *, timeout: int):
+        return _DIRECT_URL_OPENER.open(request, timeout=timeout)
+
 
 # =============================
 # 1. 数据结构
@@ -892,8 +900,13 @@ def call_deepseek_json(prompt: str, api_key: Optional[str] = None, timeout: int 
     key = api_key or os.getenv("DEEPSEEK_API_KEY")
     if not key:
         return None
-    base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-    model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+    base_url = (
+        os.getenv("DEEPSEEK_API_BASE_URL")
+        or os.getenv("DEEPSEEK_API_URL")
+        or os.getenv("DEEPSEEK_BASE_URL")
+        or "https://api.deepseek.com/v1"
+    )
+    model = os.getenv("DEEPSEEK_MODEL", "DeepSeek-V4-Flash")
     url = base_url.rstrip("/") + "/chat/completions"
 
     body = {
@@ -912,7 +925,7 @@ def call_deepseek_json(prompt: str, api_key: Optional[str] = None, timeout: int 
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urlopen_direct(req, timeout=timeout) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
         content = payload["choices"][0]["message"]["content"]
         content = content.strip()

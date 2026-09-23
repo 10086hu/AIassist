@@ -1,7 +1,7 @@
 $ErrorActionPreference = "Stop"
 
 $baseUrl = "https://llmapi.tongji.edu.cn/v1"
-$model = "DeepSeek-R1"
+$model = "DeepSeek-V4-Flash"
 
 Write-Host "[AI Assist] Configure OpenAI-compatible LLM API"
 Write-Host "[AI Assist] Base URL: $baseUrl"

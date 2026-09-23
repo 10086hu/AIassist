@@ -3,12 +3,12 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
-import requests
-
 from app.core.config import settings
+from app.core.direct_http import post_direct
 from app.core.llm_json import parse_json_object_from_text
 from app.modules.duplicate.embeddings import lexical_overlap, normalize_text
 
@@ -35,9 +35,10 @@ def judge_pair_with_llm(
     use_llm: bool = True,
 ) -> LLMJudgement:
     """调用 DeepSeek 大模型进行重复判定"""
-    if not use_llm or not settings.deepseek_api_key:
-        logger.warning("DEEPSEEK_API_KEY not set, falling back to rule-based judge")
+    if not use_llm:
         return _fallback_judge(left_name, left_description, right_name, right_description, similarity)
+    if not settings.deepseek_api_key:
+        raise ValueError("重复建设检查需要大模型，但后端未配置 DEEPSEEK_API_KEY")
 
     prompt = _build_judge_prompt(
         left_name, left_description,
@@ -50,8 +51,8 @@ def judge_pair_with_llm(
         response = _call_deepseek_api(prompt)
         return _parse_llm_response(response)
     except Exception as e:
-        logger.error(f"LLM judgement failed: {e}, falling back to rule-based judge")
-        return _fallback_judge(left_name, left_description, right_name, right_description, similarity)
+        logger.exception("重复建设大模型判定失败")
+        raise ValueError(f"重复建设大模型判定失败：{e}") from e
 
 
 def _build_judge_prompt(
@@ -100,30 +101,39 @@ def _call_deepseek_api(prompt: str) -> str:
     }
     payload = {
         "model": settings.deepseek_model,
-        "messages": [
-            {
-                "role": "system",
-                "content": "你是政府信息化项目可研重复建设审查助手。只输出合法 JSON，不输出推理过程、Markdown 或解释文字。",
-            },
-            {
-                "role": "user",
-                "content": prompt,
-            }
-        ],
+        "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.1,
-        "max_tokens": min(settings.duplicate_llm_max_tokens, 4096),
+        # Keep enough of the output budget for the required JSON response.
+        "reasoning_effort": "low",
+        "max_tokens": settings.duplicate_llm_max_tokens,
         "response_format": {"type": "json_object"},
     }
 
     timeout = settings.duplicate_llm_timeout_seconds
-    response = requests.post(url, headers=headers, json=payload, timeout=timeout)
+    response = _post_with_retry(url, headers, payload, timeout)
     if response.status_code in {400, 422}:
         payload.pop("response_format", None)
-        response = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        response = _post_with_retry(url, headers, payload, timeout)
     response.raise_for_status()
 
     data = response.json()
     return _extract_message_text(data)
+
+
+def _post_with_retry(url: str, headers: dict[str, str], payload: dict, timeout: int):
+    response = None
+    for attempt in range(3):
+        try:
+            response = post_direct(url, headers=headers, json=payload, timeout=timeout)
+            if response.status_code not in {408, 429, 500, 502, 503, 504}:
+                return response
+        except Exception:
+            if attempt == 2:
+                raise
+        if attempt < 2:
+            time.sleep(2**attempt)
+    assert response is not None
+    return response
 
 
 def _parse_llm_response(response: str) -> LLMJudgement:
@@ -145,7 +155,7 @@ def _parse_llm_response(response: str) -> LLMJudgement:
             severity=severity_map[label],
             reason=reason or "LLM 判定",
             suggestion=suggestion or None,
-            model_name="deepseek",
+            model_name=settings.deepseek_model,
         )
     except (json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as e:
         logger.error(f"Failed to parse LLM response: {e}, response: {response}")
@@ -182,7 +192,7 @@ def _normalize_label(value: str) -> str:
         return "高度相似"
     if text in {"无关", "不重复", "相似但不重复"}:
         return "无关"
-    return "无关"
+    raise ValueError(f"大模型返回了无法识别的重复建设判定：{text}")
 
 
 def _fallback_judge(

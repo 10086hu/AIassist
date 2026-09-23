@@ -59,6 +59,30 @@ def test_one_real_task_produces_one_visible_report(database, tmp_path):
     assert runs[0]['results'][0]['findings_count'] == expected
 
 
+def test_failed_module_still_produces_visible_failure_record(database, tmp_path):
+    report = tmp_path / '失败报告.docx'
+    report.write_bytes(b'not-a-real-docx')
+    factory = sessionmaker(bind=database.bind)
+    with (
+        patch.object(evaluate, 'SessionLocal', factory),
+        patch.object(evaluate, '_run_module_check', side_effect=RuntimeError('模型输出被截断')),
+        patch.object(evaluate, 'get_llm_status', return_value={'model': 'DeepSeek-V4-Flash'}),
+    ):
+        evaluate._run_evaluate_task(
+            'failed-module-record', str(report), report.name, None, None,
+            '失败记录项目', None, ['duplicate'], 'local', True, None,
+        )
+
+    task = evaluate.TASKS.pop('failed-module-record')
+    assert task['status'] == 'failed'
+    assert len(task['result_ids']) == 1
+    aggregate = database.scalar(select(CheckResult).where(CheckResult.check_subtype == 'aggregate'))
+    payload = json.loads(aggregate.reference_data)['result']
+    assert payload['status'] == 'failed'
+    assert payload['summary']['failure_reason'] == '模型输出被截断'
+    assert payload['model_name'] == 'DeepSeek-V4-Flash'
+
+
 def test_legacy_aggregate_survives_and_detail_rows_are_hidden(database):
     project = Project(name='历史项目')
     visible = row(project, count=2)

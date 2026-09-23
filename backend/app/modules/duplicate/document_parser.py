@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from io import BytesIO
 from typing import List, Optional
 from docx import Document
@@ -16,11 +16,20 @@ class DocumentSection:
 
 
 @dataclass(frozen=True)
+class DocumentSourceBlock:
+    text: str
+    paragraph: int
+    line: int
+    section: str = ""
+
+
+@dataclass(frozen=True)
 class DocumentContent:
     format: str  # "docx"
     raw_text: str
     sections: List[DocumentSection]
     filename: str
+    source_blocks: List[DocumentSourceBlock] = field(default_factory=list)
 
 
 def parse_document(content: bytes, filename: str) -> DocumentContent:
@@ -82,7 +91,58 @@ def _parse_docx(content: bytes, filename: str) -> DocumentContent:
         raw_text=raw_text,
         sections=sections,
         filename=filename,
+        source_blocks=_extract_docx_source_blocks(doc),
     )
+
+
+def _extract_docx_source_blocks(doc: Document) -> list[DocumentSourceBlock]:
+    """Build locations with the same paragraph/line numbering as the preview."""
+    from docx.oxml.table import CT_Tbl
+    from docx.oxml.text.paragraph import CT_P
+    from docx.table import Table, _Cell
+    from docx.text.paragraph import Paragraph
+
+    blocks: list[DocumentSourceBlock] = []
+    paragraph_index = 0
+    line_index = 0
+    current_section = ""
+
+    def register(text: str) -> tuple[int, int]:
+        nonlocal paragraph_index, line_index
+        paragraph_index += 1
+        if text.strip():
+            line_index += 1
+        return paragraph_index, line_index if text.strip() else 0
+
+    for child in doc.element.body.iterchildren():
+        if isinstance(child, CT_P):
+            paragraph = Paragraph(child, doc)
+            text = paragraph.text.strip()
+            location = register(text)
+            style_name = str(getattr(paragraph.style, "name", "") or "").lower()
+            if text and ("heading" in style_name or "标题" in style_name):
+                current_section = text
+            if text:
+                blocks.append(DocumentSourceBlock(text, location[0], location[1], current_section))
+        elif isinstance(child, CT_Tbl):
+            table = Table(child, doc)
+            for row_xml in child.tr_lst:
+                row_texts: list[str] = []
+                row_locations: list[tuple[int, int]] = []
+                for cell_xml in row_xml.tc_lst:
+                    cell = _Cell(cell_xml, table)
+                    cell_parts: list[str] = []
+                    for paragraph in cell.paragraphs:
+                        text = paragraph.text.strip()
+                        row_locations.append(register(text))
+                        if text:
+                            cell_parts.append(text)
+                    if cell_parts:
+                        row_texts.append(" ".join(cell_parts))
+                if row_texts:
+                    first = next((item for item in row_locations if item[1] > 0), row_locations[0])
+                    blocks.append(DocumentSourceBlock(" ".join(row_texts), first[0], first[1], current_section))
+    return blocks
 
 
 def _extract_docx_table_text(doc: Document) -> list[str]:

@@ -58,6 +58,14 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+try:
+    from app.core.direct_http import urlopen_direct
+except ImportError:
+    _DIRECT_URL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def urlopen_direct(request: urllib.request.Request, *, timeout: int):
+        return _DIRECT_URL_OPENER.open(request, timeout=timeout)
+
 
 # ============================================================
 # 1. 数据结构
@@ -1107,13 +1115,19 @@ def merge_duplicate_findings(findings: List[SensitiveFinding]) -> List[Sensitive
 def deepseek_review_finding(
     finding: SensitiveFinding,
     api_key: Optional[str] = None,
-    model: str = "deepseek-chat",
-    api_url: str = "https://api.deepseek.com/v1/chat/completions",
+    model: Optional[str] = None,
+    api_url: Optional[str] = None,
     timeout: int = 20,
 ) -> Optional[Dict[str, Any]]:
     api_key = api_key or os.getenv("DEEPSEEK_API_KEY")
     if not api_key:
         return None
+    model = model or os.getenv("DEEPSEEK_MODEL", "DeepSeek-V4-Flash")
+    api_url = api_url or (
+        os.getenv("DEEPSEEK_API_BASE_URL")
+        or os.getenv("DEEPSEEK_API_URL")
+        or "https://api.deepseek.com/v1"
+    ).rstrip("/") + "/chat/completions"
 
     system_prompt = (
         "你是可研报告审查辅助系统中的敏感词检查模块。"
@@ -1157,7 +1171,7 @@ def deepseek_review_finding(
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urlopen_direct(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         content = data["choices"][0]["message"]["content"]
         return extract_json_object(content)

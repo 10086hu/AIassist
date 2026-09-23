@@ -28,6 +28,8 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Optional
 
+from app.core.direct_http import urlopen_direct
+
 try:
     # 正式放入后端项目时，推荐路径是 backend/app/core/llm_client.py。
     # 这种情况下可以直接读取 app.core.config 中的统一配置。
@@ -39,7 +41,7 @@ except ImportError:
     class _EnvironmentSettings:
         deepseek_api_key = os.getenv("DEEPSEEK_API_KEY")
         deepseek_api_url = os.getenv("DEEPSEEK_API_URL", "https://api.deepseek.com/v1")
-        deepseek_model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+        deepseek_model = os.getenv("DEEPSEEK_MODEL", "DeepSeek-V4-Flash")
 
     settings = _EnvironmentSettings()
 
@@ -103,7 +105,7 @@ class LLMClient:
     1. 初始化 LLMClient 时显式传入的 api_key/base_url/model。
     2. 通用环境变量 LLM_API_KEY、LLM_BASE_URL、LLM_MODEL。
     3. DeepSeek 环境变量或项目 settings：DEEPSEEK_API_KEY、DEEPSEEK_API_URL、DEEPSEEK_MODEL。
-    4. 默认地址 https://api.deepseek.com/v1 和默认模型 deepseek-chat。
+    4. 默认地址 https://api.deepseek.com/v1 和默认模型 DeepSeek-V4-Flash。
     """
 
     def __init__(
@@ -136,13 +138,13 @@ class LLMClient:
             or "https://api.deepseek.com/v1"
         )
 
-        # deepseek-chat 是通用对话模型；如果后续需要换模型，只改环境变量即可。
+        # 模型名称统一从环境变量读取；当前默认使用 DeepSeek-V4-Flash。
         resolved_model = (
             model
             or os.getenv("LLM_MODEL")
             or getattr(settings, "deepseek_model", None)
             or os.getenv("DEEPSEEK_MODEL")
-            or "deepseek-chat"
+            or "DeepSeek-V4-Flash"
         )
 
         self.config = LLMConfig(
@@ -268,7 +270,7 @@ class LLMClient:
         for attempt in range(self.config.max_retries + 1):
             request = urllib.request.Request(url, data=payload, headers=headers, method="POST")
             try:
-                with urllib.request.urlopen(request, timeout=self.config.timeout) as response:
+                with urlopen_direct(request, timeout=self.config.timeout) as response:
                     raw = response.read().decode("utf-8")
                     data = json.loads(raw)
                     if not isinstance(data, dict):

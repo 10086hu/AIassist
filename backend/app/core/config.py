@@ -30,7 +30,7 @@ class Settings:
     embedding_dim: int = int(os.getenv("EMBEDDING_DIM", "384"))
     deepseek_api_key: str = os.getenv("DEEPSEEK_API_KEY", "")
     deepseek_api_url: str = os.getenv("DEEPSEEK_API_URL", "https://api.deepseek.com/v1")
-    deepseek_model: str = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+    deepseek_model: str = os.getenv("DEEPSEEK_MODEL", "DeepSeek-V4-Flash")
     rule_api_base_url: str = os.getenv(
         "RULE_API_BASE_URL",
         "https://decree-tapering-that.ngrok-free.dev/rules",

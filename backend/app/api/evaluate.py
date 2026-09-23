@@ -221,7 +221,16 @@ def evaluate_result_source(result_id: str, source_id: str, db: Session = Depends
 
 
 @router.get("/results/{result_id}/sources/{source_id}/preview")
-def evaluate_result_source_preview(result_id: str, source_id: str, db: Session = Depends(get_db)) -> Response:
+def evaluate_result_source_preview(
+    result_id: str,
+    source_id: str,
+    page: int = 1,
+    quote: str = "",
+    paragraph: int = 0,
+    line: int = 0,
+    section: str = "",
+    db: Session = Depends(get_db),
+) -> Response:
     """Render a source inside the desktop review pane while retaining the original download endpoint."""
     artifact = (
         db.query(SourceArtifact)
@@ -238,7 +247,10 @@ def evaluate_result_source_preview(result_id: str, source_id: str, db: Session =
     if suffix == ".docx":
         try:
             return HTMLResponse(
-                content=_render_docx_preview(artifact.content, artifact.filename),
+                content=_render_docx_preview(
+                    artifact.content, artifact.filename, page=page,
+                    quote=quote, paragraph=paragraph, line=line, section=section,
+                ),
                 headers={"Cache-Control": "no-store"},
             )
         except Exception as exc:
@@ -273,7 +285,7 @@ async def evaluate_duplicate_internal(
     content = await _read_upload(file, DUPLICATE_EXTENSIONS)
 
     try:
-        return _run_duplicate_module(db, content, filename, project_id, project_name, department, use_llm=use_llm)
+        return _run_duplicate_module(db, content, filename, project_id, project_name, department, use_llm=True)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -309,7 +321,7 @@ async def evaluate_duplicate_compare(
             department=department,
             current_stage=current_stage,
             history_stages=_parse_history_stages(history_stages),
-            use_llm=use_llm,
+            use_llm=True,
         )
         normalized = _attach_finding_locations(_normalize_duplicate_result(raw), current_content, current_filename)
         project = db.get(Project, raw.project.id)
@@ -796,6 +808,7 @@ def _run_evaluate_task(
 ) -> None:
     db = SessionLocal()
     result_ids: list[str] = []
+    successful_result_count = 0
     task_errors: list[str] = []
     task_context: dict[str, Any] = {}
     try:
@@ -861,14 +874,55 @@ def _run_evaluate_task(
                 )
                 db.commit()
                 result_ids.append(result_id)
+                successful_result_count += 1
                 llm_status = str(summary.get("llm_status") or "")
                 if llm_status in {"partial", "timeout"}:
                     task_errors.append(f"{_module_display_name(module)}: {llm_status}")
             except Exception as exc:
                 db.rollback()
-                task_errors.append(f"{_module_display_name(module)}: {exc}")
+                error_message = str(exc)
+                task_errors.append(f"{_module_display_name(module)}: {error_message}")
+                failure_result = {
+                    "module_code": module,
+                    "module_name": _module_display_name(module),
+                    "status": "failed",
+                    "summary": {
+                        "total_findings": 0,
+                        "risk_count": {},
+                        "failure_reason": error_message,
+                    },
+                    "findings": [],
+                    "rules_used": [],
+                    "model_name": (
+                        str(get_llm_status().get("model") or "")
+                        if module == "duplicate"
+                        else "local-python-checker"
+                    ),
+                    "notices": [f"{_module_display_name(module)}失败：{error_message}"],
+                }
+                try:
+                    result_id = _store_check_result(
+                        db=db,
+                        project=project,
+                        module=module,
+                        result=failure_result,
+                        severity="需人工确认",
+                        suggestion="请检查模型服务和报告内容后重新执行该模块。",
+                        check_run_id=check_run.id,
+                        report_name=original_filename,
+                    )
+                    _store_current_source_artifact(
+                        db=db,
+                        result_id=result_id,
+                        content=Path(temp_path).read_bytes(),
+                        filename=original_filename,
+                    )
+                    db.commit()
+                    result_ids.append(result_id)
+                except Exception:
+                    db.rollback()
 
-        if not result_ids:
+        if successful_result_count == 0:
             check_run.status = "failed"
             db.commit()
             _set_task(
@@ -877,7 +931,7 @@ def _run_evaluate_task(
                 progress=100,
                 stage="failed",
                 message="检测失败",
-                result_ids=[],
+                result_ids=result_ids,
                 error="; ".join(task_errors),
             )
             return
@@ -986,7 +1040,7 @@ def _run_module_check(
             project_id=project.id,
             project_name=project_name,
             department=department,
-            use_llm=use_llm,
+            use_llm=True,
         )
         return _normalize_duplicate_result(raw)
 
@@ -1549,18 +1603,29 @@ def _store_result_source_artifact(
     _store_current_source_artifact(db, result_id, content, filename)
 
 
-def _render_docx_preview(content: bytes, filename: str) -> str:
+def _render_docx_preview(
+    content: bytes, filename: str, *, page: int = 1, quote: str = "",
+    paragraph: int = 0, line: int = 0, section: str = "",
+) -> str:
     from docx import Document
     from docx.oxml.ns import qn
     from docx.oxml.table import CT_Tbl
     from docx.oxml.text.paragraph import CT_P
-    from docx.table import Table
+    from docx.table import Table, _Cell
     from docx.text.paragraph import Paragraph
 
     document = Document(io.BytesIO(content))
-    blocks: list[str] = []
+    page_size = 80
+    blocks: list[tuple[str, Any, str, list[tuple[int, int]]]] = []
     paragraph_index = 0
     line_index = 0
+
+    def register_paragraph(value: Any) -> tuple[int, int]:
+        nonlocal paragraph_index, line_index
+        paragraph_index += 1
+        if value.text.strip():
+            line_index += 1
+        return paragraph_index, line_index if value.text.strip() else 0
 
     def render_run(run: Any) -> str:
         value = html.escape(run.text or "").replace("\n", "<br>")
@@ -1580,12 +1645,9 @@ def _render_docx_preview(content: bytes, filename: str) -> str:
             images.append(f'<img src="data:{part.content_type};base64,{encoded}" alt="文档图片">')
         return value + "".join(images)
 
-    def render_paragraph(paragraph: Any) -> str:
-        nonlocal paragraph_index, line_index
-        paragraph_index += 1
+    def render_paragraph(paragraph: Any, location: tuple[int, int], targeted: bool = False) -> str:
+        paragraph_index, line_index = location
         raw_text = paragraph.text.strip()
-        if raw_text:
-            line_index += 1
         body = "".join(render_run(run) for run in paragraph.runs)
         if not body and not raw_text:
             body = "&nbsp;"
@@ -1598,26 +1660,68 @@ def _render_docx_preview(content: bytes, filename: str) -> str:
         elif "heading" in style_name or "标题" in style_name:
             tag = "h3"
         return (
-            f'<{tag} class="source-block" data-paragraph="{paragraph_index}" '
-            f'data-line="{line_index if raw_text else 0}" data-text="{html.escape(raw_text, quote=True)}">'
+            f'<{tag} class="source-block{" source-target" if targeted else ""}" data-paragraph="{paragraph_index}" '
+            f'data-line="{line_index}" data-text="{html.escape(raw_text, quote=True)}">'
             f"{body}</{tag}>"
         )
 
     for child in document.element.body.iterchildren():
         if isinstance(child, CT_P):
-            blocks.append(render_paragraph(Paragraph(child, document)))
+            paragraph_obj = Paragraph(child, document)
+            blocks.append(("paragraph", paragraph_obj, paragraph_obj.text.strip(), [register_paragraph(paragraph_obj)]))
         elif isinstance(child, CT_Tbl):
             table = Table(child, document)
-            rows: list[str] = []
-            for row in table.rows:
-                cells: list[str] = []
-                for cell in row.cells:
-                    cell_html = "".join(render_paragraph(paragraph) for paragraph in cell.paragraphs)
-                    cells.append(f'<td class="source-block table-cell" data-text="{html.escape(cell.text.strip(), quote=True)}">{cell_html}</td>')
-                rows.append(f"<tr>{''.join(cells)}</tr>")
-            blocks.append(f'<table class="document-table"><tbody>{"".join(rows)}</tbody></table>')
+            for row_xml in child.tr_lst:
+                row_cells = []
+                locations = []
+                texts = []
+                for cell_xml in row_xml.tc_lst:
+                    cell = _Cell(cell_xml, table)
+                    paragraphs = cell.paragraphs
+                    row_cells.append((cell, paragraphs))
+                    locations.extend(register_paragraph(p) for p in paragraphs)
+                    texts.append(" ".join(p.text.strip() for p in paragraphs))
+                blocks.append(("row", row_cells, " ".join(texts), locations))
 
-    return _source_preview_page(filename, "".join(blocks))
+    def normalized(value: str) -> str:
+        return re.sub(r"[\s，。；：、“”‘’（）()]", "", value or "").lower()
+
+    target_index: int | None = None
+    # Paragraph and line are occurrence-specific. Quotes can legitimately be
+    # repeated, so only use text matching as a fallback.
+    if paragraph > 0:
+        target_index = next((i for i, block in enumerate(blocks) if any(p == paragraph for p, _ in block[3])), None)
+    if target_index is None and line > 0:
+        target_index = next((i for i, block in enumerate(blocks) if any(n == line for _, n in block[3])), None)
+    if target_index is None:
+        for candidate in (quote, section):
+            needle = normalized(candidate)[:120]
+            if len(needle) < 2:
+                continue
+            target_index = next((i for i, block in enumerate(blocks) if needle in normalized(block[2])), None)
+            if target_index is not None:
+                break
+
+    total_pages = max(1, (len(blocks) + page_size - 1) // page_size)
+    current_page = target_index // page_size + 1 if target_index is not None else max(1, min(page, total_pages))
+    start = (current_page - 1) * page_size
+    rendered: list[str] = []
+    for index in range(start, min(start + page_size, len(blocks))):
+        kind, item, _, locations = blocks[index]
+        targeted = index == target_index
+        if kind == "paragraph":
+            rendered.append(render_paragraph(item, locations[0], targeted))
+        else:
+            cells: list[str] = []
+            location_iter = iter(locations)
+            for cell, paragraphs in item:
+                cell_html = "".join(render_paragraph(p, next(location_iter)) for p in paragraphs)
+                cell_text = " ".join(p.text.strip() for p in paragraphs)
+                cells.append(f'<td class="source-block table-cell" data-text="{html.escape(cell_text, quote=True)}">{cell_html}</td>')
+            row_class = ' class="source-block source-target"' if targeted else ""
+            rendered.append(f'<table class="document-table"><tbody><tr{row_class}>{"".join(cells)}</tr></tbody></table>')
+
+    return _source_preview_page(filename, "".join(rendered), current_page, total_pages)
 
 
 def _render_plain_source_preview(content: bytes, filename: str) -> str:
@@ -1631,8 +1735,13 @@ def _render_plain_source_preview(content: bytes, filename: str) -> str:
     return _source_preview_page(filename, "".join(blocks))
 
 
-def _source_preview_page(filename: str, body: str) -> str:
+def _source_preview_page(filename: str, body: str, page: int = 1, total_pages: int = 1) -> str:
     safe_title = html.escape(filename)
+    navigation = ""
+    if total_pages > 1:
+        previous = f'<a href="?page={page - 1}">上一页</a>' if page > 1 else ""
+        following = f'<a href="?page={page + 1}">下一页</a>' if page < total_pages else ""
+        navigation = f'<nav class="page-nav">{previous}<span>第 {page} / {total_pages} 页</span>{following}</nav>'
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -1644,6 +1753,8 @@ def _source_preview_page(filename: str, body: str) -> str:
   html {{ scroll-behavior: smooth; background: #eef2f7; }}
   body {{ margin: 0; color: #172033; font-family: "Microsoft YaHei", "Segoe UI", sans-serif; }}
   .paper {{ width: min(920px, calc(100% - 32px)); min-height: calc(100vh - 32px); margin: 16px auto; padding: 54px 60px 72px; background: white; box-shadow: 0 2px 14px rgba(15,23,42,.12); }}
+  .page-nav {{ display: flex; justify-content: center; gap: 24px; padding: 12px; background: #f8fafc; }}
+  .page-nav a {{ color: #1d4ed8; }}
   p {{ margin: 0 0 12px; font-size: 15px; line-height: 1.8; white-space: pre-wrap; }}
   h1, h2, h3 {{ margin: 22px 0 12px; line-height: 1.45; letter-spacing: 0; }}
   h1 {{ font-size: 24px; }} h2 {{ font-size: 20px; }} h3 {{ font-size: 17px; }}
@@ -1658,24 +1769,26 @@ def _source_preview_page(filename: str, body: str) -> str:
 </style>
 </head>
 <body>
-<main class="paper">{body}</main>
+{navigation}<main class="paper">{body}</main>{navigation}
 <div id="location-note" class="location-note">已定位到审查依据原文</div>
 <script>
+  window.addEventListener('load', () => document.querySelector('.source-target')?.scrollIntoView({{ block: 'center' }}));
   const normalize = value => (value || '').replace(/\\s+/g, '').replace(/[，。；：、“”‘’（）()]/g, '').toLowerCase();
   window.locateSource = function(quote, paragraph, line, section) {{
     const blocks = Array.from(document.querySelectorAll('.source-block'));
     blocks.forEach(block => block.classList.remove('source-target'));
     const candidates = [quote, section].map(normalize).filter(value => value.length >= 2);
-    let target = null;
-    for (const candidate of candidates) {{
-      target = blocks.find(block => {{
-        const value = normalize(block.dataset.text || block.innerText);
-        return value.includes(candidate) || (value.length >= 8 && candidate.includes(value));
-      }});
-      if (target) break;
-    }}
-    if (!target && paragraph) target = document.querySelector(`[data-paragraph="${{paragraph}}"]`);
+    let target = paragraph ? document.querySelector(`[data-paragraph="${{paragraph}}"]`) : null;
     if (!target && line) target = document.querySelector(`[data-line="${{line}}"]`);
+    if (!target) {{
+      for (const candidate of candidates) {{
+        target = blocks.find(block => {{
+          const value = normalize(block.dataset.text || block.innerText);
+          return value.includes(candidate) || (value.length >= 8 && candidate.includes(value));
+        }});
+        if (target) break;
+      }}
+    }}
     if (!target) return false;
     target.classList.add('source-target');
     target.scrollIntoView({{ behavior: 'smooth', block: 'center' }});

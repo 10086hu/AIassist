@@ -18,7 +18,6 @@ from app.modules.duplicate.llm_judge import judge_pair_with_llm
 from app.schemas import DuplicateInternalResponse, DuplicatePairOut, ProjectOut
 
 
-MAX_LOCAL_DOCUMENT_CHARS = 300_000
 MAX_DUPLICATE_POINTS = 120
 MAX_CANDIDATE_PAIRS = 2_000
 
@@ -92,7 +91,10 @@ def run_duplicate_check_from_document(
     doc_content = parse_document(content, filename)
 
     # 2. LLM 提取功能点
-    extracted_points = _parse_document_function_points(doc_content, project_name, use_llm=use_llm)
+    extracted_points = _annotate_document_points(
+        _parse_document_function_points(doc_content, project_name, use_llm=use_llm),
+        doc_content,
+    )
 
     # 3. 复用现有流程处理功能点
     return _process_function_points(
@@ -265,7 +267,14 @@ def _process_function_points(
         })
         for point in parsed_points
     }
-    candidates = _find_candidate_pairs(points)
+    candidates = [
+        candidate
+        for candidate in _find_candidate_pairs(points)
+        if not _same_source_occurrence(
+            locations_by_row.get(candidate.left.row_index, {}),
+            locations_by_row.get(candidate.right.row_index, {}),
+        )
+    ]
     db.execute(
         delete(CheckResult).where(
             CheckResult.project_id == project.id,
@@ -440,10 +449,10 @@ def _parse_document_function_points(
     project_context: str,
     use_llm: bool = True,
 ) -> list[ParsedFunctionPoint]:
+    if use_llm:
+        return _limit_function_points(extract_function_points(doc_content, project_context=project_context))
     section_points = _extract_function_sections(doc_content)
-    if len(section_points) >= 3 or len(doc_content.raw_text) > MAX_LOCAL_DOCUMENT_CHARS or not use_llm:
-        return _limit_function_points(section_points or _extract_local_paragraph_points(doc_content))
-    return _limit_function_points(extract_function_points(doc_content, project_context=project_context))
+    return _limit_function_points(section_points or _extract_local_paragraph_points(doc_content))
 
 
 def _extract_local_paragraph_points(doc_content: DocumentContent) -> list[ParsedFunctionPoint]:
@@ -475,46 +484,101 @@ def _annotate_document_points(
     points: list[ParsedFunctionPoint],
     document: DocumentContent,
 ) -> list[ParsedFunctionPoint]:
-    """Map extracted function points back to their source line/page and quote."""
-    lines = [line.strip() for line in document.raw_text.splitlines() if line.strip()]
+    """Map each extracted occurrence to its own paragraph in the source file."""
+    blocks = list(document.source_blocks)
+    if not blocks:
+        from app.modules.duplicate.document_parser import DocumentSourceBlock
+        blocks = [
+            DocumentSourceBlock(text=line.strip(), paragraph=index, line=index)
+            for index, line in enumerate(document.raw_text.splitlines(), start=1)
+            if line.strip()
+        ]
+
     output: list[ParsedFunctionPoint] = []
+    used_by_signature: dict[str, set[int]] = {}
+    last_by_signature: dict[str, int] = {}
     for point in points:
         existing = dict(point.source_location or {})
-        match_index = None
-        match_line = ""
-        for index, line in enumerate(lines, start=1):
-            if point.name and point.name in line:
-                match_index, match_line = index, line
-                break
-        if match_index is None:
-            description_token = (point.description or "").strip()[:30]
-            if description_token:
-                for index, line in enumerate(lines, start=1):
-                    if description_token in line:
-                        match_index, match_line = index, line
-                        break
+        source_quote = str(existing.get("quote") or "")
+        extraction_section = str(existing.get("extraction_section") or "")
+        signature = _location_normalize(point.name) or _location_normalize(source_quote)
+        used = used_by_signature.setdefault(signature, set())
+        scored = [
+            (_source_block_score(point, source_quote, extraction_section, block), index, block)
+            for index, block in enumerate(blocks)
+        ]
+        candidates = [item for item in scored if item[0] >= 24 and item[1] not in used]
+        match = None
+        if candidates:
+            previous = last_by_signature.get(signature, -1)
+            forward = [item for item in candidates if item[1] > previous]
+            pool = forward or candidates
+            match = max(pool, key=lambda item: (item[0], -item[1]))
 
-        section = next(
-            (item for item in document.sections if point.name and point.name in item.content),
-            None,
-        )
         existing.update({
             "file_name": document.filename,
             "file_type": document.format,
-            "precision": "line" if match_index is not None else "document",
+            "precision": "paragraph" if match is not None else "document",
         })
-        if match_index is not None:
-            existing.update({"line_start": match_index, "line_end": match_index, "quote": match_line[:500]})
-        if section is not None:
-            existing.setdefault("section", section.title)
-            if section.page_no is not None:
-                existing.setdefault("page", section.page_no)
-            if section.start_line:
-                existing.setdefault("section_line_start", section.start_line)
-            if section.end_line:
-                existing.setdefault("section_line_end", section.end_line)
+        if match is not None:
+            _, block_index, block = match
+            used.add(block_index)
+            last_by_signature[signature] = block_index
+            existing.update({
+                "paragraph": block.paragraph,
+                "line_start": block.line,
+                "line_end": block.line,
+                "quote": block.text[:500],
+            })
+            if block.section:
+                existing["section"] = block.section
         output.append(replace(point, source_location=existing))
     return output
+
+
+def _location_normalize(value: str) -> str:
+    return re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "", value or "").lower()
+
+
+def _source_block_score(
+    point: ParsedFunctionPoint,
+    source_quote: str,
+    extraction_section: str,
+    block: Any,
+) -> float:
+    block_text = _location_normalize(block.text)
+    if not block_text:
+        return 0.0
+
+    score = 0.0
+    quote = _location_normalize(source_quote)
+    name = _location_normalize(point.name)
+    description = _location_normalize(point.description)
+    if quote and (quote in block_text or block_text in quote):
+        score += 120.0 + min(len(quote), len(block_text)) / max(len(quote), len(block_text)) * 20.0
+    if name and name in block_text:
+        score += 65.0 + min(15.0, len(name))
+    if description:
+        score += _character_overlap(description, block_text) * 45.0
+    section = _location_normalize(getattr(block, "section", ""))
+    if section and section in _location_normalize(extraction_section):
+        score += 12.0
+    if point.category and _location_normalize(point.category) in section:
+        score += 8.0
+    return score
+
+
+def _character_overlap(left: str, right: str) -> float:
+    def grams(value: str) -> set[str]:
+        if len(value) < 2:
+            return {value} if value else set()
+        return {value[index:index + 2] for index in range(len(value) - 1)}
+
+    left_grams = grams(left)
+    right_grams = grams(right)
+    if not left_grams or not right_grams:
+        return 0.0
+    return len(left_grams & right_grams) / min(len(left_grams), len(right_grams))
 
 
 def _extract_function_sections(doc_content: DocumentContent) -> list[ParsedFunctionPoint]:
@@ -615,6 +679,11 @@ def _find_report_candidate_pairs(points: list[ReportPoint]) -> list[ReportCandid
     candidates: list[ReportCandidatePair] = []
     for left_index in range(len(points)):
         for right_index in range(left_index + 1, len(points)):
+            if _same_source_occurrence(
+                points[left_index].source_location,
+                points[right_index].source_location,
+            ):
+                continue
             similarity = _report_point_similarity(points[left_index], points[right_index])
             if similarity >= settings.duplicate_high_similarity_threshold:
                 candidates.append(
@@ -625,6 +694,19 @@ def _find_report_candidate_pairs(points: list[ReportPoint]) -> list[ReportCandid
                     )
                 )
     return sorted(candidates, key=lambda item: item.similarity, reverse=True)[:MAX_CANDIDATE_PAIRS]
+
+
+def _same_source_occurrence(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    """One paragraph may describe several capabilities; it is not self-duplication."""
+    left_paragraph = left.get("paragraph")
+    right_paragraph = right.get("paragraph")
+    if left_paragraph and right_paragraph:
+        return left_paragraph == right_paragraph
+    left_row = left.get("row_index")
+    right_row = right.get("row_index")
+    if left_row and right_row and left.get("file_name") == right.get("file_name"):
+        return left_row == right_row
+    return False
 
 
 def _find_cross_report_candidate_pairs(
@@ -750,6 +832,7 @@ def _duplicate_pair_highlights(
                 "file_type": location.get("file_type"),
                 "sheet_name": location.get("sheet_name"),
                 "page": location.get("page"),
+                "paragraph": location.get("paragraph"),
                 "line_start": location.get("line_start"),
                 "line_end": location.get("line_end"),
                 "row_index": location.get("row_index"),

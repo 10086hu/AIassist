@@ -9,9 +9,10 @@ import urllib.request
 from typing import Any
 
 from app.core.llm_json import parse_json_object_from_text
+from app.core.direct_http import urlopen_direct
 
 
-DEFAULT_MODEL = "deepseek-v4-flash"
+DEFAULT_MODEL = "DeepSeek-V4-Flash"
 DEFAULT_API_BASE_URL = "https://api.deepseek.com"
 DEFAULT_TIMEOUT_SECONDS = 12
 TRANSPORT = "openai_chat_completions"
@@ -254,7 +255,7 @@ def _post_chat_completion(
         },
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with urlopen_direct(request, timeout=timeout) as response:
         data = json.loads(response.read().decode("utf-8"))
 
     provider_error = _provider_error_detail(data)

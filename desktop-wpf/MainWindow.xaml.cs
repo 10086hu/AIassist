@@ -43,7 +43,6 @@ public partial class MainWindow : Window
     private TextBlock? _documentTitleTextBlock;
     private TextBlock? _documentLocationTextBlock;
     private string? _activePreviewUrl;
-    private string? _activePreviewExtension;
     private readonly Dictionary<string, string> _previewUrlsByRole = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _previewNamesByRole = new(StringComparer.OrdinalIgnoreCase);
     private StackPanel? _rulesDirectoryPanel;
@@ -423,7 +422,7 @@ public partial class MainWindow : Window
         heading.Children.Add(Text("可研报告专项检查", 28, FontWeights.Bold, FindBrush("TextBrush")));
         heading.Children.Add(Text("选择项目、报告和专项检测范围，创建任务并查看进度。", 13, null, FindBrush("MutedBrush"), new Thickness(0, 6, 0, 0), true));
         _specialistPage.Children.Add(heading);
-        _llmReviewCheckBox = new CheckBox { Content = "专项检测启用大模型辅助复核", IsChecked = false, Margin = new Thickness(0, 16, 0, 0) };
+        _llmReviewCheckBox = new CheckBox { Content = "其他专项检测启用大模型辅助复核（重复建设检查始终使用大模型）", IsChecked = false, Margin = new Thickness(0, 16, 0, 0) };
         Grid.SetRow(_llmReviewCheckBox, 3);
         _specialistPage.Children.Add(_llmReviewCheckBox);
         for (var i = 0; i < specialistContent.Length; i++)
@@ -897,6 +896,16 @@ public partial class MainWindow : Window
             DefaultBackgroundColor = System.Drawing.Color.FromArgb(238, 242, 247),
             Margin = new Thickness(1, 0, 1, 1)
         };
+        _documentWebView.NavigationCompleted += (_, args) =>
+        {
+            if (string.IsNullOrWhiteSpace(_activePreviewUrl) || _documentLocationTextBlock == null)
+            {
+                return;
+            }
+            _documentLocationTextBlock.Text = args.IsSuccess
+                ? "原文已加载，可翻页查看定位内容。"
+                : "原文加载失败，请重试。";
+        };
         Grid.SetRow(_documentWebView, 1);
         grid.Children.Add(_documentWebView);
         _ = ShowPreviewPlaceholderAsync("选择一条审查结果后，可在这里查看并定位完整原文。");
@@ -1006,7 +1015,7 @@ public partial class MainWindow : Window
         }));
         _llmApiKeyBox = new PasswordBox { Style = (Style)FindResource("PasswordInput"), ToolTip = "输入后保存，界面不会回显密钥" };
         _llmBaseUrlBox = Input(GetUserEnvironment("DEEPSEEK_API_BASE_URL", "https://llmapi.tongji.edu.cn/v1"));
-        _llmModelBox = Input(GetUserEnvironment("DEEPSEEK_MODEL", "DeepSeek-R1"));
+        _llmModelBox = Input(GetUserEnvironment("DEEPSEEK_MODEL", "DeepSeek-V4-Flash"));
         _llmConfigStatusTextBlock = Text(
             HasUserApiKey() ? "当前用户密钥已配置（已隐藏）" : "当前用户尚未配置 API Key",
             12,
@@ -1020,7 +1029,7 @@ public partial class MainWindow : Window
         {
             SettingRow("API Key", "留空表示保留现有密钥；输入新值后点击顶部保存设置", _llmApiKeyBox),
             SettingRow("接口地址", "填写到 /v1，不要包含 /chat/completions", _llmBaseUrlBox),
-            SettingRow("模型名称", "例如 DeepSeek-R1 或兼容接口提供的模型名", _llmModelBox),
+            SettingRow("模型名称", "当前网关推荐使用 DeepSeek-V4-Flash", _llmModelBox),
             ActionRow(testLlmButton),
             _llmConfigStatusTextBlock
         }, new Thickness(0, 14, 0, 0)));
@@ -2580,7 +2589,6 @@ public partial class MainWindow : Window
         _activePreviewUrl = BuildBackendUrl(previewPath);
         _previewUrlsByRole["current"] = _activePreviewUrl;
         _previewNamesByRole["current"] = filename;
-        _activePreviewExtension = Path.GetExtension(filename).ToLowerInvariant();
         if (_documentTitleTextBlock != null)
         {
             _documentTitleTextBlock.Text = filename;
@@ -2599,30 +2607,6 @@ public partial class MainWindow : Window
         {
             ResetDocumentPreview($"原文加载失败：{exc.Message}");
         }
-    }
-
-    private async Task SwitchPreviewSourceAsync(string role)
-    {
-        if (_documentWebView == null || !_previewUrlsByRole.TryGetValue(role, out var url))
-        {
-            return;
-        }
-
-        _activePreviewUrl = url;
-        _activePreviewExtension = Path.GetExtension(_previewNamesByRole.GetValueOrDefault(role, "原始报告")).ToLowerInvariant();
-        if (_documentTitleTextBlock != null)
-        {
-            _documentTitleTextBlock.Text = _previewNamesByRole.GetValueOrDefault(role, "原始报告");
-        }
-        if (_documentLocationTextBlock != null)
-        {
-            _documentLocationTextBlock.Text = role.Equals("related", StringComparison.OrdinalIgnoreCase)
-                ? "关联 Word 原文预览"
-                : "Word 完整原文预览";
-        }
-        await _documentWebView.EnsureCoreWebView2Async();
-        _documentWebView.Source = new Uri(url);
-        await Task.Delay(120);
     }
 
     private async Task NavigateToFindingAsync(JsonElement finding, string? preferredRole = null)
@@ -2696,15 +2680,22 @@ public partial class MainWindow : Window
                 && _previewUrlsByRole.TryGetValue(requestedRole, out var requestedUrl)
                 && !string.Equals(_activePreviewUrl, requestedUrl, StringComparison.OrdinalIgnoreCase))
             {
-                await SwitchPreviewSourceAsync(requestedRole);
+                _activePreviewUrl = requestedUrl;
+                if (_documentTitleTextBlock != null)
+                {
+                    _documentTitleTextBlock.Text = _previewNamesByRole.GetValueOrDefault(requestedRole, "原始报告");
+                }
             }
-            var script = $"window.locateSource({JsonSerializer.Serialize(quote)}, {paragraph}, {line}, {JsonSerializer.Serialize(section)})";
-            var result = await _documentWebView.ExecuteScriptAsync(script);
+            var locationUrl = new UriBuilder(_activePreviewUrl)
+            {
+                Query = $"quote={Uri.EscapeDataString(quote.Length > 300 ? quote[..300] : quote)}"
+                    + $"&paragraph={paragraph}&line={line}"
+                    + $"&section={Uri.EscapeDataString(section.Length > 120 ? section[..120] : section)}"
+            };
+            _documentWebView.Source = locationUrl.Uri;
             if (_documentLocationTextBlock != null)
             {
-                _documentLocationTextBlock.Text = result.Contains("true", StringComparison.OrdinalIgnoreCase)
-                    ? "已定位并高亮对应原文"
-                    : "未匹配到完整摘录，已保留章节或最近原文位置";
+                _documentLocationTextBlock.Text = "正在加载对应原文位置...";
             }
         }
         catch (Exception exc)
@@ -2719,7 +2710,6 @@ public partial class MainWindow : Window
     private void ResetDocumentPreview(string message)
     {
         _activePreviewUrl = null;
-        _activePreviewExtension = null;
         _previewUrlsByRole.Clear();
         _previewNamesByRole.Clear();
         if (_documentTitleTextBlock != null)
@@ -3131,7 +3121,7 @@ public partial class MainWindow : Window
         form.Add(new StringContent(string.Empty, Encoding.UTF8), "department");
         form.Add(new StringContent("api", Encoding.UTF8), "rule_source");
         form.Add(new StringContent(ProjectLevelForModule(item.ModuleCode), Encoding.UTF8), "project_level");
-        var useLlm = item.ModuleCode == "security" || _llmReviewCheckBox?.IsChecked == true;
+        var useLlm = item.ModuleCode is "security" or "duplicate" || _llmReviewCheckBox?.IsChecked == true;
         form.Add(new StringContent(useLlm.ToString().ToLowerInvariant(), Encoding.UTF8), "use_llm");
         form.Add(new StringContent(string.Join(",", SelectedRuleIdsForModule(item.ModuleCode)), Encoding.UTF8), "selected_rule_ids");
 
@@ -3162,7 +3152,7 @@ public partial class MainWindow : Window
         form.Add(new StringContent(FirstNonEmpty(_selectedProjectName ?? string.Empty, Path.GetFileNameWithoutExtension(currentReportPath)), Encoding.UTF8), "project_name");
         form.Add(new StringContent(string.Empty, Encoding.UTF8), "department");
         form.Add(new StringContent("本期", Encoding.UTF8), "current_stage");
-        form.Add(new StringContent((_llmReviewCheckBox?.IsChecked == true).ToString().ToLowerInvariant()), "use_llm");
+        form.Add(new StringContent("true"), "use_llm");
 
         var streams = new List<FileStream>();
         try
@@ -3338,6 +3328,23 @@ public partial class MainWindow : Window
 
     private bool TryRenderDuplicateFindings(Panel target, JsonElement root)
     {
+        if (string.Equals(GetString(root, "status"), "failed", StringComparison.OrdinalIgnoreCase))
+        {
+            var reason = string.Empty;
+            if (root.TryGetProperty("summary", out var summary) && summary.ValueKind == JsonValueKind.Object)
+            {
+                reason = GetString(summary, "failure_reason");
+            }
+            target.Children.Add(Text(
+                FirstNonEmpty(reason, "重复建设检查未能完成，请检查模型服务后重新执行。"),
+                13,
+                FontWeights.SemiBold,
+                Brush(185, 28, 28),
+                new Thickness(0, 10, 0, 10),
+                true));
+            return true;
+        }
+
         if (!root.TryGetProperty("findings", out var findings)
             || findings.ValueKind != JsonValueKind.Array)
         {
@@ -3420,17 +3427,19 @@ public partial class MainWindow : Window
         AddTextIf(stack, "文档依据", evidence, FindBrush("MutedBrush"));
         AddRevisionAdvice(stack, advice, location);
         AddSourceHighlights(stack, finding);
-        if (string.Equals(GetString(finding, "comparison_type"), "cross_report", StringComparison.OrdinalIgnoreCase))
+        var comparisonType = GetString(finding, "comparison_type");
+        if (!string.IsNullOrWhiteSpace(comparisonType))
         {
             var sourceButtons = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 8, 0, 0) };
-            var currentButton = Button("定位当前报告", false);
+            var isCrossReport = string.Equals(comparisonType, "cross_report", StringComparison.OrdinalIgnoreCase);
+            var currentButton = Button(isCrossReport ? "定位当前报告" : "定位功能点1", false);
             currentButton.Margin = new Thickness(0, 0, 8, 0);
             currentButton.Click += async (_, e) =>
             {
                 e.Handled = true;
                 await NavigateToFindingAsync(findingSnapshot, "current");
             };
-            var relatedButton = Button("定位关联报告", false);
+            var relatedButton = Button(isCrossReport ? "定位关联报告" : "定位功能点2", false);
             relatedButton.Click += async (_, e) =>
             {
                 e.Handled = true;
