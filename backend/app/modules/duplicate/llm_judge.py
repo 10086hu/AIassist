@@ -11,6 +11,7 @@ from app.core.config import settings
 from app.core.direct_http import post_direct
 from app.core.llm_json import parse_json_object_from_text
 from app.modules.duplicate.embeddings import lexical_overlap, normalize_text
+from app.modules.duplicate.execution import remaining_timeout, report_progress
 
 
 logger = logging.getLogger(__name__)
@@ -23,6 +24,12 @@ class LLMJudgement:
     reason: str
     suggestion: Optional[str] = None
     model_name: str = "deepseek"
+    relation: str = ""
+    left_unit: str = ""
+    right_unit: str = ""
+    overlap_scope: str = ""
+    left_evidence: str = ""
+    right_evidence: str = ""
 
 
 def judge_pair_with_llm(
@@ -33,6 +40,8 @@ def judge_pair_with_llm(
     similarity: float,
     context: str = "",
     use_llm: bool = True,
+    left_source: str = "",
+    right_source: str = "",
 ) -> LLMJudgement:
     """调用 DeepSeek 大模型进行重复判定"""
     if not use_llm:
@@ -45,11 +54,16 @@ def judge_pair_with_llm(
         right_name, right_description,
         similarity,
         context,
+        left_source,
+        right_source,
     )
 
     try:
         response = _call_deepseek_api(prompt)
-        return _parse_llm_response(response)
+        judgement = _parse_llm_response(response)
+        return _validate_construction_evidence(
+            judgement, left_source or left_description, right_source or right_description,
+        )
     except Exception as e:
         logger.exception("重复建设大模型判定失败")
         raise ValueError(f"重复建设大模型判定失败：{e}") from e
@@ -62,34 +76,25 @@ def _build_judge_prompt(
     right_description: str,
     similarity: float,
     context: str = "",
+    left_source: str = "",
+    right_source: str = "",
 ) -> str:
     context_text = f"\n【报告关系】\n{context}\n" if context.strip() else ""
-    return f"""你是政府信息化项目可研评审专家。请比较以下两个功能点是否重复建设。
-
-【功能点1】
-名称: {left_name}
-描述: {left_description}
-
-【功能点2】
-名称: {right_name}
-描述: {right_description}
-
-【参考信息】
-语义相似度: {similarity:.2f}
+    return f"""审查软件重复建设，直接输出简短JSON结论。
+功能点1：{left_name}；范围：{left_description}
+左侧原文：{left_source or left_description}
+功能点2：{right_name}；范围：{right_description}
+右侧原文：{right_source or right_description}
 {context_text}
+口径：
+- 必须是两个独立建设单元或不同期的两次建设，且同一服务对象、范围、核心交付重叠。分列拟建模块或本期重建往期已有模块可作为建设证据，不强求分别列出预算。
+- 同一模块在目标、设计、功能清单中的复述不算独立建设；共性能力复用、场景配置、上下级能力、前后步骤、不同服务范围、明确新增能力的合理分期升级不算重复。不能把整条流程赋给每个子功能。
+- 比较名称指向的建设项，不能从邻近的其他模块移借建设证据。双侧证据均须逐字摘录各自提供的原文；证据不足则无关。文本相似度仅用于检索。
+label取重复/高度相似/无关。relation取construction_duplicate/construction_overlap/repeated_description/shared_reuse/process_steps/hierarchy/different_scope/phase_continuation/insufficient_evidence。
+有实质重复用construction_duplicate；有独立建设但具体重叠边界待核实用construction_overlap。
+reason和suggestion各60字以内。unit仅用原文模块名；overlap_scope概括具体重叠能力和对象，60字以内；evidence各取最短的完整证据句，120字以内。无关时只需label、relation、reason。
+输出格式：{{"label":"判定", "relation":"关系", "reason":"理由", "suggestion":"建议", "left_unit":"左建设项", "right_unit":"右建设项", "overlap_scope":"重叠范围", "left_evidence":"左原文", "right_evidence":"右原文"}}"""
 
-判定口径：
-1. 重复：目标对象、业务流程、核心能力基本相同，只是措辞不同。
-2. 高度相似：属于同一业务域，能力有明显重叠，但存在上下级、前后置或范围差异。
-3. 无关：业务目标或核心能力不同。
-
-请按以下 JSON 格式输出你的判定结果，不要包含其他内容。
-reason 控制在 80 个汉字以内，suggestion 控制在 80 个汉字以内：
-{{
-    "label": "重复|高度相似|无关",
-    "reason": "判定理由",
-    "suggestion": "建议"
-}}"""
 
 
 def _call_deepseek_api(prompt: str) -> str:
@@ -110,21 +115,30 @@ def _call_deepseek_api(prompt: str) -> str:
     }
 
     timeout = settings.duplicate_llm_timeout_seconds
-    response = _post_with_retry(url, headers, payload, timeout)
-    if response.status_code in {400, 422}:
-        payload.pop("response_format", None)
+    limit = max(payload["max_tokens"], getattr(settings, "duplicate_judge_max_tokens", 24000))
+    while True:
         response = _post_with_retry(url, headers, payload, timeout)
-    response.raise_for_status()
-
-    data = response.json()
-    return _extract_message_text(data)
+        if response.status_code in {400, 422} and "response_format" in payload:
+            payload.pop("response_format", None)
+            response = _post_with_retry(url, headers, payload, timeout)
+        response.raise_for_status()
+        data = response.json()
+        try:
+            return _extract_message_text(data)
+        except ValueError as exc:
+            if "finish_reason=length" not in str(exc) or payload["max_tokens"] >= limit:
+                raise
+            remaining_timeout(timeout)
+            payload["max_tokens"] = min(limit, payload["max_tokens"] * 2)
+            logger.warning("重复建设判定输出截断，保留完整证据并重试，输出预算=%s", payload["max_tokens"])
+            report_progress(0, f"部分候选判定输出截断，正在提高预算重试（{payload['max_tokens']} tokens）")
 
 
 def _post_with_retry(url: str, headers: dict[str, str], payload: dict, timeout: int):
     response = None
     for attempt in range(3):
         try:
-            response = post_direct(url, headers=headers, json=payload, timeout=timeout)
+            response = post_direct(url, headers=headers, json=payload, timeout=remaining_timeout(timeout))
             if response.status_code not in {408, 429, 500, 502, 503, 504}:
                 return response
         except Exception:
@@ -140,9 +154,20 @@ def _parse_llm_response(response: str) -> LLMJudgement:
     """解析 LLM 响应"""
     try:
         data = parse_json_object_from_text(_strip_think_blocks(response))
-        label = _normalize_label(_text_value(data.get("label"), "无关"))
+        if not data.get("label"):
+            raise ValueError("LLM response missing label")
+        label = _normalize_label(_text_value(data.get("label"), ""))
         reason = _text_value(data.get("reason"), "")
         suggestion = _text_value(data.get("suggestion"), "")
+        relation = _text_value(data.get("relation"), "")
+        if relation not in {
+            "construction_duplicate", "construction_overlap", "repeated_description",
+            "shared_reuse", "process_steps", "hierarchy", "different_scope",
+            "phase_continuation", "insufficient_evidence",
+        }:
+            raise ValueError("LLM response missing valid construction relation")
+        if relation not in {"construction_duplicate", "construction_overlap"}:
+            label = "无关"
 
         severity_map = {
             "重复": "risk",
@@ -156,10 +181,41 @@ def _parse_llm_response(response: str) -> LLMJudgement:
             reason=reason or "LLM 判定",
             suggestion=suggestion or None,
             model_name=settings.deepseek_model,
+            relation=relation,
+            left_unit=_text_value(data.get("left_unit"), ""),
+            right_unit=_text_value(data.get("right_unit"), ""),
+            overlap_scope=_text_value(data.get("overlap_scope"), ""),
+            left_evidence=_text_value(data.get("left_evidence"), ""),
+            right_evidence=_text_value(data.get("right_evidence"), ""),
         )
     except (json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as e:
         logger.error(f"Failed to parse LLM response: {e}, response: {response}")
         raise ValueError(f"Invalid LLM response format") from e
+
+
+def _validate_construction_evidence(
+    judgement: LLMJudgement, left_source: str, right_source: str,
+) -> LLMJudgement:
+    """Reject unsupported positive findings without replacing semantic review with rules."""
+    if judgement.label == "无关":
+        return judgement
+    compact = lambda value: re.sub(r"\s+", "", value or "")
+    valid = bool(
+        judgement.left_unit and judgement.right_unit and judgement.overlap_scope
+        and judgement.left_evidence and judgement.right_evidence
+        and compact(judgement.left_evidence) in compact(left_source)
+        and compact(judgement.right_evidence) in compact(right_source)
+        and compact(judgement.left_unit) in compact(left_source)
+        and compact(judgement.right_unit) in compact(right_source)
+    )
+    if valid:
+        return judgement
+    from dataclasses import replace
+    return replace(
+        judgement, label="无关", severity="pass", relation="insufficient_evidence",
+        reason="缺少两侧可核验的独立建设及重叠交付证据，不列为重复建设问题。",
+        suggestion=None,
+    )
 
 
 def _extract_message_text(data: dict[str, Any]) -> str:
@@ -167,10 +223,12 @@ def _extract_message_text(data: dict[str, Any]) -> str:
     if not choices:
         raise ValueError("LLM response missing choices")
     message = (choices[0] or {}).get("message") or {}
+    finish_reason = (choices[0] or {}).get("finish_reason")
+    if finish_reason == "length":
+        raise ValueError("LLM response truncated, finish_reason=length")
     value = message.get("content")
     if value is not None and str(value).strip():
         return str(value).strip()
-    finish_reason = (choices[0] or {}).get("finish_reason")
     raise ValueError(f"LLM response missing final content, finish_reason={finish_reason}")
 
 
@@ -188,9 +246,9 @@ def _normalize_label(value: str) -> str:
     text = value.strip()
     if text in {"重复", "完全重复", "疑似重复"}:
         return "重复"
-    if text in {"高度相似", "部分重复", "阶段延续", "需人工确认", "相似"}:
+    if text in {"高度相似", "部分重复", "需人工确认", "相似"}:
         return "高度相似"
-    if text in {"无关", "不重复", "相似但不重复"}:
+    if text in {"无关", "不重复", "相似但不重复", "阶段延续"}:
         return "无关"
     raise ValueError(f"大模型返回了无法识别的重复建设判定：{text}")
 

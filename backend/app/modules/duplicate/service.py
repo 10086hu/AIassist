@@ -15,6 +15,7 @@ from app.modules.duplicate.excel_parser import ParsedFunctionPoint, parse_functi
 from app.modules.duplicate.document_parser import DocumentContent, parse_document
 from app.modules.duplicate.llm_extractor import extract_function_points
 from app.modules.duplicate.llm_judge import judge_pair_with_llm
+from app.modules.duplicate.execution import parallel_model_work
 from app.schemas import DuplicateInternalResponse, DuplicatePairOut, ProjectOut
 
 
@@ -199,23 +200,7 @@ def run_duplicate_compare_check(
                 reason=pair.reason,
                 suggestion=pair.suggestion,
                 model_name=pair.model_name or "deepseek",
-                reference_data=json.dumps(
-                    {
-                        "comparison_type": pair.comparison_type,
-                        "similarity": pair.similarity,
-                        "item_report_name": pair.item_report_name,
-                        "related_report_name": pair.related_report_name,
-                        "item_stage": pair.item_stage,
-                        "related_stage": pair.related_stage,
-                        "item_row_index": pair.item_row_index,
-                        "related_row_index": pair.related_row_index,
-                        "item_source_location": pair.item_source_location,
-                        "related_source_location": pair.related_source_location,
-                        "item_source_excerpt": pair.item_source_excerpt,
-                        "related_source_excerpt": pair.related_source_excerpt,
-                    },
-                    ensure_ascii=False,
-                ),
+                reference_data=json.dumps(pair.model_dump(mode="json"), ensure_ascii=False),
             )
         )
 
@@ -283,77 +268,32 @@ def _process_function_points(
         )
     )
 
-    pairs: List[DuplicatePairOut] = []
-    for candidate in candidates:
-        judgement = judge_pair_with_llm(
-            candidate.left.name,
-            candidate.left.description,
-            candidate.right.name,
-            candidate.right.description,
-            candidate.similarity,
-            use_llm=use_llm,
+    refs = {
+        point.id: ReportPoint(
+            point_id=point.id, name=point.name, description=point.description,
+            category=point.category, row_index=point.row_index,
+            report_name=str(locations_by_row.get(point.row_index, {}).get("file_name") or project_name),
+            stage="本期", source="current",
+            source_location=locations_by_row.get(point.row_index, {}),
+            source_excerpt=str(locations_by_row.get(point.row_index, {}).get("quote") or point.description),
         )
-        if judgement.label == "无关":
-            continue
-        result = CheckResult(
-            project_id=project.id,
-            module="duplicate",
-            check_subtype="internal_dedup",
-            item_id=candidate.left.id,
-            related_item_id=candidate.right.id,
-            severity=judgement.severity,
-            score=round(candidate.similarity * 100, 2),
-            result_label=judgement.label,
-            reason=judgement.reason,
-            suggestion=judgement.suggestion,
-            model_name=judgement.model_name,
-            reference_data=json.dumps(
-                {
-                    "similarity": candidate.similarity,
-                    "item_row_index": candidate.left.row_index,
-                    "related_row_index": candidate.right.row_index,
-                    "item_source_location": locations_by_row.get(candidate.left.row_index, {}),
-                    "related_source_location": locations_by_row.get(candidate.right.row_index, {}),
-                    "item_source_excerpt": locations_by_row.get(candidate.left.row_index, {}).get("quote", ""),
-                    "related_source_excerpt": locations_by_row.get(candidate.right.row_index, {}).get("quote", ""),
-                },
-                ensure_ascii=False,
-            ),
-        )
-        db.add(result)
-        pairs.append(
-            DuplicatePairOut(
-                item_id=candidate.left.id,
-                related_item_id=candidate.right.id,
-                item_name=candidate.left.name,
-                related_item_name=candidate.right.name,
-                similarity=round(candidate.similarity, 4),
-                result_label=judgement.label,
-                severity=judgement.severity,
-                reason=judgement.reason,
-                suggestion=judgement.suggestion,
-                item_row_index=candidate.left.row_index,
-                related_row_index=candidate.right.row_index,
-                item_source_location=locations_by_row.get(candidate.left.row_index, {}),
-                related_source_location=locations_by_row.get(candidate.right.row_index, {}),
-                item_source_excerpt=locations_by_row.get(candidate.left.row_index, {}).get("quote"),
-                related_source_excerpt=locations_by_row.get(candidate.right.row_index, {}).get("quote"),
-                location_hint=_format_pair_location_hint(
-                    locations_by_row.get(candidate.left.row_index, {}),
-                    locations_by_row.get(candidate.right.row_index, {}),
-                ),
-                source_highlights=_duplicate_pair_highlights(
-                    locations_by_row.get(candidate.left.row_index, {}),
-                    locations_by_row.get(candidate.right.row_index, {}),
-                ),
-                revision_target=_duplicate_revision_target(
-                    locations_by_row.get(candidate.left.row_index, {}),
-                    locations_by_row.get(candidate.right.row_index, {}),
-                    judgement.suggestion,
-                ),
-                model_name=judgement.model_name,
-            )
-        )
+        for point in points
+    }
+    pairs = _judge_report_pairs(
+        [ReportCandidatePair(refs[item.left.id], refs[item.right.id], item.similarity) for item in candidates],
+        project_id=project.id, comparison_type="internal",
+        context_builder=lambda left, right: f"两项均来自同一本当前报告《{left.report_name}》。",
+        use_llm=use_llm,
+    )
+    for pair in pairs:
+        db.add(CheckResult(
+            project_id=project.id, module="duplicate", check_subtype="internal_dedup",
+            item_id=pair.item_id, related_item_id=pair.related_item_id,
+            severity=pair.severity, score=round(pair.similarity * 100, 2),
+            result_label=pair.result_label, reason=pair.reason,
+            suggestion=pair.suggestion, model_name=pair.model_name,
+            reference_data=json.dumps(pair.model_dump(mode="json"), ensure_ascii=False),
+        ))
 
     project.status = "evaluated"
     db.commit()
@@ -529,6 +469,12 @@ def _annotate_document_points(
                 "line_start": block.line,
                 "line_end": block.line,
                 "quote": block.text[:500],
+                "review_context": "\n".join(
+                    item.text for item in blocks[max(0, block_index - 3):block_index + 3]
+                )[:800],
+                "report_context": "\n".join(
+                    f"{section.title}: {section.content[:220]}" for section in document.sections[:4]
+                )[:900],
             })
             if block.section:
                 existing["section"] = block.section
@@ -701,7 +647,10 @@ def _same_source_occurrence(left: dict[str, Any], right: dict[str, Any]) -> bool
     left_paragraph = left.get("paragraph")
     right_paragraph = right.get("paragraph")
     if left_paragraph and right_paragraph:
-        return left_paragraph == right_paragraph
+        return (
+            left_paragraph == right_paragraph
+            and left.get("file_name") == right.get("file_name")
+        )
     left_row = left.get("row_index")
     right_row = right.get("row_index")
     if left_row and right_row and left.get("file_name") == right.get("file_name"):
@@ -743,16 +692,27 @@ def _judge_report_pairs(
     use_llm: bool = True,
 ) -> list[DuplicatePairOut]:
     pairs: list[DuplicatePairOut] = []
-    for candidate in candidates:
-        judgement = judge_pair_with_llm(
+    judgements = parallel_model_work(
+        candidates,
+        lambda candidate: judge_pair_with_llm(
             candidate.left.name,
             candidate.left.description,
             candidate.right.name,
             candidate.right.description,
             candidate.similarity,
-            context=context_builder(candidate.left, candidate.right),
+            context=(
+                context_builder(candidate.left, candidate.right)
+                + "\n报告总体背景：" + str(candidate.left.source_location.get("report_context") or "")[:900]
+            ),
             use_llm=use_llm,
-        )
+            left_source=_point_review_source(candidate.left),
+            right_source=_point_review_source(candidate.right),
+        ),
+        message="大模型复核" + ("报告内部候选对" if comparison_type == "internal" else "跨报告候选对"),
+        start=0.4 if comparison_type == "internal" else 0.65,
+        end=0.65 if comparison_type == "internal" else 0.95,
+    )
+    for candidate, judgement in zip(candidates, judgements):
         if judgement.label == "无关":
             continue
         pairs.append(
@@ -793,9 +753,67 @@ def _judge_report_pairs(
                     judgement.suggestion,
                 ),
                 model_name=judgement.model_name,
+                relation=judgement.relation,
+                left_unit=judgement.left_unit,
+                right_unit=judgement.right_unit,
+                overlap_scope=judgement.overlap_scope,
+                left_evidence=judgement.left_evidence,
+                right_evidence=judgement.right_evidence,
             )
         )
-    return pairs
+    return _merge_construction_findings(pairs)
+
+
+def _point_review_source(point: ReportPoint) -> str:
+    location = point.source_location
+    return (
+        f"章节：{location.get('section') or location.get('extraction_section') or ''}\n"
+        f"对应原文：{point.source_excerpt}\n"
+        f"邻近上下文：{str(location.get('review_context') or '')[:800]}"
+    )
+
+
+def _merge_construction_findings(pairs: list[DuplicatePairOut]) -> list[DuplicatePairOut]:
+    """One conflict per pair of commissioned units, retaining every overlapping capability."""
+    groups: dict[tuple, DuplicatePairOut] = {}
+    for pair in pairs:
+        if not pair.left_unit or not pair.right_unit or not pair.overlap_scope:
+            groups[(pair.item_id, pair.related_item_id)] = pair
+            continue
+        sides = sorted([
+            (pair.item_report_name or "", pair.item_stage or "", _construction_unit_key(pair.left_unit)),
+            (pair.related_report_name or "", pair.related_stage or "", _construction_unit_key(pair.right_unit)),
+        ])
+        key = (pair.comparison_type, tuple(sides))
+        existing = groups.get(key)
+        if existing is None:
+            pair.item_name = pair.left_unit
+            pair.related_item_name = pair.right_unit
+            pair.overlap_scopes = pair.overlap_scopes or [pair.overlap_scope]
+            groups[key] = pair
+            continue
+        existing.merged_count += pair.merged_count
+        existing.similarity = max(existing.similarity, pair.similarity)
+        if pair.severity == "risk":
+            existing.severity = "risk"
+            existing.result_label = "重复"
+        for highlight in pair.source_highlights:
+            if highlight not in existing.source_highlights:
+                existing.source_highlights.append(highlight)
+        for evidence in [pair.left_evidence, pair.right_evidence]:
+            if evidence and evidence not in existing.evidence_examples:
+                existing.evidence_examples.append(evidence)
+        for scope in pair.overlap_scopes or [pair.overlap_scope]:
+            if scope and scope not in existing.overlap_scopes:
+                existing.overlap_scopes.append(scope)
+        existing.overlap_scope = "；".join(existing.overlap_scopes)
+        existing.revision_target["highlights"] = existing.source_highlights
+    return list(groups.values())
+
+
+def _construction_unit_key(name: str) -> str:
+    # A module heading and its sentence often differ only by the word “模块”.
+    return re.sub(r"模块$", "", _location_normalize(name))
 
 
 def _format_pair_location_hint(left: dict[str, Any], right: dict[str, Any]) -> str:

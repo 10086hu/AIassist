@@ -1678,7 +1678,8 @@ public partial class MainWindow : Window
                 throw new InvalidOperationException("未选择项目。");
             }
 
-            _selectedCheckRunId = await CreateCheckRunAsync(projectId, reportPath);
+            var checkRunId = await CreateCheckRunAsync(projectId, reportPath);
+            _selectedCheckRunId = checkRunId;
 
             var taskItems = runnableItems.ToList();
             var duplicateItem = taskItems.FirstOrDefault(item => item.ModuleCode == "duplicate");
@@ -1697,31 +1698,24 @@ public partial class MainWindow : Window
                 StatusTextBlock.Text = "正在执行重复建设跨报告比对...";
                 try
                 {
-                    var duplicateResult = await UploadAndRunDuplicateCompareAsync(reportPath, duplicateHistoryFiles, projectId, _selectedCheckRunId);
+                    var duplicateResult = await UploadAndRunDuplicateCompareAsync(reportPath, duplicateHistoryFiles, projectId, checkRunId);
                     RenderCheckResult(duplicateResult);
                     AddResultNotice("重复建设检查已完成：已完成当前报告内部和往期报告跨报告比对。");
                     await LoadRecordsAsync();
                 }
                 catch (Exception exc)
                 {
-                    // Cross-report comparison can fail on a malformed or very
-                    // large history attachment. Keep this batch's duplicate
-                    // check by falling back to the internal comparison path.
-                    AddResultNotice($"跨报告比对失败，已回退为当前报告内部重复检查：{exc.Message}");
-                    StatusTextBlock.Text = "跨报告比对失败，正在执行当前报告内部重复检查...";
-                    var fallbackTaskId = await CreateEvaluateTaskAsync(
-                        new[] { duplicateItem },
-                        reportPath,
-                        projectId,
-                        _selectedCheckRunId);
-                    await PollEvaluateTaskAsync(fallbackTaskId);
+                    AddResultNotice($"跨报告比对未完成，请修复后重新比对当期和历史文档：{exc.Message}");
+                    StatusTextBlock.Text = "跨报告比对失败，尚无完整的两期审查结论。";
+                    await LoadRecordsAsync();
+                    return;
                 }
             }
 
             if (taskItems.Count > 0)
             {
                 StatusTextBlock.Text = "正在创建后台检测任务...";
-                var taskId = await CreateEvaluateTaskAsync(taskItems, reportPath, projectId, _selectedCheckRunId);
+                var taskId = await CreateEvaluateTaskAsync(taskItems, reportPath, projectId, checkRunId);
                 AddResultNotice("检测任务已创建，正在后台审查……");
                 await PollEvaluateTaskAsync(taskId);
             }
@@ -2174,9 +2168,7 @@ public partial class MainWindow : Window
             var isSelected = runId == _selectedCheckRunId;
             var runName = FirstNonEmpty(GetString(run, "report_name"), "未命名报告");
             var createdAt = FormatDateTime(GetString(run, "created_at"));
-            var resultCount = run.TryGetProperty("results", out var resultItems) && resultItems.ValueKind == JsonValueKind.Array
-                ? resultItems.GetArrayLength()
-                : 0;
+            var resultCount = ParseRunResults(run).Count(item => !string.Equals(item.Status, "failed", StringComparison.OrdinalIgnoreCase));
             var runStack = new StackPanel();
             runStack.Children.Add(Text($"{(isSelected ? "▼" : "▶")}  {runName}", 13, FontWeights.SemiBold, FindBrush("TextBrush"), null, true));
             runStack.Children.Add(Text($"{createdAt} · {resultCount}/9 项检查", 12, null, FindBrush("MutedBrush"), new Thickness(0, 3, 0, 0), true));
@@ -2241,7 +2233,8 @@ public partial class MainWindow : Window
             var isActive = result.Id == _activeRecordId;
             var content = new StackPanel();
             content.Children.Add(Text(moduleTitle, 12, FontWeights.SemiBold, FindBrush("TextBrush"), null, true));
-            content.Children.Add(Text($"{FirstNonEmpty(result.Status, "已完成")} · 问题：{result.FindingsCount}", 11, null, Brush(2, 122, 72), new Thickness(0, 3, 0, 0), true));
+            var failed = string.Equals(result.Status, "failed", StringComparison.OrdinalIgnoreCase);
+            content.Children.Add(Text(failed ? "检查未完成 · 问题数未确定" : $"{FirstNonEmpty(result.Status, "已完成")} · 问题：{result.FindingsCount}", 11, null, failed ? Brush(185, 28, 28) : Brush(2, 122, 72), new Thickness(0, 3, 0, 0), true));
             var button = new Button
             {
                 Content = content,
@@ -2416,6 +2409,9 @@ public partial class MainWindow : Window
                 GetString(item, "risk_level"),
                 GetInt(item, "findings_count"),
                 GetString(item, "created_at")))
+            .OrderByDescending(item => item.CreatedAt, StringComparer.Ordinal)
+            .GroupBy(item => item.Module)
+            .Select(group => group.First())
             .ToList();
     }
 
@@ -2483,7 +2479,8 @@ public partial class MainWindow : Window
 
         _recordDetailPanel.Children.Add(Text(projectName, 18, FontWeights.Bold, FindBrush("TextBrush"), null, true));
         _recordDetailPanel.Children.Add(Text($"检查模块：{moduleName}", 13, FontWeights.SemiBold, FindBrush("TextBrush"), new Thickness(0, 6, 0, 0), true));
-        _recordDetailPanel.Children.Add(Text($"风险等级：{risk}｜问题数量：{count}", 13, null, FindBrush("MutedBrush"), new Thickness(0, 4, 0, 8), true));
+        var failed = string.Equals(GetString(resultRoot, "status"), "failed", StringComparison.OrdinalIgnoreCase);
+        _recordDetailPanel.Children.Add(Text(failed ? "检查未完成｜问题数量：未确定" : $"风险等级：{risk}｜问题数量：{count}", 13, null, FindBrush("MutedBrush"), new Thickness(0, 4, 0, 8), true));
 
         if (root.TryGetProperty("summary", out var summary) && summary.ValueKind == JsonValueKind.Object)
         {
@@ -3229,14 +3226,15 @@ public partial class MainWindow : Window
             ? ruleResultsSummary
             : summary.ValueKind == JsonValueKind.Object ? summary : riskSummary;
         var findingCount = GetInt(summarySource, "total_findings");
+        var countText = string.Equals(status, "failed", StringComparison.OrdinalIgnoreCase) ? "未确定" : findingCount.ToString();
         var riskText = BuildRiskSummaryText(summarySource);
 
         ResultsSummaryPanel.Children.Add(Text($"{moduleName}：{status}", 14, FontWeights.SemiBold, FindBrush("TextBrush"), new Thickness(0, 8, 0, 0), true));
-        ResultsSummaryPanel.Children.Add(Text($"问题数量：{findingCount}；耗时：{elapsed:0.###} 秒；{riskText}", 13, null, FindBrush("MutedBrush"), new Thickness(0, 3, 0, 0), true));
+        ResultsSummaryPanel.Children.Add(Text($"问题数量：{countText}；耗时：{elapsed:0.###} 秒；{riskText}", 13, null, FindBrush("MutedBrush"), new Thickness(0, 3, 0, 0), true));
 
         var stack = new StackPanel();
         stack.Children.Add(Text(moduleName, 16, FontWeights.Bold, FindBrush("TextBrush")));
-        stack.Children.Add(Text($"状态：{status}    问题数量：{findingCount}    耗时：{elapsed:0.###} 秒", 13, null, FindBrush("MutedBrush"), new Thickness(0, 5, 0, 10), true));
+        stack.Children.Add(Text($"状态：{status}    问题数量：{countText}    耗时：{elapsed:0.###} 秒", 13, null, FindBrush("MutedBrush"), new Thickness(0, 5, 0, 10), true));
         RenderResultNotices(stack, root);
 
         if (moduleCode == "duplicate" && TryRenderDuplicateFindings(stack, root))
@@ -3367,7 +3365,14 @@ public partial class MainWindow : Window
         }
 
         RenderDuplicateFindingGroup(target, "本报告内部重复", internalFindings, "未发现本报告内部重复功能点。");
-        RenderDuplicateFindingGroup(target, "与往期报告重复", crossFindings, "未发现与往期报告重复的功能点。");
+        if (GetInt(root, "history_imported_count") > 0)
+        {
+            RenderDuplicateFindingGroup(target, "与往期报告重复", crossFindings, "未发现与往期报告重复的功能点。");
+        }
+        else
+        {
+            target.Children.Add(Text("未执行历史文档比对。", 13, null, FindBrush("MutedBrush"), new Thickness(0, 4, 0, 10), true));
+        }
         return true;
     }
 

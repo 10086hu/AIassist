@@ -70,6 +70,14 @@ class DuplicatePairOut(BaseModel):
     evidence_examples: List[str] = Field(default_factory=list)
     source_section: str = "资源申请清单"
     model_name: Optional[str] = None
+    relation: str = ""
+    left_unit: str = ""
+    right_unit: str = ""
+    overlap_scope: str = ""
+    overlap_scopes: List[str] = Field(default_factory=list)
+    left_evidence: str = ""
+    right_evidence: str = ""
+    merged_count: int = 1
 
 
 class DuplicateInternalResponse(BaseModel):

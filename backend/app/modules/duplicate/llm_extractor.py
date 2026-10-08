@@ -12,14 +12,14 @@ from app.core.direct_http import post_direct
 from app.core.llm_json import parse_json_object_from_text
 from app.modules.duplicate.document_parser import DocumentContent, DocumentSection
 from app.modules.duplicate.excel_parser import ParsedFunctionPoint
+from app.modules.duplicate.execution import parallel_model_work, remaining_timeout
 
 
 logger = logging.getLogger(__name__)
 
-# V4-Flash reliably completes structured extraction for blocks around 4k
-# characters.  Larger blocks can consume the gateway output budget and return
-# finish_reason=length with no final content.
-MAX_SECTION_CHARS = 4000
+# The gateway routes Flash to V4.1 and includes reasoning in the output budget.
+# Smaller blocks leave room for both reasoning and the evidence-bearing JSON.
+MAX_SECTION_CHARS = 1200
 
 
 def extract_function_points(
@@ -37,50 +37,33 @@ def extract_function_points(
 
     extracted_points: List[ParsedFunctionPoint] = []
 
-    # 短文档一次性提取；长文档将相邻小章节合并，避免每个章节各发一次请求。
-    if len(doc_content.raw_text) < 5000:
-        # 一次性提取
-        points = _extract_from_text(
-            doc_content.raw_text,
-            section_title="完整文档",
-            project_context=project_context,
-        )
+    chunks = (
+        [("完整文档", doc_content.raw_text)]
+        if len(doc_content.raw_text) <= MAX_SECTION_CHARS else _build_extraction_chunks(doc_content)
+    )
+
+    def extract_segment(chunk_title, chunk, depth=0):
+        try:
+            return _extract_from_text(chunk, section_title=chunk_title, project_context=project_context)
+        except ValueError as exc:
+            if "finish_reason=length" not in str(exc) or depth >= 3 or len(chunk) <= 300:
+                raise ValueError(f"文档分块提取不完整：{chunk_title}: {exc}") from exc
+            logger.warning("文档块输出截断，继续拆分（层级 %s）：%s", depth + 1, chunk_title)
+            recovered = []
+            for part_index, part in enumerate(_split_chunk(chunk), 1):
+                recovered.extend(extract_segment(f"{chunk_title}（片段 {part_index}）", part, depth + 1))
+            return recovered
+
+    def extract_chunk(item):
+        idx, (chunk_title, chunk) = item
+        logger.info("提取合并文档块 %s/%s: %s", idx, len(chunks), chunk_title)
+        return extract_segment(chunk_title, chunk)
+
+    for points in parallel_model_work(
+        enumerate(chunks, 1), extract_chunk,
+        message="大模型抽取功能点", start=0.02, end=0.35,
+    ):
         extracted_points.extend(points)
-    else:
-        errors: list[str] = []
-        chunks = _build_extraction_chunks(doc_content)
-        for idx, (chunk_title, chunk) in enumerate(chunks, 1):
-            logger.info("提取合并文档块 %s/%s: %s", idx, len(chunks), chunk_title)
-            try:
-                points = _extract_from_text(
-                    chunk,
-                    section_title=chunk_title,
-                    project_context=project_context,
-                )
-                extracted_points.extend(points)
-            except ValueError as exc:
-                # V4-Flash can occasionally spend its whole output budget on a
-                # dense block. Retry that block as two smaller requests before
-                # giving up, so one transient truncation does not erase the
-                # duplicate module from the review.
-                logger.warning("文档块 %s/%s 提取失败，拆分后重试: %s", idx, len(chunks), exc)
-                recovered = False
-                for part_idx, part in enumerate(_split_chunk(chunk), 1):
-                    try:
-                        part_points = _extract_from_text(
-                            part,
-                            section_title=f"{chunk_title}（重试片段 {part_idx}）",
-                            project_context=project_context,
-                        )
-                        extracted_points.extend(part_points)
-                        recovered = recovered or bool(part_points)
-                    except ValueError as part_exc:
-                        errors.append(f"{chunk_title}（片段 {part_idx}）: {part_exc}")
-                        logger.warning("跳过提取失败的重试片段 %s/%s: %s", part_idx, 2, part_exc)
-                if not recovered:
-                    errors.append(f"{chunk_title}: {exc}")
-        if not extracted_points and errors:
-            raise ValueError("所有文档分块的大模型功能点提取均失败：" + "; ".join(errors[:3]))
 
     # 保留报告不同位置重复出现的功能点，供后续重复建设判定。
     final_points: List[ParsedFunctionPoint] = []
@@ -91,6 +74,7 @@ def extract_function_points(
                 name=point.name,
                 description=point.description,
                 category=point.category,
+                source_location=point.source_location,
             )
         )
 
@@ -120,7 +104,7 @@ def _build_extraction_chunks(doc_content: DocumentContent) -> list[tuple[str, st
         if not content:
             continue
         title = section.title.strip() or "未命名章节"
-        content_limit = max(1000, MAX_SECTION_CHARS - len(title) - 20)
+        content_limit = max(300, MAX_SECTION_CHARS - len(title) - 20)
         for offset in range(0, len(content), content_limit):
             segment = content[offset : offset + content_limit]
             part_number = offset // content_limit + 1
@@ -185,56 +169,17 @@ def _build_extraction_prompt(
     project_context: str = "",
     previous_points: Optional[List[ParsedFunctionPoint]] = None,
 ) -> str:
-    """构建功能点提取提示词"""
-    previous_context = ""
-    if previous_points:
-        prev_names = [p.name for p in previous_points[-5:]]  # 最近 5 个
-        previous_context = f"""
-
-已提取的功能点（避免重复）：
-{json.dumps(prev_names, ensure_ascii=False, indent=2)}
-
-注意：不要重复提取上面已提取的功能点。"""
-
-    return f"""你是政府信息化项目可研报告的分析专家。请从以下文本中提取所有功能点。
-
-功能点定义：指系统或应用需要实现的具体功能，包括但不限于：
-- 用户认证、权限管理、数据交换等核心业务功能
-- 报表、监控、日志等支撑功能
-- 不包括硬件配置、采购清单等非功能项
-- 不包括技术指标或性能要求
-- 同一功能在不同位置重复申报时，请分别输出，不要合并或去重
-
-{f"项目上下文：{project_context}" if project_context else ""}
-
-{f"章节标题：{section_title}" if section_title else ""}{previous_context}
-
-请返回严格的 JSON 格式，包含以下字段：
-- function_points: 功能点列表
-  - name: 功能点名称（简洁，20 字以内）
-  - description: 详细描述（1-2 句话）
-  - category: 所属模块或分类
-  - source_quote: 能直接证明该功能点的原文句子或表格行，必须从输入文本逐字复制，不得改写，120 字以内
-
-响应格式示例：
-{{
-  "function_points": [
-    {{
-      "name": "统一身份认证",
-      "description": "实现用户账号集中管理和单点登录功能",
-      "category": "基础设施",
-      "source_quote": "建设统一身份认证能力，实现用户账号集中管理和单点登录。"
-    }},
-    {{
-      "name": "权限管理",
-      "description": "提供基于角色的访问控制机制",
-      "category": "基础设施"
-    }}
-  ],
-  "extraction_notes": "提取时的说明（如有特殊情况）"
-}}
-
-文本内容：
+    """Extract explicit software capabilities without expanding background prose."""
+    return f"""从下面原文中摘录明确提出要建设的软件功能或模块。只输出 JSON。
+要求：
+1. 只摘录具体建设内容、功能设计、独立交付清单或软件开发预算中的待建项。项目概况、目标、必要性、效益、总架构、总结性功能清单对这些项的复述不另提取，即使写有“建设”也不单独输出。不推导隐含功能。
+2. 原文明确系统/平台/模块时，以该建设单元为一项，将它的子功能归入description，不能将每个子功能再拆成独立建设项；无明确模块时才按可独立交付的软件功能提取。同一位置的同名功能只输出一次。
+3. 两个不同的明确待建模块即使功能相同也分别保留，并保留各自原文位置。只是输出结果、业务原则、复用已有能力或对已介绍模块的回顾时，不视为新的待建项。
+4. name 使用原文的简短功能名称，30字以内；description 用120字以内保留该建设项的服务对象、范围和核心子功能，不把整条流程赋给每个步骤；source_quote 逐字复制原文依据，120字以内。
+5. 无明确软件功能时返回空数组。不需要分类、提取说明或分析过程。
+格式：{{"function_points": [{{"name": "功能名称", "description": "该功能自己的建设范围", "source_quote": "原文依据"}}]}}
+章节：{section_title}
+原文：
 {text}"""
 
 
@@ -256,7 +201,7 @@ def _call_deepseek_api(prompt: str) -> str:
         # extraction that can consume the whole token budget before any JSON
         # is emitted (finish_reason=length, empty content).
         "reasoning_effort": "low",
-        "max_tokens": settings.duplicate_llm_max_tokens,
+        "max_tokens": getattr(settings, "duplicate_extraction_max_tokens", settings.duplicate_llm_max_tokens),
         "response_format": {"type": "json_object"},
     }
 
@@ -275,7 +220,7 @@ def _post_with_retry(url: str, headers: dict[str, str], payload: dict, timeout: 
     response = None
     for attempt in range(3):
         try:
-            response = post_direct(url, headers=headers, json=payload, timeout=timeout)
+            response = post_direct(url, headers=headers, json=payload, timeout=remaining_timeout(timeout))
             if response.status_code not in {408, 429, 500, 502, 503, 504}:
                 return response
         except Exception:
@@ -291,14 +236,16 @@ def _parse_extraction_response(response: str) -> List[ParsedFunctionPoint]:
     """解析 LLM 响应中的功能点"""
     try:
         data = parse_json_object_from_text(_strip_think_blocks(response))
-        function_points = data.get("function_points", [])
+        function_points = data.get("function_points")
+        if not isinstance(function_points, list):
+            raise ValueError("LLM response missing function_points array")
 
         parsed_points: List[ParsedFunctionPoint] = []
         for idx, item in enumerate(function_points, 1):
             if not isinstance(item, dict):
                 continue
             name = _text_value(item.get("name"), "")
-            description = _text_value(item.get("description"), "")
+            description = _text_value(item.get("description"), "") or _text_value(item.get("source_quote"), "")
             category = _text_value(item.get("category"), "")
             source_quote = _text_value(item.get("source_quote"), "")
 
@@ -340,10 +287,12 @@ def _extract_message_text(data: dict) -> str:
     if not choices:
         raise ValueError("LLM response missing choices")
     message = (choices[0] or {}).get("message") or {}
+    finish_reason = (choices[0] or {}).get("finish_reason")
+    if finish_reason == "length":
+        raise ValueError("LLM response truncated, finish_reason=length")
     value = message.get("content")
     if value is not None and str(value).strip():
         return str(value).strip()
-    finish_reason = (choices[0] or {}).get("finish_reason")
     raise ValueError(f"LLM response missing final content, finish_reason={finish_reason}")
 
 

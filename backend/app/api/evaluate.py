@@ -9,6 +9,7 @@ import tempfile
 import threading
 import traceback
 import uuid
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -17,8 +18,10 @@ from urllib.parse import quote
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Form, HTTPException, Response, UploadFile
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import HTMLResponse
+from starlette.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.db.models import CheckResult, CheckRun, Project, SourceArtifact
 from app.db.session import SessionLocal, get_db
 from app.modules.content_consistency.service import run_content_consistency_check_from_document
@@ -31,6 +34,7 @@ from app.modules.duplicate.service import (
     run_duplicate_check_from_document,
     run_internal_duplicate_check,
 )
+from app.modules.duplicate.execution import duplicate_execution
 from app.modules.shanghai_review.base import BaseValidator
 from app.modules.resource.service import run_resource_check_from_file
 from app.modules.price.service import (
@@ -285,7 +289,8 @@ async def evaluate_duplicate_internal(
     content = await _read_upload(file, DUPLICATE_EXTENSIONS)
 
     try:
-        return _run_duplicate_module(db, content, filename, project_id, project_name, department, use_llm=True)
+        with duplicate_execution():
+            return await run_in_threadpool(_run_duplicate_module, db, content, filename, project_id, project_name, department, use_llm=True)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -310,19 +315,34 @@ async def evaluate_duplicate_compare(
         filename = file.filename or ""
         history_payloads.append((await _read_upload(file, DUPLICATE_EXTENSIONS), filename))
 
+    return await run_in_threadpool(
+        _evaluate_duplicate_compare_sync, db, current_content, current_filename,
+        history_payloads, project_id, check_run_id, project_name, department,
+        current_stage, history_stages,
+    )
+
+
+def _evaluate_duplicate_compare_sync(
+    db, current_content, current_filename, history_payloads, project_id,
+    check_run_id, project_name, department, current_stage, history_stages,
+):
+    check_run = db.get(CheckRun, check_run_id) if check_run_id else None
+    if check_run_id and (check_run is None or check_run.project_id != project_id):
+        raise HTTPException(status_code=400, detail="报告检查记录不存在或不属于当前项目")
     try:
-        raw = run_duplicate_compare_check(
-            db=db,
-            current_content=current_content,
-            current_filename=current_filename,
-            history_files=history_payloads,
-            project_id=project_id,
-            project_name=project_name,
-            department=department,
-            current_stage=current_stage,
-            history_stages=_parse_history_stages(history_stages),
-            use_llm=True,
-        )
+        with duplicate_execution():
+            raw = run_duplicate_compare_check(
+                db=db,
+                current_content=current_content,
+                current_filename=current_filename,
+                history_files=history_payloads,
+                project_id=project_id,
+                project_name=project_name,
+                department=department,
+                current_stage=current_stage,
+                history_stages=_parse_history_stages(history_stages),
+                use_llm=True,
+            )
         normalized = _attach_finding_locations(_normalize_duplicate_result(raw), current_content, current_filename)
         project = db.get(Project, raw.project.id)
         if project is not None:
@@ -364,10 +384,54 @@ async def evaluate_duplicate_compare(
         return normalized
     except ValueError as exc:
         db.rollback()
+        _record_duplicate_compare_failure(
+            db, str(exc), current_content, current_filename, history_payloads,
+            project_id, check_run_id, project_name, department, current_stage, history_stages,
+        )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         db.rollback()
+        _record_duplicate_compare_failure(
+            db, str(exc), current_content, current_filename, history_payloads,
+            project_id, check_run_id, project_name, department, current_stage, history_stages,
+        )
         raise HTTPException(status_code=500, detail=f"重复建设跨报告检查失败：{exc}") from exc
+
+
+def _record_duplicate_compare_failure(
+    db, reason, current_content, current_filename, history_payloads,
+    project_id, check_run_id, project_name, department, current_stage, history_stages,
+):
+    """Keep failed cross-report work and both inputs reviewable in report history."""
+    try:
+        project = _get_or_create_project(db, project_id, project_name, department)
+        failure = {
+            "module_code": "duplicate", "module_name": _module_display_name("duplicate"),
+            "status": "failed", "comparison_scope": "current_and_history",
+            "summary": {
+                "total_findings": 0, "risk_count": {}, "failure_reason": reason,
+                "history_file_count": len(history_payloads), "comparison_completed": False,
+            },
+            "findings": [], "model_name": settings.deepseek_model,
+            "notices": [f"当期与历史文档比对未完成：{reason}"],
+        }
+        result_id = _store_check_result(
+            db, project, "duplicate", failure, "需人工确认",
+            "请修复后重新比对当期和历史文档；当前尚无完整结论。",
+            check_run_id=check_run_id, report_name=current_filename,
+        )
+        _store_duplicate_source_artifacts(
+            db, result_id, (current_content, current_filename), history_payloads,
+            current_stage or "本期", _parse_history_stages(history_stages),
+        )
+        if check_run_id:
+            run = db.get(CheckRun, check_run_id)
+            if run is not None:
+                run.status = "failed"
+        db.commit()
+    except Exception:
+        db.rollback()
+        traceback.print_exc()
 
 
 @router.post("/content-consistency/document")
@@ -790,6 +854,7 @@ def _set_task(task_id: str, **updates: Any) -> None:
     with TASKS_LOCK:
         current = dict(TASKS.get(task_id) or {})
         current.update(updates)
+        current["updated_at"] = time.time()
         TASKS[task_id] = current
 
 
@@ -839,6 +904,14 @@ def _run_evaluate_task(
                 message=f"正在检测：{_module_display_name(module)}",
             )
             try:
+                progress_last = progress_base
+
+                def duplicate_progress(fraction, message):
+                    nonlocal progress_last
+                    progress_last = max(progress_last, progress_base + int(fraction * 80 / max(1, len(modules))))
+                    _set_task(task_id, progress=progress_last, stage="duplicate", message=message)
+
+                task_context["duplicate_progress"] = duplicate_progress
                 result = _run_module_check(
                     db=db,
                     module=module,
@@ -1033,15 +1106,16 @@ def _run_module_check(
 
     if module == "duplicate":
         _ensure_extension(suffix, DUPLICATE_EXTENSIONS, module)
-        raw = _run_duplicate_module(
-            db=db,
-            content=content,
-            filename=source_filename,
-            project_id=project.id,
-            project_name=project_name,
-            department=department,
-            use_llm=True,
-        )
+        with duplicate_execution((task_context or {}).get("duplicate_progress")):
+            raw = _run_duplicate_module(
+                db=db,
+                content=content,
+                filename=source_filename,
+                project_id=project.id,
+                project_name=project_name,
+                department=department,
+                use_llm=True,
+            )
         return _normalize_duplicate_result(raw)
 
     if module == "data_reasonableness":
@@ -1829,7 +1903,13 @@ def _normalize_duplicate_result(result: DuplicateInternalResponse) -> dict[str, 
         prefix = "与往期报告重复" if is_cross else "本报告内部重复"
         left_report = str(pair.get("item_report_name") or "当前报告")
         right_report = str(pair.get("related_report_name") or ("往期报告" if is_cross else "当前报告"))
-        evidence_parts = [f"相似度：{float(pair.get('similarity') or 0):.2%}"]
+        evidence_parts = [
+            f"建设单元：{pair.get('left_unit') or pair.get('item_name', '')} ↔ {pair.get('right_unit') or pair.get('related_item_name', '')}",
+            f"重叠内容：{pair.get('overlap_scope') or pair.get('reason', '')}",
+        ]
+        for side in ("left", "right"):
+            if pair.get(f"{side}_evidence"):
+                evidence_parts.append(f"{'当前' if side == 'left' else '关联'}原文：{pair[f'{side}_evidence']}")
         if is_cross:
             evidence_parts.append(f"当前：{left_report}")
             evidence_parts.append(f"往期：{right_report}")
@@ -1840,7 +1920,7 @@ def _normalize_duplicate_result(result: DuplicateInternalResponse) -> dict[str, 
                 "review_opinion": pair.get("reason") or pair.get("result_label") or "疑似重复建设，请复核。",
                 "evidence_summary": "；".join(evidence_parts),
                 "revision_advice": pair.get("suggestion") or "请核对两个功能点是否存在建设内容、服务对象或实现范围重复。",
-                "rule_basis": "功能点相似度预筛与大模型语义复核",
+                "rule_basis": "独立建设单元、重叠交付范围及双侧原文证据的大模型复核",
                 "source_section": prefix,
                 "comparison_type": comparison_type,
                 "item_report_name": left_report,
@@ -1854,9 +1934,11 @@ def _normalize_duplicate_result(result: DuplicateInternalResponse) -> dict[str, 
                 "item_source_excerpt": pair.get("item_source_excerpt") or "",
                 "related_source_excerpt": pair.get("related_source_excerpt") or "",
                 "location_hint": pair.get("location_hint"),
-                "llm_refined": pair.get("model_name") == "deepseek",
+                "llm_refined": bool(pair.get("model_name") and pair.get("model_name") != "rule-based"),
                 "model_name": pair.get("model_name") or "",
-                "merged_count": 1,
+                "merged_count": pair.get("merged_count", 1),
+                "source_highlights": pair.get("source_highlights") or [],
+                "revision_target": pair.get("revision_target") or {},
             }
         )
     internal_count = len(data.get("internal_pairs") or [pair for pair in pairs if (pair.get("comparison_type") or "internal") == "internal"])
@@ -1868,11 +1950,16 @@ def _normalize_duplicate_result(result: DuplicateInternalResponse) -> dict[str, 
         internal_duplicate_count=internal_count,
         cross_report_duplicate_count=cross_count,
     )
-    summary["llm_model"] = _first_text([pair.get("model_name") for pair in pairs if pair.get("model_name")]) or "deepseek"
+    summary["llm_model"] = _first_text([pair.get("model_name") for pair in pairs if pair.get("model_name")]) or settings.deepseek_model
+    summary["review_criteria"] = "独立建设及双侧原文证据；排除章节复述、共性复用、层级与流程关系"
+    summary["comparison_completed"] = True
+    summary["history_comparison_status"] = "completed" if data.get("history_imported_count", 0) else "not_requested"
     return {
         "module_code": "duplicate",
         "module_name": _module_display_name("duplicate"),
         "status": "completed",
+        "comparison_scope": "current_and_history" if data.get("history_imported_count", 0) else "current_only",
+        "model_name": summary["llm_model"],
         "imported_count": data.get("imported_count", 0),
         "history_imported_count": data.get("history_imported_count", 0),
         "threshold": data.get("threshold", 0),
