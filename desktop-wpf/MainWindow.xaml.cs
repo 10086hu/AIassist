@@ -64,7 +64,13 @@ public partial class MainWindow : Window
     private TextBlock? _priceBenchmarkStatusTextBlock;
     private PasswordBox? _llmApiKeyBox;
     private TextBox? _llmBaseUrlBox;
-    private TextBox? _llmModelBox;
+    private ComboBox? _llmModelBox;
+    private TextBlock? _llmModelsStatusTextBlock;
+    private CancellationTokenSource? _llmModelsCancellation;
+    private int _llmModelsRevision;
+    private int _llmLoadedModelsRevision = -1;
+    private string? _llmPreferredModel;
+    private bool _isSavingLlmSettings;
     private TextBlock? _llmConfigStatusTextBlock;
     private CheckBox? _llmReviewCheckBox;
     private bool _isCompletenessChecked;
@@ -1015,7 +1021,40 @@ public partial class MainWindow : Window
         }));
         _llmApiKeyBox = new PasswordBox { Style = (Style)FindResource("PasswordInput"), ToolTip = "输入后保存，界面不会回显密钥" };
         _llmBaseUrlBox = Input(GetUserEnvironment("DEEPSEEK_API_BASE_URL", "https://llmapi.tongji.edu.cn/v1"));
-        _llmModelBox = Input(GetUserEnvironment("DEEPSEEK_MODEL", "DeepSeek-V4-Flash"));
+        _llmPreferredModel = GetUserEnvironment("DEEPSEEK_MODEL", GetUserEnvironment("LLM_MODEL", "DeepSeek-V4-Flash"));
+        _llmModelBox = new ComboBox
+        {
+            IsEditable = false,
+            IsEnabled = false,
+            Padding = new Thickness(10),
+            Margin = new Thickness(0, 0, 0, 14),
+            MinWidth = 0,
+            ToolTip = "从当前 API 返回的可用模型中选择"
+        };
+        _llmModelsStatusTextBlock = Text("填写接口地址和密钥后获取可用模型。", 12, null, FindBrush("MutedBrush"), new Thickness(0, 8, 0, 0), true);
+        _llmModelBox.SelectionChanged += (_, _) =>
+        {
+            if (_llmLoadedModelsRevision == _llmModelsRevision && _llmModelBox.SelectedItem != null)
+            {
+                _llmModelsStatusTextBlock.Text = $"已获取 {_llmModelBox.Items.Count} 个可用模型。";
+            }
+        };
+        _llmBaseUrlBox.TextChanged += async (_, _) => await RefreshLlmModelsAsync(debounce: true);
+        _llmApiKeyBox.PasswordChanged += async (_, _) =>
+        {
+            if (!_isSavingLlmSettings)
+            {
+                await RefreshLlmModelsAsync(debounce: true);
+            }
+        };
+        _llmModelBox.IsVisibleChanged += async (_, _) =>
+        {
+            if (_llmModelBox.IsVisible)
+            {
+                await RefreshLlmModelsAsync();
+            }
+        };
+        Closed += (_, _) => _llmModelsCancellation?.Cancel();
         _llmConfigStatusTextBlock = Text(
             HasUserApiKey() ? "当前用户密钥已配置（已隐藏）" : "当前用户尚未配置 API Key",
             12,
@@ -1025,12 +1064,15 @@ public partial class MainWindow : Window
             true);
         var testLlmButton = Button("测试连接", false);
         testLlmButton.Click += async (_, _) => await TestLlmConnectionAsync();
+        var refreshLlmModelsButton = Button("刷新模型", false);
+        refreshLlmModelsButton.Click += async (_, _) => await RefreshLlmModelsAsync();
         right.Children.Add(SettingsPanel("大模型 API 配置", "配置 DeepSeek 或 OpenAI 兼容接口。密钥仅保存到当前 Windows 用户环境变量，不会在界面中显示。", new UIElement[]
         {
             SettingRow("API Key", "留空表示保留现有密钥；输入新值后点击顶部保存设置", _llmApiKeyBox),
             SettingRow("接口地址", "填写到 /v1，不要包含 /chat/completions", _llmBaseUrlBox),
-            SettingRow("模型名称", "当前网关推荐使用 DeepSeek-V4-Flash", _llmModelBox),
-            ActionRow(testLlmButton),
+            SettingRow("模型名称", "从当前接口和密钥可用的模型中选择", _llmModelBox),
+            _llmModelsStatusTextBlock,
+            ActionRow(refreshLlmModelsButton, testLlmButton),
             _llmConfigStatusTextBlock
         }, new Thickness(0, 14, 0, 0)));
         right.Children.Add(SettingsPanel("服务连接", "配置客户端访问审查服务的地址和响应策略。", new UIElement[]
@@ -1063,6 +1105,95 @@ public partial class MainWindow : Window
             : fallback;
     }
 
+    private async Task RefreshLlmModelsAsync(bool debounce = false)
+    {
+        if (_llmModelBox == null || _llmBaseUrlBox == null || _llmApiKeyBox == null || _llmModelsStatusTextBlock == null)
+        {
+            return;
+        }
+
+        if (_llmModelBox.SelectedItem is string selectedModel)
+        {
+            _llmPreferredModel = selectedModel;
+        }
+        var revision = ++_llmModelsRevision;
+        _llmModelsCancellation?.Cancel();
+        var cancellation = new CancellationTokenSource();
+        _llmModelsCancellation = cancellation;
+        _llmLoadedModelsRevision = -1;
+        _llmModelBox.ItemsSource = null;
+        _llmModelBox.IsEnabled = false;
+        _llmModelsStatusTextBlock.Text = "正在获取可用模型...";
+
+        var baseUrl = _llmBaseUrlBox.Text.Trim().TrimEnd('/');
+        var apiKey = _llmApiKeyBox.Password.Trim();
+        if (string.IsNullOrWhiteSpace(apiKey))
+        {
+            apiKey = GetUserEnvironment("DEEPSEEK_API_KEY", GetUserEnvironment("LLM_API_KEY", string.Empty));
+        }
+
+        try
+        {
+            if (string.IsNullOrWhiteSpace(baseUrl) || string.IsNullOrWhiteSpace(apiKey))
+            {
+                _llmModelsStatusTextBlock.Text = "请填写接口地址和 API Key，再获取模型列表。";
+                return;
+            }
+            if (debounce)
+            {
+                await Task.Delay(700, cancellation.Token);
+            }
+            var models = await LlmModelCatalog.GetModelsAsync(baseUrl, apiKey, cancellation.Token);
+            if (revision != _llmModelsRevision || cancellation.IsCancellationRequested)
+            {
+                return;
+            }
+
+            _llmModelBox.ItemsSource = models;
+            _llmModelBox.SelectedItem = models.Contains(_llmPreferredModel, StringComparer.Ordinal) ? _llmPreferredModel : null;
+            _llmModelBox.IsEnabled = models.Length > 0;
+            _llmLoadedModelsRevision = revision;
+            _llmModelsStatusTextBlock.Text = models.Length == 0
+                ? "当前接口未返回可用模型，请检查密钥权限或刷新。"
+                : _llmModelBox.SelectedItem == null
+                    ? $"已获取 {models.Length} 个可用模型，请选择模型。"
+                    : $"已获取 {models.Length} 个可用模型。";
+        }
+        catch (OperationCanceledException)
+        {
+            if (revision == _llmModelsRevision && !cancellation.IsCancellationRequested)
+            {
+                _llmModelsStatusTextBlock.Text = "获取模型列表超时，请点击刷新模型重试。";
+            }
+        }
+        catch (HttpRequestException exc)
+        {
+            if (revision == _llmModelsRevision)
+            {
+                _llmModelsStatusTextBlock.Text = exc.StatusCode.HasValue
+                    ? exc.Message
+                    : "无法连接模型接口，请检查地址和网络后刷新。";
+            }
+        }
+        catch (Exception exc) when (exc is JsonException or ArgumentException)
+        {
+            if (revision == _llmModelsRevision)
+            {
+                _llmModelsStatusTextBlock.Text = exc is ArgumentException
+                    ? "请填写有效的 API 接口地址。"
+                    : "接口没有返回有效的模型列表，请检查地址后刷新。";
+            }
+        }
+        finally
+        {
+            if (ReferenceEquals(_llmModelsCancellation, cancellation))
+            {
+                _llmModelsCancellation = null;
+            }
+            cancellation.Dispose();
+        }
+    }
+
     private async Task SaveLlmSettingsAsync()
     {
         if (_llmApiKeyBox == null || _llmBaseUrlBox == null || _llmModelBox == null)
@@ -1072,10 +1203,11 @@ public partial class MainWindow : Window
 
         var apiKey = _llmApiKeyBox.Password.Trim();
         var baseUrl = _llmBaseUrlBox.Text.Trim().TrimEnd('/');
-        var model = _llmModelBox.Text.Trim();
-        if (string.IsNullOrWhiteSpace(baseUrl) || string.IsNullOrWhiteSpace(model))
+        var model = _llmModelBox.SelectedItem as string;
+        if (string.IsNullOrWhiteSpace(baseUrl) || string.IsNullOrWhiteSpace(model)
+            || _llmLoadedModelsRevision != _llmModelsRevision || !_llmModelBox.Items.Contains(model))
         {
-            MessageBox.Show(this, "接口地址和模型名称不能为空。", "保存失败", MessageBoxButton.OK, MessageBoxImage.Warning);
+            MessageBox.Show(this, "请获取当前接口的可用模型，并从列表中选择模型后保存。", "保存失败", MessageBoxButton.OK, MessageBoxImage.Warning);
             return;
         }
 
@@ -1107,7 +1239,15 @@ public partial class MainWindow : Window
             SetUserEnvironment("DEEPSEEK_MODEL", model);
             SetUserEnvironment("LLM_BASE_URL", baseUrl);
             SetUserEnvironment("LLM_MODEL", model);
-            _llmApiKeyBox.Clear();
+            _isSavingLlmSettings = true;
+            try
+            {
+                _llmApiKeyBox.Clear();
+            }
+            finally
+            {
+                _isSavingLlmSettings = false;
+            }
             _llmConfigStatusTextBlock!.Text = "已保存到当前 Windows 用户环境变量；请重启后端后生效。";
             StatusTextBlock.Text = "大模型配置已保存，请重启后端。";
             MessageBox.Show(this, "大模型配置已保存。请重启后端，新的 API Key 和模型配置才会生效。", "保存成功", MessageBoxButton.OK, MessageBoxImage.Information);
