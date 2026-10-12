@@ -258,7 +258,7 @@ def validate_data_governance_service_design(document: dict[str, Any]) -> list[Va
     # 也不允许历史数据迁移包含迁移工具开发或购买。此类冲突需要结合全文判断，
     # 不能只看 6.3 表内的服务名称和计量单位。
     errors.extend(_find_service_declaration_conflicts(full_text, annex_text, found_specs))
-    errors.extend(_check_governance_acceptance_requirements(full_text, found_specs))
+    errors.extend(_check_governance_acceptance_requirements(full_text, found_specs, candidate_tables))
 
     for spec in found_specs:
         context = _service_context(annex_text, spec)
@@ -359,49 +359,128 @@ def _find_service_declaration_conflicts(
 def _check_governance_acceptance_requirements(
     full_text: str,
     found_specs: list[DataGovernanceServiceSpec],
+    tables: list[GovernanceAnnexTable] | None = None,
 ) -> list[ValidationError]:
-    """在报告明确编写验收/交付物时，核对指引要求的证明材料。"""
+    """Supplement the service annex, not the project's overall acceptance plan.
 
-    # Only service-linked delivery prose is evidence. A generic security log
-    # or quoted policy elsewhere must not satisfy this service's acceptance.
-    linked_text = _governance_delivery_context(full_text, found_specs)
+    The guide's new-data obligations are conditional. A service name alone
+    cannot prove new data is produced, nor that acceptance materials are due
+    at feasibility-study time. Existing, explicitly linked prose is valid.
+    """
+    tables = tables or []
     errors: list[ValidationError] = []
-    names = {spec.name for spec in found_specs}
-    if names & {"数据购买", "历史数据迁移", "数据融合"}:
-        required = {"数据上链": ("数据上链", "完成上链", "开展上链", "进行上链", "归集和上链", "政务目录链登记", "政务目录链编目"), "资源归集": ("数据资源归集", "资源归集", "归集至市大数据中心", "归集至公共数据平台", "向市大数据中心汇聚"), "质量自评估": ("质量自评估", "质量自评价", "数据质量评价", "质量自评", "自行开展数据质量评估", "自行评价数据质量", "自行评估数据质量")}
-        missing = [label for label, aliases in required.items() if not _has_delivery_evidence(linked_text, aliases)]
+    missing_by_service = []
+    new_data_specs = []
+    for spec in found_specs:
+        if spec.name not in {"数据购买", "历史数据迁移", "数据融合"}:
+            continue
+        rows = _governance_service_rows(tables, spec)
+        own_text = '\n'.join([' | '.join(row) for _, _, row in rows]
+                             + [_governance_delivery_context(full_text, [spec], include_common=False)])
+        if not _produces_new_governance_data(own_text):
+            continue
+        linked = own_text + '\n' + _governance_delivery_context(full_text, [spec])
+        required = {
+            "资源归集": ("数据资源归集", "资源归集", "归集至市大数据中心", "归集至公共数据平台", "向市大数据中心汇聚"),
+            "质量自评估": ("质量自评估", "质量自评价", "数据质量评价", "质量自评", "自行开展数据质量评估", "自行评价数据质量", "自行评估数据质量"),
+        }
+        missing = ([] if _has_governance_chain_evidence(linked) else ["政务目录链上链"])
+        missing += [label for label, aliases in required.items() if not _has_delivery_evidence(linked, aliases)]
         if missing:
-            errors.append(
-                ValidationError(
-                    code="DGS-010",
-                    message=f"数据购买、历史数据迁移或数据融合未识别到以下交付要求：{'、'.join(missing)}；通用背景提及仍需与本服务交付物对应。",
-                    section="验收要求",
-                    severity="warning",
-                    suggestion="请补充新数据上链、资源归集及数据质量自评估等验收内容。",
-                )
-            )
+            new_data_specs.append(spec)
+            missing_by_service.append(f"{spec.name}：{'、'.join(missing)}")
+    if missing_by_service:
+        errors.append(ValidationError(
+            code="DGS-010",
+            message="数据治理表或关联说明涉及形成新数据，以下交付约定尚未确认（" + '；'.join(missing_by_service)
+                    + "）。这是服务交付的补充核查，应先确认指引适用及新增数据范围；不等同于缺少竣工验收材料。",
+            section=_governance_delivery_section(tables, new_data_specs), severity="warning",
+            suggestion="请先核对数据治理表的相关服务行、治理成效及交付物列，并指出关联正文中的已有说明；"
+                       "确认适用后再补充相应约定，无需在可研阶段提供已完成的验收报告。"))
     log_specs = [s for s in found_specs if s.name in {'数据标签', '历史数据归档及销毁'}]
-    if log_specs and not _has_delivery_evidence(_governance_delivery_context(full_text, log_specs, include_common=False), ('执行日志', '操作记录', '执行记录', '处理日志', '作业日志', '归档日志', '销毁记录', '标注日志')):
+    missing_logs = [spec for spec in log_specs if not _has_delivery_evidence(
+        '\n'.join([' | '.join(row) for _, _, row in _governance_service_rows(tables, spec)]) + '\n'
+        + _governance_delivery_context(full_text, [spec]),
+        ('执行日志', '操作记录', '执行记录', '处理日志', '作业日志', '归档日志', '销毁记录', '标注日志'))]
+    if missing_logs:
         errors.append(
             ValidationError(
                 code="DGS-011",
-                message="数据标签或历史数据归档及销毁服务的验收描述未明确执行日志。",
-                section="验收要求",
+                message=f"{'、'.join(s.name for s in missing_logs)}的服务表及关联说明中，尚未确认执行日志或等价操作记录的交付约定；需结合已有说明核实。",
+                section=_governance_delivery_section(tables, missing_logs),
                 severity="warning",
-                suggestion="请将执行日志列为数据标签、归档及销毁服务的验收交付物。",
+                suggestion="请核对相关服务行的交付物及明确关联的正文；已有执行或操作记录约定可作为依据，无需现在提交实际日志。",
             )
         )
-    if "数据安全风险评估" in names and not all(_has_delivery_evidence(linked_text, (token,)) for token in ("评估报告", "整改报告", "信息安全服务资质")):
+    assessment_specs = [s for s in found_specs if s.name == '数据安全风险评估']
+    assessment_text = _governance_delivery_context(full_text, assessment_specs) if assessment_specs else ''
+    assessment_text += '\n' + '\n'.join(' | '.join(row) for spec in assessment_specs
+                                         for _, _, row in _governance_service_rows(tables, spec))
+    if assessment_specs and not all(_has_delivery_evidence(assessment_text, (token,)) for token in ("评估报告", "整改报告", "信息安全服务资质")):
         errors.append(
             ValidationError(
                 code="DGS-012",
-                message="数据安全风险评估的验收描述未明确第三方资质、评估报告或整改报告。",
-                section="验收要求",
+                message="数据安全风险评估的服务表及关联说明中，尚未确认第三方资质、评估报告或整改报告的约定。",
+                section=_governance_delivery_section(tables, assessment_specs),
                 severity="warning",
-                suggestion="请补充第三方信息安全服务资质、盖章版评估报告和数据安全风险整改报告。",
+                suggestion="请核对该服务的资质条件与计划交付成果；可研阶段说明相应约定即可，不要求已经取得竣工验收材料。",
             )
         )
     return errors
+
+
+def _governance_service_rows(tables, spec):
+    for table in tables:
+        column = _table_header_mapping(table).get('服务事项')
+        if column is None:
+            continue
+        for number, row in enumerate(table.rows, 1):
+            if column < len(row) and _service_text_matches_spec(row[column], spec):
+                yield table, number, row
+
+
+def _governance_delivery_section(tables, specs):
+    # Representative service rows identify the checked scope. Never redirect
+    # a missing-deliverable warning to a generic project acceptance heading.
+    selected = []
+    for spec in specs:
+        rows = list(_governance_service_rows(tables, spec))
+        if rows:
+            table, number, row = next((r for r in rows if _produces_new_governance_data(' | '.join(r[2]))), rows[0])
+            selected.append(f"{table.heading_text or '数据治理内容'} 表内行{number}：" + ' | '.join(row))
+    return '；'.join(dict.fromkeys(selected)) or '数据治理内容'
+
+
+def _produces_new_governance_data(text):
+    output_pattern = (
+        r'(?:产生|生成|形成|新增|构建|建立|输出).{0,35}?'
+        r'(?:新(?:的|增的)?[^，。；|]{0,10}数据|数据集|宽表|主题库|专题库|成果数据|融合数据)'
+        r'|(?:新增|新产生|新生成).{0,16}?数据(?!治理|服务|目录|质量|安全|评估|迁移|融合|标签)'
+        r'|(?:购买|引入|获取).{0,15}?(?:第三方|外部|新的)[^，。；|]{0,12}数据(?:集)?'
+    )
+    for clause in re.split(r'[。；;\n]|但是|但|然而', text):
+        if re.search(r'例如|示例|模板|指引规定|政策规定|后续项目|另行立项|远期规划', clause):
+            continue
+        for match in re.finditer(output_pattern, clause):
+            prefix = re.split(r'[，,|]', clause[:match.start()])[-1]
+            if re.search(r'不(?:再|会|需要)?$|未$|不会|无需|不涉及|不包含|是否|可能|如果|若|仅举例', prefix):
+                continue
+            return True
+    return False
+
+
+def _has_governance_chain_evidence(text):
+    for clause in re.split(r'[。；;\n]', text):
+        # A different chain, or explicitly declining the government directory
+        # chain, must not be accepted merely because it contains “上链”.
+        if re.search(r'不涉及|不对接|不接入|无需|不开展|不完成|未完成', clause):
+            continue
+        if re.search(r'国家航贸链|航贸链|联盟链|行业链|企业链', clause) and '政务目录链' not in clause:
+            continue
+        if _has_delivery_evidence(clause, ('数据上链', '完成上链', '开展上链', '进行上链', '归集和上链',
+                                           '政务目录链登记', '政务目录链编目', '配合开展上链')):
+            return True
+    return False
 
 
 def _governance_delivery_context(text, specs, include_common=True):
@@ -410,21 +489,33 @@ def _governance_delivery_context(text, specs, include_common=True):
     for i, line in enumerate(lines):
         named = any(_service_text_matches_spec(line, s) for s in specs)
         common = include_common and bool(re.search(r'数据治理(?:服务)?|数据上链内容|本项目.{0,25}(?:新数据|数据资源|政务目录链)', line))
-        if not (named or common) or re.search(r'例如|示例|政策规定|指引规定|模板示范', line):
+        if not (named or common) or re.search(r'例如|示例|政策规定|指引规定|模板示范|后续项目|另行立项|远期规划', line):
+            continue
+        # A different named service does not satisfy this service's duties.
+        other = any(_service_text_matches_spec(line, s) for s in DATA_GOVERNANCE_SERVICE_SPECS if s not in specs)
+        if other and not named:
             continue
         selected.append(line)
         # A short heading can introduce its delivery paragraph. Never consume
         # unrelated paragraphs merely because a long service row precedes them.
-        if len(line) < 40 and i + 1 < len(lines) and not re.match(r'^\d+(?:\.\d+)*\s', lines[i + 1]):
-            selected.append(lines[i + 1])
+        if len(line) < 40 and not re.search(r'[。；;|]', line):
+            for following in lines[i + 1:i + 5]:
+                if re.match(r'^\d+(?:\.\d+)*[.、\s]', following):
+                    break
+                if any(_service_text_matches_spec(following, s) for s in DATA_GOVERNANCE_SERVICE_SPECS if s not in specs):
+                    break
+                if re.search(r'例如|示例|政策规定|指引规定|模板示范|后续项目|另行立项|远期规划', following):
+                    break
+                selected.append(following)
     return '\n'.join(selected)
 
 
 def _has_delivery_evidence(text, terms):
     for clause in re.split(r'[。；;\n]', text):
-        if re.fullmatch(r'\s*(?:\d+(?:\.\d+)*\s*)?(?:数据上链|资源归集|数据质量|验收|执行日志)(?:内容|要求|说明)?\s*', clause):
+        heading = re.sub(r'^\s*(?:(?:第[一二三四五六七八九十百\d]+[章节条])|[（(]?[一二三四五六七八九十百\d]+(?:\.\d+)*[）).、．:：]?)\s*', '', clause)
+        if re.fullmatch(r'\s*(?:数据上链|资源归集|数据质量|验收|执行日志)(?:内容|要求|说明)?\s*', heading):
             continue
-        if re.search(r'未(?:提供|提交|形成|开展|完成)|尚无|缺少|待补充|无需|不提供|不提交|不开展|不要求|无需', clause):
+        if re.search(r'未(?:提供|提交|形成|开展|完成)|尚无|缺少|待补充|无需|不提供|不提交|不开展|不要求|不涉及|不对接', clause):
             continue
         if _has_positive_phrase(clause, terms):
             return True

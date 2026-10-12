@@ -233,6 +233,7 @@ def evaluate_result_source_preview(
     paragraph: int = 0,
     line: int = 0,
     section: str = "",
+    precision_rule: str | None = None,
     db: Session = Depends(get_db),
 ) -> Response:
     """Render a source inside the desktop review pane while retaining the original download endpoint."""
@@ -248,6 +249,18 @@ def evaluate_result_source_preview(
         raise HTTPException(status_code=404, detail="原始报告附件不存在")
 
     suffix = Path(artifact.filename).suffix.lower()
+    if precision_rule is not None:
+        module = _precise_rule_module(precision_rule)
+        result = db.get(CheckResult, result_id)
+        if module is None or result is None or result.module != module:
+            raise HTTPException(status_code=400, detail="该检查项未启用精确原文定位")
+        if suffix != ".docx":
+            raise HTTPException(status_code=400, detail="精确原文定位当前支持DOCX报告")
+        try:
+            return HTMLResponse(content=_render_rule_evidence_preview(artifact.content, artifact.filename),
+                                headers={"Cache-Control": "no-store"})
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"精确原文预览生成失败：{exc}") from exc
     if suffix == ".docx":
         try:
             return HTMLResponse(
@@ -1728,6 +1741,217 @@ def _store_result_source_artifact(
 ) -> None:
     """Attach the original Word/text/spreadsheet snapshot to every standalone result."""
     _store_current_source_artifact(db, result_id, content, filename)
+
+
+def _precise_rule_module(rule_id: str) -> str | None:
+    if rule_id in {"R15_SECURITY_PAAS_CRYPTO_QUANTITY", "R16_SERVER_OS_QUANTITY", "R16_DB_SERVER_DATABASE_QUANTITY"}:
+        return "resource"
+    if rule_id in {"DATA_REASON_001", "DATA_REASON_002", "DATA_REASON_024"}:
+        return "data_reasonableness"
+    return None
+
+
+def _render_rule_evidence_preview(content: bytes, filename: str) -> str:
+    """Opt-in DOCX preview using the five rules' existing document coordinates."""
+    import hashlib
+    from docx.oxml.ns import qn
+    from docx.text.paragraph import Paragraph
+    from app.modules.resource.quantity_parser import DocumentIndex, W, heading_level
+
+    index = DocumentIndex(content, filename)
+    doc = index.document
+    paragraphs = {b["paragraph"]: b for b in index.blocks if b.get("paragraph")}
+    rows = {
+        (b["table_index"], b.get("table_path", ""), b["row_index"]): b
+        for b in index.blocks if b.get("table_index")
+    }
+    merge_ends = {}
+    for (table, path, row), block in rows.items():
+        for cell in block.get("cells", []):
+            key = (table, path, cell["origin_row"], cell["column_start"])
+            merge_ends[key] = max(merge_ends.get(key, 0), row)
+
+    def attrs(kind, text, section="", **coordinates):
+        values = {"kind": kind, "text": text, "section": section, **coordinates}
+        return " ".join(
+            'data-e-' + name.replace("_", "-") + '="' + html.escape(str(value), quote=True) + '"'
+            for name, value in values.items()
+        )
+
+    def inline(node):
+        if node.tag in {W + "del", W + "instrText", W + "delText"}:
+            return ""
+        if node.tag == W + "t":
+            return html.escape(node.text or "")
+        if node.tag in {W + "br", W + "cr"}:
+            return "<br>"
+        if node.tag == W + "tab":
+            return "&#9;"
+        if node.tag == qn("a:blip"):
+            part = doc.part.related_parts.get(node.get(qn("r:embed")))
+            if part is None:
+                return ""
+            image = base64.b64encode(part.blob).decode("ascii")
+            return '<img alt="文档图片" src="data:' + html.escape(part.content_type, quote=True) + ';base64,' + image + '">'
+        value = "".join(inline(child) for child in node)
+        if node.tag == W + "r":
+            for prop, tag in (("b", "strong"), ("i", "em"), ("u", "u")):
+                setting = node.find(W + "rPr/" + W + prop)
+                if setting is not None and setting.get(qn("w:val"), "1") not in {"0", "false", "none"}:
+                    value = f"<{tag}>{value}</{tag}>"
+        return value
+
+    def paragraph(element, number=None):
+        item = Paragraph(element, doc)
+        block = paragraphs.get(number) if number is not None else None
+        level = heading_level(item) if block and block.get("is_heading") else None
+        tag = "h" + str(min(level, 6)) if level else "p"
+        attributes = attrs("paragraph", block["quote"], block.get("section", ""), paragraph=number) if block else ""
+        return f'<{tag} class="rule-evidence-block" {attributes}>' + (inline(element) or "&nbsp;") + f"</{tag}>"
+
+    def table(element, number=None, path=""):
+        output = []
+        for row_number, row in enumerate(element.findall(W + "tr"), 1):
+            block = rows.get((number, path, row_number))
+            section = block.get("section", "") if block else ""
+            coordinates = {"table": number, "path": path, "row": row_number}
+            row_attrs = attrs("row", block["quote"], section, **coordinates) if block else ""
+            cells = []
+            before = row.find(W + "trPr/" + W + "gridBefore")
+            leading = int(before.get(qn("w:val"), "0")) if before is not None else 0
+            if leading:
+                cells.append(f'<td colspan="{leading}" aria-hidden="true"></td>')
+            for cell_number, cell in enumerate(row.findall(W + "tc")):
+                info = block["cells"][cell_number] if block else None
+                if info and info["origin_row"] != row_number:
+                    continue
+                column = info["column_start"] if info else cell_number + 1
+                width = info["column_end"] - column + 1 if info else 1
+                last_row = merge_ends.get((number, path, row_number, column), row_number)
+                cell_attrs = attrs(
+                    "cell", info["quote"], section, **coordinates,
+                    column=column, column_end=column + width - 1, row_end=last_row,
+                ) if info else ""
+                body = []
+                nested_index = 0
+                for child in cell:
+                    if child.tag == W + "p":
+                        body.append(paragraph(child))
+                    elif child.tag == W + "tbl":
+                        nested_index += 1
+                        nested_path = (path + "/" if path else "") + f"{row_number}/{column}/{nested_index}"
+                        body.append(table(child, number, nested_path))
+                    elif child.tag == W + "sdt":
+                        body.append(inline(child))
+                cells.append(
+                    f'<td class="rule-evidence-block" colspan="{width}" rowspan="{last_row-row_number+1}" {cell_attrs}>'
+                    + "".join(body) + "</td>"
+                )
+            output.append(f'<tr class="rule-evidence-block" {row_attrs}>' + "".join(cells) + "</tr>")
+        return '<table class="document-table"><tbody>' + "".join(output) + "</tbody></table>"
+
+    indexed = {}
+    paragraph_number = table_number = 0
+    for child in index.body_children(doc.element.body):
+        if child.tag == W + "p":
+            paragraph_number += 1
+            indexed[child] = ("paragraph", paragraph_number)
+        elif child.tag == W + "tbl":
+            table_number += 1
+            indexed[child] = ("table", table_number)
+
+    def body_parts(container):
+        output = []
+        for child in container:
+            kind, number = indexed.get(child, ("", None))
+            if child.tag == W + "p":
+                output.append(paragraph(child, number))
+            elif child.tag == W + "tbl":
+                output.append(table(child, number))
+            elif child.tag == W + "sdt":
+                nested = child.find(W + "sdtContent")
+                if nested is not None:
+                    output.append(body_parts(nested))
+            elif child.tag == W + "ins":
+                output.append(body_parts(child))
+        return "".join(output)
+
+    snapshot = json.dumps({
+        "filename": filename, "sha256": hashlib.sha256(content).hexdigest(), "version": "rule-evidence-v1",
+    }, ensure_ascii=True).replace("<", "\\u003c")
+    script = r"""
+<style>
+ .rule-evidence-block {scroll-margin-top:24px}
+ .rule-evidence-target {background:#fff0a6!important;outline:2px solid #e5a014;outline-offset:1px}
+ tr.rule-evidence-target>td {background:#fff0a6}
+ .rule-evidence-scope {background:#e8f1ff!important;outline:2px dashed #4a77ba}
+ .rule-evidence-candidate {outline-style:dashed!important}
+ h4,h5,h6 {font-size:16px;line-height:1.5;margin:16px 0 10px}
+</style>
+<script>
+(() => {
+ const norm = value => String(value || '').normalize('NFKC').replace(/\s+/g, '');
+ const all = () => Array.from(document.querySelectorAll('[data-e-kind]'));
+ const num = (el,key) => Number(el.getAttribute('data-e-'+key) || 0);
+ const attr = (el,key) => el.getAttribute('data-e-'+key) || '';
+ const clear = () => document.querySelectorAll('.rule-evidence-target,.rule-evidence-scope,.rule-evidence-candidate')
+   .forEach(el => el.classList.remove('rule-evidence-target','rule-evidence-scope','rule-evidence-candidate'));
+ window.clearRuleEvidence = clear;
+ window.locateRuleEvidence = payload => {
+   clear();
+   const loc = payload.source || {};
+   if (payload.file_name && payload.file_name !== window.ruleEvidenceReady.filename)
+     return {status:'wrong_document',matched_count:0};
+   const quote = norm(loc.quote);
+   const scoped = loc.role === 'scope' || loc.match_status === 'scope';
+   const column = Number(loc.column_start || 0);
+   const table = Number(loc.table_index || 0);
+   const row = Number(loc.row_index || 0);
+   const paragraph = Number(loc.paragraph || 0);
+   const path = String(loc.table_path || '');
+   let candidates = [];
+   let addressed = false;
+   if (table && row) {
+     addressed = true;
+     candidates = all().filter(el => num(el,'table') === table && attr(el,'path') === path &&
+       (column
+         ? attr(el,'kind') === 'cell' && num(el,'row') <= row && num(el,'row-end') >= row &&
+           num(el,'column') <= column && num(el,'column-end') >= column
+         : attr(el,'kind') === 'row' && num(el,'row') === row));
+   } else if (paragraph) {
+     addressed = true;
+     candidates = all().filter(el => attr(el,'kind') === 'paragraph' && num(el,'paragraph') === paragraph);
+   } else if (quote.length >= 4 && loc.section) {
+     const section = norm(loc.section);
+     candidates = all().filter(el => attr(el,'kind') !== 'cell' && norm(attr(el,'section')) === section &&
+       norm(attr(el,'text')) === quote);
+   }
+   if (!candidates.length) return {status:'unresolved',matched_count:0};
+   if (candidates.length !== 1) return {status:'ambiguous',matched_count:candidates.length};
+   const target = candidates[0];
+   const actual = norm(attr(target,'text'));
+   if (loc.section && norm(attr(target,'section')) !== norm(loc.section))
+     return {status:'section_mismatch',matched_count:0};
+   if (!quote || (actual !== quote && !(quote.length >= 4 && actual.includes(quote))))
+     return {status:'text_mismatch',matched_count:0};
+   const status = scoped ? 'scope' : loc.match_status === 'ambiguous' ? 'candidate' : addressed ? 'matched' : 'text_match';
+   const targets = [target];
+   if (table && row && !column) {
+     all().filter(el => attr(el,'kind') === 'cell' && num(el,'table') === table && attr(el,'path') === path &&
+       num(el,'row') < row && num(el,'row-end') >= row).forEach(el => targets.push(el));
+   }
+   targets.forEach(el => {
+     el.classList.add(scoped ? 'rule-evidence-scope' : 'rule-evidence-target');
+     if (status === 'candidate') el.classList.add('rule-evidence-candidate');
+   });
+   target.scrollIntoView({behavior:'instant',block:'start'});
+   return {status,matched_count:targets.length};
+ };
+ window.ruleEvidenceReady = __SNAPSHOT__;
+})();
+</script>
+""".replace("__SNAPSHOT__", snapshot)
+    return _source_preview_page(filename, body_parts(doc.element.body)).replace("</body>", script + "</body>")
 
 
 def _render_docx_preview(

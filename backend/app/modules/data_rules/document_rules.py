@@ -906,6 +906,8 @@ def _group_validation_errors_by_rule(errors: list[ValidationError]) -> dict[str,
                 "suggestion": error.suggestion,
             }
         )
+        if str(rule["rule_id"]) == "DATA_REASON_024":
+            grouped["DATA_REASON_024"][-1]["code"] = str(error.code)
     return grouped
 
 
@@ -2430,7 +2432,23 @@ def _retain_data_evidence_locations(result, content, filename):
     for issue in rows:
         data = asdict(issue) if isinstance(issue, RuleIssue) else issue
         evidence = data.get('evidence') or data.get('section') or ''
-        locations.append(build_evidence_location(index, [evidence], data.get('section') or '', advice=advice))
+        is_governance = not isinstance(result, RuleResult) and result.get('rule_id') == 'DATA_REASON_024'
+        issue_advice = (data.get('suggestion') or advice) if is_governance else advice
+        location = build_evidence_location(index, [evidence], data.get('section') or '', advice=issue_advice)
+        if is_governance and data.get('code') in {'DGS-010', 'DGS-011', 'DGS-012'}:
+            # A service row is the scope being checked, not a quotation proving
+            # absent words. Preserve exact coordinates but show the blue scope.
+            for entry in location['source_locations'] + location['source_highlights']:
+                entry['role'] = 'scope'
+                if entry.get('match_status') == 'matched':
+                    entry['match_status'] = 'scope'
+            location['source_location']['precision'] = 'scope'
+            if location['source_location']['match_status'] == 'matched':
+                location['source_location']['match_status'] = 'scope'
+            location['location_hint'] = '相关服务及交付物核查范围：' + location['location_hint'].removeprefix('核查范围：')
+            location['revision_target']['location_hint'] = location['location_hint']
+            location['revision_target']['target_type'] = 'section_or_document'
+        locations.append(location)
     if isinstance(result, RuleResult):
         return replace(result, evidence_locations=locations)
     return {**result, 'evidence_locations': locations}

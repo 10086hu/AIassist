@@ -136,7 +136,8 @@ def test_semantic_acceptance_and_non_service_logs():
     assert any(e.code == 'DGS-011' for e in _check_governance_acceptance_requirements('安全运维系统提供执行日志。', specs('数据标签')))
     assert any(e.code == 'DGS-011' for e in _check_governance_acceptance_requirements('数据标签服务不提供执行日志。', specs('数据标签')))
     missing = _check_governance_acceptance_requirements('6.4 数据上链内容', specs('数据融合'))
-    assert any('数据上链' in e.message for e in missing)
+    # A heading and a service name do not establish the guide's new-data condition.
+    assert not any(e.code == 'DGS-010' for e in missing)
     explained = _check_governance_acceptance_requirements('6.4 数据上链内容\n项目建设后将根据市级要求配合开展上链工作。', specs('数据融合'))
     assert not any('交付要求：数据上链' in e.message for e in explained)
 

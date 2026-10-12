@@ -50,6 +50,9 @@ public partial class MainWindow : Window
     private TextBlock? _ruleStatsTextBlock;
     private string _activeRuleModule = "function_correspondence";
     private string? _activeRecordId;
+    private int _preciseEvidenceGeneration;
+    private Task<bool>? _evidencePreviewLoadTask;
+    private string? _evidencePreviewLoadingUrl;
     private Button? _reportNavButton;
     private Button? _specialistNavButton;
     private Button? _recordsNavButton;
@@ -2735,19 +2738,52 @@ public partial class MainWindow : Window
             _documentLocationTextBlock.Text = "Word 完整原文预览";
         }
 
+        var generation = ++_preciseEvidenceGeneration;
+        var usesPrecisePreview = false;
         try
         {
+            if (Path.GetExtension(filename).Equals(".docx", StringComparison.OrdinalIgnoreCase)
+                && root.TryGetProperty("result", out var result)
+                && result.TryGetProperty("findings", out var findings)
+                && findings.ValueKind == JsonValueKind.Array)
+            {
+                var preciseFinding = findings.EnumerateArray().FirstOrDefault(UsesCompactReportEvidence);
+                if (preciseFinding.ValueKind == JsonValueKind.Object)
+                {
+                    usesPrecisePreview = true;
+                    if (_documentLocationTextBlock != null)
+                        _documentLocationTextBlock.Text = "正在加载报告原文，可点击子问题等待定位…";
+                    var url = RuleEvidencePreviewUrl(_activePreviewUrl, GetString(preciseFinding, "rule_id"));
+                    if (await EnsureEvidencePreviewAsync(url, generation) && _documentLocationTextBlock != null)
+                        _documentLocationTextBlock.Text = "报告原文已加载，点击子问题即可定位对应位置。";
+                    return;
+                }
+            }
             await _documentWebView.EnsureCoreWebView2Async();
+            if (generation != _preciseEvidenceGeneration) return;
             _documentWebView.Source = new Uri(_activePreviewUrl);
         }
         catch (Exception exc)
         {
-            ResetDocumentPreview($"原文加载失败：{exc.Message}");
+            if (generation != _preciseEvidenceGeneration) return;
+            if (!usesPrecisePreview)
+            {
+                ResetDocumentPreview($"原文加载失败：{exc.Message}");
+                return;
+            }
+            if (_documentLocationTextBlock != null)
+                _documentLocationTextBlock.Text = $"原文加载未完成，可点击子问题重试：{exc.Message}";
         }
     }
 
     private async Task NavigateToFindingAsync(JsonElement finding, string? preferredRole = null)
     {
+        if (UsesCompactReportEvidence(finding))
+        {
+            await NavigateToRuleEvidenceAsync(finding);
+            return;
+        }
+        ++_preciseEvidenceGeneration;
         if (_documentWebView == null || string.IsNullOrWhiteSpace(_activePreviewUrl))
         {
             return;
@@ -2844,8 +2880,187 @@ public partial class MainWindow : Window
         }
     }
 
+    private async Task NavigateToRuleEvidenceAsync(JsonElement finding, JsonElement? evidence = null)
+    {
+        if (_documentWebView == null || !UsesCompactReportEvidence(finding)) return;
+        var generation = ++_preciseEvidenceGeneration;
+        // Do not await script execution in the page being replaced: WebView2 can
+        // queue that script until a slow, obsolete navigation has completed.
+        if (_documentLocationTextBlock != null)
+            _documentLocationTextBlock.Text = "正在定位本处原文；首次加载较大报告可能需要一些时间…";
+        var ruleId = GetString(finding, "rule_id");
+        var sources = ReportEvidenceSources(finding);
+        if (!evidence.HasValue)
+        {
+            if (sources.Count != 1)
+            {
+                if (_documentLocationTextBlock != null)
+                    _documentLocationTextBlock.Text = sources.Count == 0
+                        ? "没有可核验的具体位置，请按报告中的核查范围查看。"
+                        : $"本项有 {sources.Count} 个关联部分，请点击对应子问题定位原文。";
+                return;
+            }
+            evidence = sources[0];
+        }
+        var source = evidence.Value.Clone();
+        var savedName = _previewNamesByRole.GetValueOrDefault("current", string.Empty);
+        var sourceName = FirstNonEmpty(GetString(source, "file_name"), savedName);
+        if (!_previewUrlsByRole.TryGetValue("current", out var defaultUrl)
+            || string.IsNullOrWhiteSpace(savedName))
+        {
+            if (_documentLocationTextBlock != null)
+                _documentLocationTextBlock.Text = "当前记录未保存可预览的原文件，无法精确定位。";
+            return;
+        }
+        if (!string.Equals(savedName, sourceName, StringComparison.Ordinal))
+        {
+            if (_documentLocationTextBlock != null)
+                _documentLocationTextBlock.Text = "依据所属文件与当前原文件不一致，未执行定位。";
+            return;
+        }
+        if (!Path.GetExtension(savedName).Equals(".docx", StringComparison.OrdinalIgnoreCase))
+        {
+            if (_documentLocationTextBlock != null)
+                _documentLocationTextBlock.Text = "精确定位当前支持 Word DOCX；此文件请按已有位置说明查看。";
+            return;
+        }
+        var recordId = _activeRecordId;
+        var url = RuleEvidencePreviewUrl(defaultUrl, ruleId);
+        try
+        {
+            if (_documentLocationTextBlock != null) _documentLocationTextBlock.Text = "正在核对原文件并定位…";
+            if (!await EnsureEvidencePreviewAsync(url, generation)) return;
+            if (generation != _preciseEvidenceGeneration || recordId != _activeRecordId) return;
+            var payload = JsonSerializer.Serialize(new { file_name = sourceName, source });
+            var response = await _documentWebView.ExecuteScriptAsync(
+                $"window.locateRuleEvidence ? window.locateRuleEvidence({payload}) : ({{status:'not_ready'}})")
+                .WaitAsync(TimeSpan.FromSeconds(15));
+            if (generation != _preciseEvidenceGeneration || recordId != _activeRecordId) return;
+            using var parsed = JsonDocument.Parse(response);
+            var status = GetString(parsed.RootElement, "status");
+            if (_documentLocationTextBlock != null)
+                _documentLocationTextBlock.Text = status switch
+                {
+                    "matched" => "已按原文坐标定位并高亮，摘录核对一致。",
+                    "scope" => "已定位核查范围；这里的文字本身不一定有错误。",
+                    "candidate" => "已显示你选择的候选位置，请结合章节确认。",
+                    "text_match" => "已在指定章节找到唯一相同摘录，尚非坐标精确定位。",
+                    "ambiguous" => "存在多处候选位置，请选择具体原文依据。",
+                    "text_mismatch" => "该坐标的原文与依据不一致，未生成推测性高亮。",
+                    "section_mismatch" => "该坐标所属章节与依据不一致，未生成推测性高亮。",
+                    "wrong_document" => "预览文件与依据所属文件不一致，未执行定位。",
+                    "not_ready" => "精确预览尚未就绪，请待原文加载后重试。",
+                    _ => "未找到可核验的具体位置，请按所列章节和表格人工查看。"
+                };
+        }
+        catch (Exception exc)
+        {
+            if (generation == _preciseEvidenceGeneration && recordId == _activeRecordId
+                && _documentLocationTextBlock != null)
+                _documentLocationTextBlock.Text = $"精确定位未完成：{exc.Message}";
+        }
+    }
+
+    private static string RuleEvidencePreviewUrl(string defaultUrl, string ruleId)
+    {
+        // One coordinate preview per saved file/module serves all five rules.
+        // The endpoint still validates that the rule belongs to this record.
+        var previewRule = ruleId is "R15_SECURITY_PAAS_CRYPTO_QUANTITY" or "R16_SERVER_OS_QUANTITY"
+            or "R16_DB_SERVER_DATABASE_QUANTITY" ? "R15_SECURITY_PAAS_CRYPTO_QUANTITY" : "DATA_REASON_001";
+        return defaultUrl + (defaultUrl.Contains('?') ? "&" : "?") + "precision_rule=" + previewRule;
+    }
+
+    private async Task<bool> EnsureEvidencePreviewAsync(string url, int generation)
+    {
+        if (_documentWebView == null) return false;
+        await _documentWebView.EnsureCoreWebView2Async();
+        if (generation != _preciseEvidenceGeneration) return false;
+        // Rapid clicks share the pending navigation. Only the latest click may
+        // apply its highlight after the document becomes ready.
+        if (_evidencePreviewLoadingUrl == url && _evidencePreviewLoadTask is { IsCompleted: false })
+        {
+            var shared = await _evidencePreviewLoadTask;
+            if (generation != _preciseEvidenceGeneration) return false;
+            if (shared) _activePreviewUrl = url;
+            return shared;
+        }
+        var destination = new Uri(url);
+        var core = _documentWebView.CoreWebView2;
+        if (Uri.TryCreate(core.Source, UriKind.Absolute, out var current) && current == destination)
+        {
+            var ready = await _documentWebView.ExecuteScriptAsync(
+                url.Contains("precision_rule=", StringComparison.Ordinal)
+                    ? "!!window.ruleEvidenceReady"
+                    : "document.readyState === 'complete'").WaitAsync(TimeSpan.FromSeconds(5));
+            if (generation != _preciseEvidenceGeneration) return false;
+            if (ready == "true")
+            {
+                _activePreviewUrl = url;
+                return true;
+            }
+        }
+        _evidencePreviewLoadingUrl = url;
+        var loading = LoadEvidencePreviewPageAsync(url);
+        _evidencePreviewLoadTask = loading;
+        var loaded = await loading;
+        if (generation != _preciseEvidenceGeneration) return false;
+        if (loaded) _activePreviewUrl = url;
+        return loaded;
+    }
+
+    private async Task<bool> LoadEvidencePreviewPageAsync(string url)
+    {
+        if (_documentWebView?.CoreWebView2 == null) return false;
+        var core = _documentWebView.CoreWebView2;
+        var destination = new Uri(url);
+        var loaded = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        ulong navigationId = 0;
+        EventHandler<Microsoft.Web.WebView2.Core.CoreWebView2NavigationStartingEventArgs> started = (_, e) =>
+        {
+            if (Uri.TryCreate(e.Uri, UriKind.Absolute, out var next) && next == destination)
+                navigationId = e.NavigationId;
+            else if (navigationId != 0)
+                loaded.TrySetResult(false);
+        };
+        EventHandler<Microsoft.Web.WebView2.Core.CoreWebView2NavigationCompletedEventArgs> completed = (_, e) =>
+        {
+            if (navigationId == 0 || e.NavigationId != navigationId) return;
+            if (e.HttpStatusCode >= 400)
+                loaded.TrySetException(new InvalidOperationException($"原文预览请求失败（HTTP {e.HttpStatusCode}），请确认原始附件及后端版本。"));
+            else if (!e.IsSuccess)
+                loaded.TrySetException(new InvalidOperationException("原文预览连接失败，请确认后端服务已启动后重试。"));
+            else loaded.TrySetResult(true);
+        };
+        core.NavigationStarting += started;
+        core.NavigationCompleted += completed;
+        try
+        {
+            // Navigate explicitly: clicking another excerpt must not depend on an arbitrary delay.
+            core.Navigate(url);
+            if (!await loaded.Task.WaitAsync(TimeSpan.FromSeconds(90))) return false;
+            var ready = await _documentWebView.ExecuteScriptAsync(url.Contains("precision_rule=", StringComparison.Ordinal)
+                ? "!!window.ruleEvidenceReady && typeof window.locateRuleEvidence === 'function'"
+                : "document.readyState === 'complete'").WaitAsync(TimeSpan.FromSeconds(10));
+            if (ready != "true")
+                throw new InvalidOperationException("原文页面尚未提供定位功能，请重启更新后的后端再重试。");
+            return true;
+        }
+        catch (TimeoutException)
+        {
+            if (Uri.TryCreate(core.Source, UriKind.Absolute, out var current) && current == destination)
+                core.Stop();
+            throw new InvalidOperationException("原文加载超时，请稍后点击子问题重试；若持续超时，请重启后端服务。");
+        }
+        finally
+        {
+            core.NavigationStarting -= started;
+            core.NavigationCompleted -= completed;
+        }
+    }
+
     private void ResetDocumentPreview(string message)
     {
+        ++_preciseEvidenceGeneration;
         _activePreviewUrl = null;
         _previewUrlsByRole.Clear();
         _previewNamesByRole.Clear();
@@ -3583,17 +3798,18 @@ public partial class MainWindow : Window
         var rule = FirstNonEmpty(GetString(finding, "rule_basis"), GetString(finding, "rule_name"), GetString(finding, "matched_rule"));
         var mergedCount = GetInt(finding, "merged_count");
         var llmRefined = GetBool(finding, "llm_refined");
+        var hasSubFindings = UsesCompactReportEvidence(finding);
         var findingSnapshot = finding.Clone();
         var stack = new StackPanel();
         stack.Children.Add(Text(title, 15, FontWeights.SemiBold, FindBrush("TextBrush"), null, true));
         stack.Children.Add(Text($"风险等级：{GetString(finding, "risk_level")}", 13, FontWeights.SemiBold, Brush(181, 71, 8), new Thickness(0, 5, 0, 0), true));
         stack.Children.Add(Text(llmRefined ? "AI辅助整理" : "规则审查结果", 12, FontWeights.SemiBold, llmRefined ? Brush(37, 99, 235) : Brush(102, 112, 133), new Thickness(0, 5, 0, 0), true));
         AddTextIf(stack, "审查意见", opinion, FindBrush("TextBrush"));
-        if (UsesCompactReportEvidence(finding))
+        if (hasSubFindings)
         {
             AddCompactDocumentBasis(stack, evidence, finding);
             AddRevisionAdvice(stack, advice, string.Empty);
-            AddCompactReportEvidence(stack, finding);
+            AddRuleSubFindings(stack, finding);
         }
         else
         {
@@ -3637,10 +3853,11 @@ public partial class MainWindow : Window
             Padding = new Thickness(12),
             Margin = new Thickness(0, 0, 0, 10),
             Child = stack,
-            Cursor = Cursors.Hand,
-            ToolTip = "在右侧原文中定位此问题"
+            Cursor = hasSubFindings ? Cursors.Arrow : Cursors.Hand,
+            ToolTip = hasSubFindings ? null : "在右侧原文中定位此问题"
         };
-        card.MouseLeftButtonUp += async (_, _) => await NavigateToFindingAsync(findingSnapshot);
+        if (!hasSubFindings)
+            card.MouseLeftButtonUp += async (_, _) => await NavigateToFindingAsync(findingSnapshot);
         return card;
     }
 
@@ -3701,23 +3918,10 @@ public partial class MainWindow : Window
         GetString(source, "table_path"), GetString(source, "sheet_name"), GetString(source, "page"),
         GetString(source, "role") == "scope" ? "scope" : "evidence" });
 
-    private static string EvidenceRows(IEnumerable<JsonElement> sources)
+    private void AddRuleSubFindings(StackPanel panel, JsonElement finding)
     {
-        var numbers = sources.Select(x => GetInt(x, "row_index")).Where(x => x > 0).Distinct().Order().ToArray();
-        var ranges = new List<string>();
-        for (var i = 0; i < numbers.Length; i++)
-        {
-            var start = numbers[i]; var end = start;
-            while (i + 1 < numbers.Length && numbers[i + 1] == end + 1) end = numbers[++i];
-            ranges.Add(start == end ? start.ToString() : $"{start}—{end}");
-        }
-        return ranges.Count == 0 ? "" : "表内第 " + string.Join("、", ranges) + " 行（含表头，非序号列）";
-    }
-
-    private void AddCompactReportEvidence(StackPanel panel, JsonElement finding)
-    {
-        panel.Children.Add(Text("报告原文", 14, FontWeights.SemiBold, FindBrush("TextBrush"), new Thickness(0, 12, 0, 4)));
         var sources = ReportEvidenceSources(finding);
+        panel.Children.Add(Text($"问题明细（{sources.Count} 个关联部分）", 14, FontWeights.SemiBold, FindBrush("TextBrush"), new Thickness(0, 12, 0, 4)));
         if (sources.Count == 0)
         {
             panel.Children.Add(Text("尚无可核验的具体原文位置，请按核查范围人工查找。", 12, null, FindBrush("MutedBrush"), null, true));
@@ -3725,58 +3929,73 @@ public partial class MainWindow : Window
             if (!string.IsNullOrWhiteSpace(hint)) panel.Children.Add(SelectableEvidence(hint));
             return;
         }
-        var groups = sources.GroupBy(EvidenceGroupKey).Select(x => x.ToList()).ToList();
-        panel.Children.Add(Text("以下按报告章节和表格列出对应原文。表内行号含表头，不等同于序号列。", 12, null, FindBrush("MutedBrush"), null, true));
-        var ambiguous = sources.Any(x => GetString(x, "match_status") == "ambiguous");
-        if (ambiguous) panel.Children.Add(Text("原文存在多处匹配：以下为候选位置，需要结合章节和表名确认。", 12, FontWeights.SemiBold, Brush(181, 71, 8), null, true));
-        for (var i = 0; i < groups.Count; i++) panel.Children.Add(BuildReportEvidenceGroup(groups[i], i + 1));
-    }
-
-    private Border BuildReportEvidenceGroup(List<JsonElement> sources, int number)
-    {
-        var first = sources[0];
-        var section = GetString(first, "section");
-        var leaf = section.Split('→', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).LastOrDefault() ?? "未识别章节标题";
-        var caption = GetString(first, "table_caption");
-        var sheet = GetString(first, "sheet_name");
-        var scope = GetString(first, "role") == "scope" || GetString(first, "match_status") == "scope";
-        var body = new StackPanel();
-        body.Children.Add(Text($"{number}. {leaf}" + (scope ? "（核查范围）" : ""), 13, FontWeights.SemiBold, FindBrush("TextBrush"), null, true));
-        if (section != leaf && !string.IsNullOrWhiteSpace(section)) body.Children.Add(Text(section, 12, null, FindBrush("MutedBrush"), new Thickness(0, 3, 0, 3), true));
-        if (!string.IsNullOrWhiteSpace(caption)) body.Children.Add(Text(caption, 13, FontWeights.SemiBold, Brush(146, 64, 14), null, true));
-        else if (!string.IsNullOrWhiteSpace(sheet)) body.Children.Add(Text(sheet + (GetInt(first, "table_index") > 0 ? "（程序解析编号，以报告章节为准）" : ""), 12, null, FindBrush("MutedBrush"), null, true));
-        var rows = EvidenceRows(sources);
-        if (!string.IsNullOrEmpty(rows)) body.Children.Add(Text(rows, 12, null, FindBrush("MutedBrush"), null, true));
-        if (GetInt(first, "page") > 0) body.Children.Add(Text($"第{GetInt(first, "page")}页", 12, null, FindBrush("MutedBrush")));
-        if (scope) body.Children.Add(Text("这里只标明已核查的范围，不代表此处文字本身有错误。", 12, null, FindBrush("MutedBrush"), null, true));
-        var filename = GetString(first, "file_name");
-        if (!string.IsNullOrWhiteSpace(filename)) body.Children.Add(Text("文件：" + filename, 11, null, FindBrush("MutedBrush"), null, true));
-        if (!string.IsNullOrWhiteSpace(GetString(first, "table_path"))) body.Children.Add(Text("嵌套表位置：" + GetString(first, "table_path"), 12, null, FindBrush("MutedBrush"), null, true));
-        // Small comparisons stay fully visible. Large aggregate tables retain
-        // several representative rows without repeating the heading 40 times.
+        panel.Children.Add(Text("以下子问题共同构成本项审查问题，点击卡片可在右侧定位对应原文。", 12, null, FindBrush("MutedBrush"), null, true));
+        // Keep every addressed source independently clickable, including rows
+        // that share the same table. Display parts do not add new findings.
         var visibleCount = sources.Count <= 6 ? sources.Count : 4;
-        for (var i = 0; i < visibleCount; i++) body.Children.Add(BuildReportExcerpt(sources[i]));
+        for (var i = 0; i < visibleCount; i++) panel.Children.Add(BuildRuleSubFindingCard(sources[i], finding, i + 1));
         if (sources.Count > visibleCount)
         {
             var rest = new StackPanel();
-            foreach (var source in sources.Skip(visibleCount)) rest.Children.Add(BuildReportExcerpt(source));
-            body.Children.Add(Text($"该表共涉及{sources.Count}处原文，以上展示{visibleCount}处；汇总数量的核验还涉及下方其余行。", 12, null, FindBrush("MutedBrush"), null, true));
-            body.Children.Add(new Expander { Header = $"查看其余 {sources.Count - visibleCount} 处原文", Content = rest });
+            for (var i = visibleCount; i < sources.Count; i++) rest.Children.Add(BuildRuleSubFindingCard(sources[i], finding, i + 1));
+            panel.Children.Add(new Expander { Header = $"展开其余 {sources.Count - visibleCount} 个子问题", Content = rest,
+                Margin = new Thickness(0, 6, 0, 0), HorizontalContentAlignment = HorizontalAlignment.Stretch });
         }
-        return new Border { Background = Brush(255, 251, 235), BorderBrush = Brush(245, 218, 148), BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(6), Padding = new Thickness(10), Margin = new Thickness(0, 6, 0, 4), Child = body };
     }
 
-    private StackPanel BuildReportExcerpt(JsonElement source)
+    private StackPanel BuildRuleSubFindingCard(JsonElement source, JsonElement finding, int number)
     {
-        var panel = new StackPanel { Margin = new Thickness(0, 5, 0, 7) };
-        var row = GetInt(source, "row_index"); var paragraph = GetInt(source, "paragraph"); var column = GetInt(source, "column_start");
-        var address = row > 0 ? $"表内第{row}行" : paragraph > 0 ? $"正文第{paragraph}段（解析顺序）" : "原文摘录";
+        var panel = new StackPanel { Margin = new Thickness(0, 8, 0, 0) };
+        var section = GetString(source, "section");
+        var leaf = section.Split('→', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).LastOrDefault();
+        var caption = GetString(source, "table_caption");
+        var sheet = GetString(source, "sheet_name");
+        var scope = GetString(source, "role") == "scope" || GetString(source, "match_status") == "scope";
+        var ambiguous = GetString(source, "match_status") == "ambiguous";
+        var row = GetInt(source, "row_index");
+        var paragraph = GetInt(source, "paragraph");
+        var column = GetInt(source, "column_start");
+        var line = GetInt(source, "line_start");
+        var address = row > 0 ? $"表内第{row}行（含表头）" : paragraph > 0 ? $"正文第{paragraph}段（解析顺序）"
+            : line > 0 ? $"第{line}行" : "原文摘录";
         if (column > 0) address += $"，第{column}列";
-        panel.Children.Add(Text(address, 12, FontWeights.SemiBold, Brush(146, 64, 14)));
+        if (GetInt(source, "page") > 0) address = $"第{GetInt(source, "page")}页 · " + address;
+        var title = $"子问题 {number} · {FirstNonEmpty(caption, leaf ?? string.Empty, sheet, "关联内容")}";
+        var body = new StackPanel();
+        body.Children.Add(Text(title, 13, FontWeights.SemiBold, FindBrush("TextBrush"), null, true));
+        if (!string.IsNullOrWhiteSpace(section)) body.Children.Add(Text(section, 12, null, FindBrush("MutedBrush"), new Thickness(0, 3, 0, 0), true));
+        if (string.IsNullOrWhiteSpace(caption) && !string.IsNullOrWhiteSpace(sheet))
+            body.Children.Add(Text(sheet + (GetInt(source, "table_index") > 0 ? "（程序解析编号）" : ""), 12, null, FindBrush("MutedBrush"), null, true));
+        body.Children.Add(Text(address, 12, null, FindBrush("MutedBrush"), new Thickness(0, 3, 0, 0), true));
         var quote = GetString(source, "quote");
-        panel.Children.Add(SelectableEvidence(EvidencePreview(quote, 900)));
-        if (quote.Length > 900) panel.Children.Add(new Expander { Header = "展开本处完整摘录", Content = SelectableEvidence(quote) });
+        body.Children.Add(Text(EvidencePreview(quote, 320), 13, null, FindBrush("TextBrush"), new Thickness(0, 6, 0, 0), true));
+        if (scope) body.Children.Add(Text("核查范围：用于说明本问题的检查范围，不代表这段文字本身有错误。", 12, null, FindBrush("MutedBrush"), new Thickness(0, 4, 0, 0), true));
+        if (ambiguous) body.Children.Add(Text("候选位置：原文有多处匹配，请结合章节和表名核对。", 12, null, Brush(181, 71, 8), new Thickness(0, 4, 0, 0), true));
+        var filename = GetString(source, "file_name");
+        if (!string.IsNullOrWhiteSpace(filename)) body.Children.Add(Text("文件：" + filename, 11, null, FindBrush("MutedBrush"), new Thickness(0, 4, 0, 0), true));
+        if (!string.IsNullOrWhiteSpace(GetString(source, "table_path")))
+            body.Children.Add(Text("嵌套表位置：" + GetString(source, "table_path"), 12, null, FindBrush("MutedBrush"), null, true));
+        var findingSnapshot = finding.Clone();
+        var sourceSnapshot = source.Clone();
+        var card = new Button
+        {
+            Style = (Style)FindResource("FindingPartButton"),
+            Content = body,
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            ToolTip = "点击此子问题，在右侧定位对应原文"
+        };
+        System.Windows.Automation.AutomationProperties.SetName(card, title + "，" + address);
+        card.Click += async (_, e) =>
+        {
+            e.Handled = true;
+            await NavigateToRuleEvidenceAsync(findingSnapshot, sourceSnapshot);
+        };
+        card.AddHandler(UIElement.MouseLeftButtonUpEvent,
+            new MouseButtonEventHandler((_, e) => e.Handled = true), true);
+        panel.Children.Add(card);
+        // Keep selection/expansion outside the button so these actions do not navigate.
+        if (quote.Length > 320) panel.Children.Add(new Expander { Header = "展开完整原文摘录", Content = SelectableEvidence(quote),
+            Margin = new Thickness(12, 4, 0, 0), HorizontalContentAlignment = HorizontalAlignment.Stretch });
         return panel;
     }
 
