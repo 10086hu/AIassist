@@ -31,6 +31,13 @@ class Settings:
     duplicate_llm_concurrency: int = int(os.getenv("DUPLICATE_LLM_CONCURRENCY", "4"))
     duplicate_extraction_max_tokens: int = int(os.getenv("DUPLICATE_EXTRACTION_MAX_TOKENS", "24000"))
     duplicate_task_timeout_seconds: int = int(os.getenv("DUPLICATE_TASK_TIMEOUT_SECONDS", "900"))
+    duplicate_candidate_top_k: int = int(os.getenv("DUPLICATE_CANDIDATE_TOP_K", "5"))
+    duplicate_judge_batch_size: int = int(os.getenv("DUPLICATE_JUDGE_BATCH_SIZE", "6"))
+    duplicate_judge_batch_chars: int = int(os.getenv("DUPLICATE_JUDGE_BATCH_CHARS", "24000"))
+    duplicate_cache_enabled: bool = os.getenv("DUPLICATE_CACHE_ENABLED", "true").lower() == "true"
+    duplicate_cache_dir: str = os.getenv("DUPLICATE_CACHE_DIR", str(
+        Path(os.getenv("AIASSIST_DATA_DIR") or Path(__file__).resolve().parents[3] / ".runtime") / "duplicate_cache"
+    ))
     embedding_dim: int = int(os.getenv("EMBEDDING_DIM", "384"))
     deepseek_api_key: str = os.getenv("DEEPSEEK_API_KEY", "")
     deepseek_api_url: str = os.getenv("DEEPSEEK_API_URL", "https://api.deepseek.com/v1")

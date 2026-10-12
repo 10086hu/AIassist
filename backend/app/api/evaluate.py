@@ -322,15 +322,68 @@ async def evaluate_duplicate_compare(
     )
 
 
+@router.post("/duplicate/compare/tasks")
+async def create_duplicate_compare_task(
+    background_tasks: BackgroundTasks,
+    current_file: UploadFile = File(...),
+    history_files: list[UploadFile] = File(default=[]),
+    project_id: str | None = Form(default=None),
+    check_run_id: str | None = Form(default=None),
+    project_name: str = Form(default="未命名可研项目"),
+    department: str | None = Form(default=None),
+    current_stage: str = Form(default="本期"),
+    history_stages: str | None = Form(default=None),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    if not history_files:
+        raise HTTPException(status_code=400, detail="请至少上传一个往期报告")
+    check_run = db.get(CheckRun, check_run_id) if check_run_id else None
+    if check_run_id and (check_run is None or check_run.project_id != project_id):
+        raise HTTPException(status_code=400, detail="报告检查记录不存在或不属于当前项目")
+    current = (await _read_upload(current_file, DUPLICATE_EXTENSIONS), current_file.filename or "")
+    history = [(await _read_upload(file, DUPLICATE_EXTENSIONS), file.filename or "") for file in history_files]
+    task_id = str(uuid.uuid4())
+    _set_task(task_id, status="queued", progress=0, stage="queued", message="跨报告检测任务已创建",
+              result_ids=[], error=None)
+    background_tasks.add_task(_run_duplicate_compare_task, task_id, current, history, project_id,
+                              check_run_id, project_name, department, current_stage, history_stages)
+    return {"task_id": task_id, "status": "queued"}
+
+
+def _run_duplicate_compare_task(task_id, current, history, project_id, check_run_id,
+                                project_name, department, current_stage, history_stages):
+    started = time.monotonic()
+    progress_last = 1
+
+    def progress(fraction, message):
+        nonlocal progress_last
+        progress_last = max(progress_last, min(95, int(fraction * 95)))
+        _set_task(task_id, progress=progress_last, stage="duplicate",
+                  message=f"{message}；任务已用时 {int(time.monotonic() - started)} 秒")
+
+    _set_task(task_id, status="running", stage="duplicate", progress=1, message="正在解析当前及往期长报告")
+    try:
+        with SessionLocal() as db:
+            result = _evaluate_duplicate_compare_sync(db, current[0], current[1], history, project_id,
+                                                      check_run_id, project_name, department, current_stage,
+                                                      history_stages, progress_reporter=progress)
+        _set_task(task_id, status="completed", progress=100, stage="completed", message="跨报告检查完成",
+                  result=result, elapsed_seconds=round(time.monotonic() - started, 2))
+    except Exception as exc:
+        error = str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
+        _set_task(task_id, status="failed", stage="failed", message="跨报告检查失败", error=error,
+                  elapsed_seconds=round(time.monotonic() - started, 2))
+
+
 def _evaluate_duplicate_compare_sync(
     db, current_content, current_filename, history_payloads, project_id,
-    check_run_id, project_name, department, current_stage, history_stages,
+    check_run_id, project_name, department, current_stage, history_stages, progress_reporter=None,
 ):
     check_run = db.get(CheckRun, check_run_id) if check_run_id else None
     if check_run_id and (check_run is None or check_run.project_id != project_id):
         raise HTTPException(status_code=400, detail="报告检查记录不存在或不属于当前项目")
     try:
-        with duplicate_execution():
+        with duplicate_execution(progress_reporter):
             raw = run_duplicate_compare_check(
                 db=db,
                 current_content=current_content,

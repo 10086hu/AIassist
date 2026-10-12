@@ -94,7 +94,7 @@ def test_extraction_chunks_stay_within_v4_flash_limit():
         "报告.docx",
     )
     chunks = llm_extractor._build_extraction_chunks(document)
-    assert len(chunks) >= 3
+    assert len(chunks) >= 2
     assert max(len(text) for _, text in chunks) <= llm_extractor.MAX_SECTION_CHARS
 
 

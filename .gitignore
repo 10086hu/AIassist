@@ -25,6 +25,7 @@ ENV/
 
 # FastAPI / local runtime data
 backend/data/
+.runtime/duplicate_cache/
 data/
 *.db
 *.sqlite

@@ -3303,14 +3303,42 @@ public partial class MainWindow : Window
                 form.Add(content, "history_files", Path.GetFileName(path));
             }
 
-            using var response = await BackendClient.PostAsync($"{BackendBaseUrl}/evaluate/duplicate/compare", form);
+            using var response = await BackendClient.PostAsync($"{BackendBaseUrl}/evaluate/duplicate/compare/tasks", form);
             var responseBody = await response.Content.ReadAsStringAsync();
             if (!response.IsSuccessStatusCode)
             {
                 throw new InvalidOperationException($"重复建设跨报告比对失败：{ExtractErrorMessage(responseBody)}");
             }
 
-            return JsonDocument.Parse(responseBody);
+            using var created = JsonDocument.Parse(responseBody);
+            var taskId = GetString(created.RootElement, "task_id");
+            if (string.IsNullOrWhiteSpace(taskId))
+            {
+                throw new InvalidOperationException("后端未返回跨报告检测任务编号。");
+            }
+            for (var attempt = 0; attempt < 1800; attempt++)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(2));
+                using var taskResponse = await BackendClient.GetAsync($"{BackendBaseUrl}/evaluate/tasks/{taskId}");
+                var taskBody = await taskResponse.Content.ReadAsStringAsync();
+                if (!taskResponse.IsSuccessStatusCode)
+                {
+                    throw new InvalidOperationException($"查询跨报告进度失败：{ExtractErrorMessage(taskBody)}");
+                }
+                using var task = JsonDocument.Parse(taskBody);
+                var root = task.RootElement;
+                var status = GetString(root, "status");
+                StatusTextBlock.Text = $"跨报告检查：{GetString(root, "message")}（{GetInt(root, "progress")}%）";
+                if (status == "completed" && root.TryGetProperty("result", out var result))
+                {
+                    return JsonDocument.Parse(result.GetRawText());
+                }
+                if (status == "failed")
+                {
+                    throw new InvalidOperationException(FirstNonEmpty(GetString(root, "error"), "跨报告检测失败"));
+                }
+            }
+            throw new InvalidOperationException("跨报告任务仍在后台执行，请稍后查看审查记录。");
         }
         finally
         {

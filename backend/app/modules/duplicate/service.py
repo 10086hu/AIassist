@@ -16,11 +16,12 @@ from app.modules.duplicate.document_parser import DocumentContent, parse_documen
 from app.modules.duplicate.llm_extractor import extract_function_points
 from app.modules.duplicate.llm_judge import judge_pair_with_llm
 from app.modules.duplicate.execution import parallel_model_work
+from app.modules.duplicate.execution import report_progress
+from app.modules.duplicate.candidate_search import CandidateIndex
+from app.modules.duplicate.document_cache import cached_document_points
+from app.modules.duplicate.llm_judge import judge_pairs_with_llm
+from app.modules.duplicate.compact_extractor import extract_compact_modules
 from app.schemas import DuplicateInternalResponse, DuplicatePairOut, ProjectOut
-
-
-MAX_DUPLICATE_POINTS = 120
-MAX_CANDIDATE_PAIRS = 2_000
 
 
 @dataclass(frozen=True)
@@ -72,34 +73,6 @@ def run_internal_duplicate_check(
     parsed_points = parse_function_points(content, filename)
     return _process_function_points(
         db, parsed_points, project_id, project_name, department, use_llm=use_llm
-    )
-
-
-def run_duplicate_check_from_document(
-    db: Session,
-    content: bytes,
-    filename: str,
-    project_id: Optional[str],
-    project_name: str,
-    department: Optional[str],
-    use_llm: bool = True,
-) -> DuplicateInternalResponse:
-    """
-    从上传的 Word 文档进行内部去重检查
-    流程：文档解析 → 功能点提取 → 向量化 → 去重判定 → 存储
-    """
-    # 1. 解析文档
-    doc_content = parse_document(content, filename)
-
-    # 2. LLM 提取功能点
-    extracted_points = _annotate_document_points(
-        _parse_document_function_points(doc_content, project_name, use_llm=use_llm),
-        doc_content,
-    )
-
-    # 3. 复用现有流程处理功能点
-    return _process_function_points(
-        db, extracted_points, project_id, project_name, department, use_llm=use_llm
     )
 
 
@@ -160,24 +133,24 @@ def run_duplicate_compare_check(
         for point in _report_points_from_parsed(report)
     ]
 
-    internal_pairs = _judge_report_pairs(
-        _find_report_candidate_pairs(current_refs),
+    candidates = _find_report_candidate_pairs(current_refs) + _find_cross_report_candidate_pairs(current_refs, history_refs)
+
+    def report_context(left, right):
+        if right.source == "current":
+            return f"两项均来自当前报告《{left.report_name}》（{left.stage}）。"
+        return (f"功能点1来自当前报告《{left.report_name}》（{left.stage}），"
+                f"功能点2来自往期报告《{right.report_name}》（{right.stage}）。"
+                "判断是否属于本期重复申报、边界不清，或合理的阶段延续。")
+
+    all_pairs = _judge_report_pairs(
+        candidates,
         project_id=project.id,
-        comparison_type="internal",
-        context_builder=lambda left, right: f"两项均来自当前报告《{left.report_name}》（{left.stage}）。",
+        comparison_type="mixed",
+        context_builder=report_context,
         use_llm=use_llm,
     )
-    cross_pairs = _judge_report_pairs(
-        _find_cross_report_candidate_pairs(current_refs, history_refs),
-        project_id=project.id,
-        comparison_type="cross_report",
-        context_builder=lambda left, right: (
-            f"功能点1来自当前报告《{left.report_name}》（{left.stage}），"
-            f"功能点2来自往期报告《{right.report_name}》（{right.stage}）。"
-            "请重点判断是否属于本期重复申报、边界不清，或只是合理的阶段延续。"
-        ),
-        use_llm=use_llm,
-    )
+    internal_pairs = [p for p in all_pairs if p.comparison_type == "internal"]
+    cross_pairs = [p for p in all_pairs if p.comparison_type == "cross_report"]
 
     db.execute(
         delete(CheckResult).where(
@@ -252,14 +225,6 @@ def _process_function_points(
         })
         for point in parsed_points
     }
-    candidates = [
-        candidate
-        for candidate in _find_candidate_pairs(points)
-        if not _same_source_occurrence(
-            locations_by_row.get(candidate.left.row_index, {}),
-            locations_by_row.get(candidate.right.row_index, {}),
-        )
-    ]
     db.execute(
         delete(CheckResult).where(
             CheckResult.project_id == project.id,
@@ -280,7 +245,7 @@ def _process_function_points(
         for point in points
     }
     pairs = _judge_report_pairs(
-        [ReportCandidatePair(refs[item.left.id], refs[item.right.id], item.similarity) for item in candidates],
+        _find_report_candidate_pairs(list(refs.values())),
         project_id=project.id, comparison_type="internal",
         context_builder=lambda left, right: f"两项均来自同一本当前报告《{left.report_name}》。",
         use_llm=use_llm,
@@ -353,22 +318,7 @@ def _replace_current_function_points(
 
 
 def _find_candidate_pairs(points: list[FunctionPoint]) -> list[CandidatePair]:
-    texts = [f"{point.name} {point.description}" for point in points]
-    candidates: list[CandidatePair] = []
-
-    for left_index in range(len(points)):
-        for right_index in range(left_index + 1, len(points)):
-            similarity = duplicate_similarity_score(texts[left_index], texts[right_index])
-            if similarity >= settings.duplicate_high_similarity_threshold:
-                candidates.append(
-                    CandidatePair(
-                        left=points[left_index],
-                        right=points[right_index],
-                        similarity=similarity,
-                    )
-                )
-
-    return sorted(candidates, key=lambda item: item.similarity, reverse=True)[:MAX_CANDIDATE_PAIRS]
+    return [CandidatePair(c.left, c.right, c.similarity) for c in _find_report_candidate_pairs(points)]
 
 
 def _parse_points_from_file(content: bytes, filename: str, project_context: str, use_llm: bool = True) -> list[ParsedFunctionPoint]:
@@ -376,11 +326,15 @@ def _parse_points_from_file(content: bytes, filename: str, project_context: str,
     if lower.endswith((".xlsx", ".csv")):
         return parse_function_points(content, filename)
     if lower.endswith(".docx"):
-        document = parse_document(content, filename)
-        return _annotate_document_points(
-            _parse_document_function_points(document, project_context=project_context, use_llm=use_llm),
-            document,
-        )
+        def load():
+            report_progress(0.02, "正在解析长报告的章节和模块清单")
+            document = parse_document(content, filename)
+            points = _annotate_document_points(
+                _parse_document_function_points(document, project_context=project_context, use_llm=use_llm), document,
+            )
+            report_progress(0.35, f"长报告已整理为 {len(points)} 个建设模块，保留核心子功能及业务场景")
+            return points
+        return cached_document_points(content, filename, project_context, use_llm, load)
     raise ValueError(f"不支持的文件格式: {filename}")
 
 
@@ -391,7 +345,7 @@ def _parse_document_function_points(
 ) -> list[ParsedFunctionPoint]:
     if use_llm:
         return _limit_function_points(extract_function_points(doc_content, project_context=project_context))
-    section_points = _extract_function_sections(doc_content)
+    section_points = extract_compact_modules(doc_content) or _extract_function_sections(doc_content)
     return _limit_function_points(section_points or _extract_local_paragraph_points(doc_content))
 
 
@@ -408,15 +362,13 @@ def _extract_local_paragraph_points(doc_content: DocumentContent) -> list[Parsed
                 description=text[:800],
                 category="文档段落",
             ))
-            if len(points) >= MAX_DUPLICATE_POINTS:
-                return points
     return points
 
 
 def _limit_function_points(points: list[ParsedFunctionPoint]) -> list[ParsedFunctionPoint]:
     return [
         replace(point, row_index=index)
-        for index, point in enumerate(points[:MAX_DUPLICATE_POINTS], start=1)
+        for index, point in enumerate(points, start=1)
     ]
 
 
@@ -439,6 +391,9 @@ def _annotate_document_points(
     last_by_signature: dict[str, int] = {}
     for point in points:
         existing = dict(point.source_location or {})
+        if existing.get("module_summary") and existing.get("paragraph"):
+            output.append(point)
+            continue
         source_quote = str(existing.get("quote") or "")
         extraction_section = str(existing.get("extraction_section") or "")
         signature = _location_normalize(point.name) or _location_normalize(source_quote)
@@ -583,11 +538,7 @@ def run_duplicate_check_from_document(
     department: Optional[str],
     use_llm: bool = True,
 ) -> DuplicateInternalResponse:
-    doc_content = parse_document(content, filename)
-    parsed_points = _annotate_document_points(
-        _parse_document_function_points(doc_content, project_name, use_llm=use_llm),
-        doc_content,
-    )
+    parsed_points = _parse_points_from_file(content, filename, project_name, use_llm=use_llm)
     return _process_function_points(
         db, parsed_points, project_id, project_name, department, use_llm=use_llm
     )
@@ -622,24 +573,20 @@ def _report_points_from_parsed(report: ParsedReport) -> list[ReportPoint]:
 
 
 def _find_report_candidate_pairs(points: list[ReportPoint]) -> list[ReportCandidatePair]:
-    candidates: list[ReportCandidatePair] = []
+    index = CandidateIndex(points)
+    candidates = {}
     for left_index in range(len(points)):
-        for right_index in range(left_index + 1, len(points)):
-            if _same_source_occurrence(
-                points[left_index].source_location,
-                points[right_index].source_location,
+        for right_index, similarity in index.search(
+            points[left_index], settings.duplicate_candidate_top_k,
+            settings.duplicate_high_similarity_threshold, query_index=left_index,
+        ):
+            if hasattr(points[left_index], "source_location") and _same_source_occurrence(
+                points[left_index].source_location, points[right_index].source_location,
             ):
                 continue
-            similarity = _report_point_similarity(points[left_index], points[right_index])
-            if similarity >= settings.duplicate_high_similarity_threshold:
-                candidates.append(
-                    ReportCandidatePair(
-                        left=points[left_index],
-                        right=points[right_index],
-                        similarity=similarity,
-                    )
-                )
-    return sorted(candidates, key=lambda item: item.similarity, reverse=True)[:MAX_CANDIDATE_PAIRS]
+            left, right = sorted((left_index, right_index))
+            candidates[(left, right)] = ReportCandidatePair(points[left], points[right], similarity)
+    return sorted(candidates.values(), key=lambda item: item.similarity, reverse=True)
 
 
 def _same_source_occurrence(left: dict[str, Any], right: dict[str, Any]) -> bool:
@@ -662,19 +609,13 @@ def _find_cross_report_candidate_pairs(
     current_points: list[ReportPoint],
     history_points: list[ReportPoint],
 ) -> list[ReportCandidatePair]:
+    index = CandidateIndex(history_points)
     candidates: list[ReportCandidatePair] = []
     for current in current_points:
-        for history in history_points:
-            similarity = _report_point_similarity(current, history)
-            if similarity >= settings.duplicate_high_similarity_threshold:
-                candidates.append(
-                    ReportCandidatePair(
-                        left=current,
-                        right=history,
-                        similarity=similarity,
-                    )
-                )
-    return sorted(candidates, key=lambda item: item.similarity, reverse=True)[:MAX_CANDIDATE_PAIRS]
+        for history_index, similarity in index.search(current, settings.duplicate_candidate_top_k,
+                                                      settings.duplicate_high_similarity_threshold):
+            candidates.append(ReportCandidatePair(current, history_points[history_index], similarity))
+    return sorted(candidates, key=lambda item: item.similarity, reverse=True)
 
 
 def _report_point_similarity(left: ReportPoint, right: ReportPoint) -> float:
@@ -692,29 +633,49 @@ def _judge_report_pairs(
     use_llm: bool = True,
 ) -> list[DuplicatePairOut]:
     pairs: list[DuplicatePairOut] = []
-    judgements = parallel_model_work(
-        candidates,
-        lambda candidate: judge_pair_with_llm(
-            candidate.left.name,
-            candidate.left.description,
-            candidate.right.name,
-            candidate.right.description,
-            candidate.similarity,
+    items = [dict(
+            left_name=candidate.left.name, left_description=_review_description(candidate.left),
+            right_name=candidate.right.name, right_description=_review_description(candidate.right),
+            similarity=candidate.similarity,
             context=(
                 context_builder(candidate.left, candidate.right)
-                + "\n报告总体背景：" + str(candidate.left.source_location.get("report_context") or "")[:900]
+                + "\n左报告背景：" + str(candidate.left.source_location.get("report_context") or "")[:900]
+                + "\n右报告背景：" + str(candidate.right.source_location.get("report_context") or "")[:900]
             ),
             use_llm=use_llm,
-            left_source=_point_review_source(candidate.left),
-            right_source=_point_review_source(candidate.right),
-        ),
-        message="大模型复核" + ("报告内部候选对" if comparison_type == "internal" else "跨报告候选对"),
-        start=0.4 if comparison_type == "internal" else 0.65,
+            left_source=_point_review_source(candidate.left, candidate.right),
+            right_source=_point_review_source(candidate.right, candidate.left),
+        ) for candidate in candidates]
+    batches = []
+    batch, chars = [], 0
+    for item in items:
+        size = len(json.dumps(item, ensure_ascii=False))
+        if batch and (len(batch) >= max(1, settings.duplicate_judge_batch_size)
+                      or chars + size > settings.duplicate_judge_batch_chars):
+            batches.append(batch)
+            batch, chars = [], 0
+        batch.append(item)
+        chars += size
+    if batch:
+        batches.append(batch)
+
+    def review(batch):
+        if not use_llm or len(batch) == 1:
+            return [judge_pair_with_llm(**item) for item in batch]
+        return judge_pairs_with_llm(batch)
+
+    grouped = parallel_model_work(
+        batches, review,
+        message=f"批量复核{'报告内部' if comparison_type == 'internal' else '内部与跨报告' if comparison_type == 'mixed' else '跨报告'}候选（{len(candidates)}对）",
+        start=0.65 if comparison_type == "cross_report" else 0.4,
         end=0.65 if comparison_type == "internal" else 0.95,
     )
+    judgements = [judgement for batch in grouped for judgement in batch]
     for candidate, judgement in zip(candidates, judgements):
         if judgement.label == "无关":
             continue
+        left_location = _evidence_location(candidate.left.source_location, judgement.left_evidence)
+        right_location = _evidence_location(candidate.right.source_location, judgement.right_evidence)
         pairs.append(
             DuplicatePairOut(
                 item_id=candidate.left.point_id,
@@ -726,7 +687,7 @@ def _judge_report_pairs(
                 severity=judgement.severity,
                 reason=judgement.reason,
                 suggestion=judgement.suggestion,
-                comparison_type=comparison_type,
+                comparison_type=("cross_report" if candidate.right.source == "history" else "internal") if comparison_type == "mixed" else comparison_type,
                 item_report_name=candidate.left.report_name,
                 related_report_name=candidate.right.report_name,
                 item_stage=candidate.left.stage,
@@ -735,21 +696,18 @@ def _judge_report_pairs(
                 related_source=candidate.right.source,
                 item_row_index=candidate.left.row_index,
                 related_row_index=candidate.right.row_index,
-                item_source_location=dict(candidate.left.source_location),
-                related_source_location=dict(candidate.right.source_location),
-                item_source_excerpt=candidate.left.source_excerpt,
-                related_source_excerpt=candidate.right.source_excerpt,
+                item_source_location=left_location,
+                related_source_location=right_location,
+                item_source_excerpt=str(left_location.get("quote") or candidate.left.source_excerpt),
+                related_source_excerpt=str(right_location.get("quote") or candidate.right.source_excerpt),
                 location_hint=_format_pair_location_hint(
-                    candidate.left.source_location,
-                    candidate.right.source_location,
+                    left_location, right_location,
                 ),
                 source_highlights=_duplicate_pair_highlights(
-                    candidate.left.source_location,
-                    candidate.right.source_location,
+                    left_location, right_location,
                 ),
                 revision_target=_duplicate_revision_target(
-                    candidate.left.source_location,
-                    candidate.right.source_location,
+                    left_location, right_location,
                     judgement.suggestion,
                 ),
                 model_name=judgement.model_name,
@@ -764,13 +722,47 @@ def _judge_report_pairs(
     return _merge_construction_findings(pairs)
 
 
-def _point_review_source(point: ReportPoint) -> str:
+def _point_review_source(point: ReportPoint, peer: ReportPoint | None = None) -> str:
     location = point.source_location
     return (
         f"章节：{location.get('section') or location.get('extraction_section') or ''}\n"
         f"对应原文：{point.source_excerpt}\n"
-        f"邻近上下文：{str(location.get('review_context') or '')[:800]}"
+        f"建设范围原文：{_compact_review_context(location, peer)}\n"
+        f"建设性质：{str(location.get('lifecycle_context') or '')[:1200]}"
     )
+
+
+def _review_description(point: ReportPoint) -> str:
+    if len(point.description) <= 1600:
+        return point.description
+    cores = "、".join(point.source_location.get("core_functions") or [])
+    return f"核心子功能：{cores[:700]}；范围摘要：{point.description[:650]}；后部范围：{point.description[-250:]}"
+
+
+def _evidence_location(location: dict[str, Any], evidence: str) -> dict[str, Any]:
+    for span in location.get("source_spans") or []:
+        if evidence and _location_normalize(evidence) in _location_normalize(span.get("quote") or ""):
+            return {**location, **span}
+    return dict(location)
+
+
+def _compact_review_context(location: dict[str, Any], peer: ReportPoint | None = None) -> str:
+    context = str(location.get("review_context") or "")
+    if not location.get("module_summary"):
+        return context[:800]
+    if len(context) <= 4000:
+        return context
+    # Distribute the evidence budget across the module, including its end.
+    lines = context.splitlines()
+    if len(lines) > 40:
+        shared = set(location.get("core_functions") or []) & set((peer.source_location if peer else {}).get("core_functions") or [])
+        matches = [i for i, line in enumerate(lines) if any(capability in line for capability in shared)]
+        priority = list(dict.fromkeys(i for match in matches for i in (match, min(len(lines) - 1, match + 1))))[:28]
+        uniform = [round(i * (len(lines) - 1) / 11) for i in range(12)]
+        indices = sorted(set(priority + uniform))
+        lines = [lines[i] for i in indices]
+    allowance = max(1, (4000 - len(lines)) // max(1, len(lines)))
+    return "\n".join(line[:allowance] for line in lines)
 
 
 def _merge_construction_findings(pairs: list[DuplicatePairOut]) -> list[DuplicatePairOut]:
