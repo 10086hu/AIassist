@@ -19,7 +19,9 @@ namespace AiReportDesktop;
 
 public partial class MainWindow : Window
 {
-    private const string BackendBaseUrl = "http://127.0.0.1:8000/api";
+    private static readonly string BackendBaseUrl =
+        (Environment.GetEnvironmentVariable("AIASSIST_BACKEND_URL")
+            ?? GetUserEnvironment("AIASSIST_BACKEND_URL", "http://127.0.0.1:8000/api")).Trim().TrimEnd('/');
     private static readonly HttpClient BackendClient = new() { Timeout = TimeSpan.FromMinutes(10) };
 
     private readonly List<CheckBox> _checkBoxes = new();
@@ -1087,7 +1089,7 @@ public partial class MainWindow : Window
         }, new Thickness(0, 14, 0, 0)));
         right.Children.Add(SettingsPanel("服务连接", "配置客户端访问审查服务的地址和响应策略。", new UIElement[]
         {
-            SettingRow("服务地址", "当前客户端请求入口", Input("http://127.0.0.1:8000/api")),
+            SettingRow("服务地址", "当前客户端请求入口（通过 AIASSIST_BACKEND_URL 配置）", Input(BackendBaseUrl)),
             SettingRow("请求超时", "大文件或复杂规则审查建议使用 60 秒以上", Combo("30 秒", "60 秒", "120 秒")),
             ActionRow(Button("测试连接", false))
         }, new Thickness(0, 14, 0, 0)));
@@ -1805,7 +1807,7 @@ public partial class MainWindow : Window
             if (!await IsBackendAvailableAsync())
             {
                 StatusTextBlock.Text = "后端服务未启动。";
-                MessageBox.Show(this, "无法连接后端服务，请先启动目标项目后端：run_backend.bat（端口 8000）", "后端未启动", MessageBoxButton.OK, MessageBoxImage.Warning);
+                MessageBox.Show(this, $"无法连接后端服务：{BackendBaseUrl}，请检查服务器状态和网络连接。", "后端连接失败", MessageBoxButton.OK, MessageBoxImage.Warning);
                 return;
             }
 
@@ -3136,7 +3138,7 @@ public partial class MainWindow : Window
         {
             return absolute.ToString();
         }
-        return new Uri(new Uri("http://127.0.0.1:8000"), path).ToString();
+        return new Uri(new Uri(BackendBaseUrl), path).ToString();
     }
 
     private UIElement BuildTechnicalJsonViewer(JsonElement root)

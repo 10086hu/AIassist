@@ -6,6 +6,13 @@ from uuid import uuid4
 
 from sqlalchemy import DateTime, Float, ForeignKey, Integer, LargeBinary, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.dialects.mysql import LONGBLOB, LONGTEXT
+
+
+# Reports and their original files can exceed MySQL's 64 KiB TEXT/BLOB limit.
+# Keep the existing portable types for SQLite and other database engines.
+REPORT_TEXT = Text().with_variant(LONGTEXT(), "mysql")
+SOURCE_BINARY = LargeBinary().with_variant(LONGBLOB(), "mysql")
 
 
 def new_uuid() -> str:
@@ -178,7 +185,7 @@ class CheckResult(Base):
     result_label: Mapped[str] = mapped_column(String(64), nullable=False)
     reason: Mapped[str] = mapped_column(Text, nullable=False)
     suggestion: Mapped[Optional[str]] = mapped_column(Text)
-    reference_data: Mapped[str] = mapped_column(Text, default="{}")
+    reference_data: Mapped[str] = mapped_column(REPORT_TEXT, default="{}")
     model_name: Mapped[str] = mapped_column(String(100), default="local-rule-judge")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
@@ -203,7 +210,7 @@ class SourceArtifact(Base):
     stage: Mapped[Optional[str]] = mapped_column(String(64))
     filename: Mapped[str] = mapped_column(String(300), nullable=False)
     media_type: Mapped[str] = mapped_column(String(120), default="application/octet-stream")
-    content: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    content: Mapped[bytes] = mapped_column(SOURCE_BINARY, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     check_result: Mapped["CheckResult"] = relationship(back_populates="source_artifacts")

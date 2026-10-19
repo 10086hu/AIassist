@@ -50,16 +50,23 @@ PRODUCT_KEYWORDS = ("服务器", "存储", "交换机", "防火墙", "数据库"
 
 
 def public_price_rules() -> list[dict[str, str]]:
-    standard = load_municipal_class2_standard()
+    try:
+        standard = load_municipal_class2_standard()
+        standard_error = ""
+    except ValueError as exc:
+        standard = None
+        standard_error = str(exc)
     rules = []
     for rule in PRICE_RULES:
         public = dict(rule, source="local_builtin")
-        if rule["rule_id"] == PRICE_REASON_001["rule_id"]:
+        if rule["rule_id"] == PRICE_REASON_001["rule_id"] and standard is not None:
             public.update(
                 standard_id=standard["standard_id"],
                 standard_title=standard["title"],
                 standard_source_sha256=standard["source_sha256"],
             )
+        elif rule["rule_id"] == PRICE_REASON_001["rule_id"]:
+            public.update(standard_status="missing", standard_error=standard_error)
         rules.append(public)
     return rules
 

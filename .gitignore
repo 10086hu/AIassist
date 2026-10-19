@@ -27,6 +27,8 @@ ENV/
 backend/data/
 .runtime/duplicate_cache/
 data/
+!backend/app/modules/price/data/
+!backend/app/modules/price/data/*.json
 *.db
 *.sqlite
 *.sqlite3

@@ -1,0 +1,19 @@
+# Managed by AIassist report backend deployment
+[Unit]
+Description=AI Assist isolated MySQL database
+After=network.target
+
+[Service]
+Type=simple
+User=aiassist-db
+Group=aiassist-db
+ExecStart=/usr/sbin/mysqld --defaults-file=/etc/aiassist/mysql.cnf
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=120
+TimeoutStopSec=120
+LimitNOFILE=65535
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

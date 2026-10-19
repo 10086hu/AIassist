@@ -1,0 +1,15 @@
+{
+  "server": "10.60.150.179",
+  "source_path": "/opt/aiassist/backend",
+  "service": "aiassist-api.service",
+  "image": "aiassist-backend:20261019-2238",
+  "image_id": "sha256:293b161aca40e418cfb6ade0bbf6f8a5249b345ae0289c933d1fc3262f5c5fb7",
+  "captured_at": "2026-10-20T00:12:22.604065+08:00",
+  "verified_app_file_count": 77,
+  "app_manifest_sha256": "253c8dd084c90bbb39706ebffd2577f9879282be8cab4e4337ae56dd557976fa",
+  "runtime_configuration": "Generated on server; .env files, credentials, database and caches excluded",
+  "pending_configuration": [
+    "DEEPSEEK_API_KEY",
+    "shanghai_municipal_class2_fees.json"
+  ]
+}

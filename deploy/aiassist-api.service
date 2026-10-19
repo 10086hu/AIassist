@@ -1,0 +1,19 @@
+# Managed by AIassist report backend deployment
+[Unit]
+Description=AI Assist FastAPI backend
+Requires=docker.service aiassist-mysql.service
+After=network-online.target docker.service aiassist-mysql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/aiassist/container.env
+ExecStart=/usr/bin/docker run --rm --name aiassist-backend --network host --user ${AIASSIST_UID}:${AIASSIST_GID} --cap-drop ALL --security-opt no-new-privileges --env-file /etc/aiassist/backend.env --mount type=bind,source=/var/lib/aiassist,target=/var/lib/aiassist --log-opt max-size=10m --log-opt max-file=3 ${AIASSIST_BACKEND_IMAGE}
+ExecStop=/usr/bin/docker stop --time 30 aiassist-backend
+Restart=always
+RestartSec=5
+TimeoutStartSec=0
+TimeoutStopSec=45
+
+[Install]
+WantedBy=multi-user.target
