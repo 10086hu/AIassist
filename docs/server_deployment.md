@@ -2,6 +2,8 @@
 
 目标服务器：`worker8`（`root@10.60.150.179`）。
 
+2026-10-20 已部署登录注册功能。服务器连接、认证 API、curl 示例、错误码与验证说明见 [后端 README](../backend/README.md)。所有业务接口均需 `Authorization: Bearer <access_token>`；现有桌面端需要后续接入认证后才能访问业务接口。
+
 ## 地址与客户端
 
 - 后端：`http://10.60.150.179:8000`
@@ -78,7 +80,8 @@ ssh worker8 'docker inspect aiassist-backend --format "{{.State.Health.Status}}"
 
 ```bash
 curl --noproxy '*' http://10.60.150.179:8000/api/health
-backend/.venv/bin/python scripts/smoke_server_backend.py
+# 先调用 /api/auth/login，使用返回的 access_token
+AIASSIST_ACCESS_TOKEN='<登录返回的令牌>' backend/.venv/bin/python scripts/smoke_server_backend.py
 ```
 
 测试覆盖规则查询、中文项目读写、大于 64 KiB 的 DOCX 上传与原文件下载、
@@ -94,6 +97,7 @@ backend/.venv/bin/python scripts/smoke_server_backend.py \
 ```
 
 第二步等待健康检查恢复后再执行最后一步；验证完成会删除测试项目。
+以上持久化验证命令也需要设置 `AIASSIST_ACCESS_TOKEN`；会话由 MySQL 保存，后端重启后仍有效。
 此测试从本机直接访问服务器，不依赖 SSH 端口转发。
 
 价格核价还需补充 `backend/app/modules/price/data/shanghai_municipal_class2_fees.json`。

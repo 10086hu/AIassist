@@ -1,0 +1,11 @@
+{
+  "base_url": "http://10.60.150.179:8000",
+  "verified_at": "2026-10-20T19:01:03.495565+08:00",
+  "test_username": "auth_smoke_58791f04f7df",
+  "test_user_id": "3f7ad3c7-36c4-4168-b03e-1e8600ace7f9",
+  "checks": {
+    "session_persistence_after_api_and_mysql_restart": "passed",
+    "password_persistence_after_restart": "passed",
+    "logout_all_after_restart": "passed"
+  }
+}

@@ -17,6 +17,7 @@ def _default_database_url() -> str:
 
 @dataclass(frozen=True)
 class Settings:
+    auth_session_hours: int = int(os.getenv("AUTH_SESSION_HOURS", "24"))
     app_env: str = os.getenv("APP_ENV", "dev")
     database_url: str = os.getenv("DATABASE_URL", _default_database_url())
     cors_origins_raw: str = os.getenv(

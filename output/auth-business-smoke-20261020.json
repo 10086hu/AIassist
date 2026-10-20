@@ -1,0 +1,59 @@
+{
+  "base_url": "http://10.60.150.179:8000",
+  "project_id": "78d0fec6-36d6-4712-b25e-d43c9281e7a8",
+  "report_id": "2f771bbe-557f-4f38-8a13-d31991b45920",
+  "source_sha256": "edd6a3f162f7aa583e20c427d5d5dbfe1a2f4beeb21f901b547d895a3fdecbf0",
+  "checks": {
+    "health": "passed",
+    "openapi": "passed",
+    "rules_basis": {
+      "source": "local_builtin",
+      "count": 4
+    },
+    "rules_function_correspondence": {
+      "source": "local_xlsx",
+      "count": 4
+    },
+    "rules_data_reasonableness": {
+      "source": "local_builtin",
+      "count": 5
+    },
+    "rules_resource": {
+      "source": "local_builtin",
+      "count": 3
+    },
+    "rules_security": {
+      "source": "local_builtin",
+      "count": 1
+    },
+    "rules_price": {
+      "source": "local_builtin",
+      "count": 1,
+      "status": "requires_configuration",
+      "reason": "价格核价标准配置缺失：shanghai_municipal_class2_fees.json，请补充标准文件后重试。"
+    },
+    "rules_price_reference": {
+      "source": "local_builtin",
+      "count": 2
+    },
+    "rules_sensitive_word": {
+      "source": "local_xlsx",
+      "count": 2
+    },
+    "project_write_read": "passed",
+    "document_upload_download": {
+      "status": "passed",
+      "bytes": 129446
+    },
+    "idempotent_upload": "passed",
+    "report_export": "passed",
+    "async_review_task": "passed",
+    "project_tree": "passed"
+  },
+  "llm": {
+    "configured": false,
+    "model": "deepseek-chat",
+    "base_url": "https://api.deepseek.com/v1",
+    "api_key_present": false
+  }
+}

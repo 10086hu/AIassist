@@ -27,6 +27,10 @@ def main() -> None:
     args = parser.parse_args()
     client = requests.Session()
     client.trust_env = False
+    token = os.environ.get("AIASSIST_ACCESS_TOKEN")
+    if not token:
+        parser.error("先登录，并通过 AIASSIST_ACCESS_TOKEN 环境变量提供 Bearer 令牌")
+    client.headers["Authorization"] = "Bearer " + token
     base = args.base_url.rstrip("/")
 
     def request(method: str, endpoint: str, **kwargs):
