@@ -71,7 +71,9 @@ ssh worker8 'systemctl restart aiassist-api'
 ssh worker8 'docker inspect aiassist-backend --format "{{.State.Health.Status}}"'
 ```
 
-大模型 API Key 初始为空，规则审查、文件处理和持久化可以独立使用。
+2026-10-21 已配置同济模型网关与 `DeepSeek-V4-Flash`，真实模型调用及开启模型的异步资源审查均验证通过。
+模型配置、验证报告及复现步骤见 [服务器模型配置与验证](server_api_key.md)。
+初次初始化时大模型 API Key 为空，规则审查、文件处理和持久化可以独立使用。
 启用模型时，在服务器编辑 `/etc/aiassist/backend.env` 的 `DEEPSEEK_API_KEY`、
 `DEEPSEEK_MODEL`、`DEEPSEEK_API_URL` 和 `DEEPSEEK_API_BASE_URL`，然后重启后端。
 两个 API 地址应与提供方接口保持一致。Windows 用户环境变量中的模型密钥不会自动上传到服务器。

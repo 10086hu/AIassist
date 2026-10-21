@@ -1,0 +1,41 @@
+{
+  "verified_at": "2026-10-21T19:06:01.455249+08:00",
+  "server": "10.60.150.179",
+  "transport": "ssh_tunnel",
+  "checks": {
+    "health": "passed",
+    "unauthenticated_protection": "passed",
+    "registration": "passed",
+    "login_and_current_user": "passed",
+    "real_llm_call": "blocked_missing_api_key",
+    "business_smoke": "passed",
+    "session_revocation": "passed",
+    "test_account_cleanup": "passed"
+  },
+  "llm_status": {
+    "configured": false,
+    "model": "deepseek-chat",
+    "base_url": "https://api.deepseek.com/v1",
+    "api_key_present": false
+  },
+  "llm_ping": {
+    "success": false,
+    "configured": false,
+    "model": "deepseek-chat",
+    "error_type": "missing_api_key"
+  },
+  "provider_network": {
+    "host": "api.deepseek.com",
+    "http_status": 401,
+    "tls_verified": true,
+    "authenticated": false,
+    "note": "HTTPS reachability passed; valid API key still required"
+  },
+  "running_check_runs_at_inspection": 0,
+  "pending_verification": [
+    "Configure a valid provider key and matching model/base URLs",
+    "Recreate the container through systemctl and confirm runtime configuration",
+    "Verify authenticated llm/ping reports success=true",
+    "Verify the common LLM client and an actual use_llm=true review"
+  ]
+}

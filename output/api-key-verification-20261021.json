@@ -1,0 +1,38 @@
+{
+  "verified_at": "2026-10-21T19:15:50.990858+08:00",
+  "checks": {
+    "health_and_auth_protection": "passed",
+    "registration_and_login": "passed",
+    "runtime_configuration": "passed",
+    "authenticated_http_model_ping": "passed",
+    "common_client_real_json_call": "passed",
+    "real_async_review_with_llm": "passed",
+    "review_result_persistence": "passed",
+    "test_project_cleanup": "passed",
+    "session_revocation": "passed",
+    "test_account_cleanup": "passed",
+    "persisted_test_data_cleanup": "passed"
+  },
+  "configuration": {
+    "configured": true,
+    "model": "DeepSeek-V4-Flash",
+    "base_url": "https://llmapi.tongji.edu.cn/v1",
+    "api_key_present": true
+  },
+  "ping": {
+    "success": true,
+    "model": "DeepSeek-V4-Flash",
+    "transport": "openai_chat_completions",
+    "content_source": "message.content"
+  },
+  "review": {
+    "task_status": "completed",
+    "module": "resource",
+    "llm_enabled": true,
+    "llm_status": "completed",
+    "llm_reviewed_count": 3,
+    "llm_error_count": 0,
+    "result_count": 1
+  },
+  "success": true
+}

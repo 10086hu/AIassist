@@ -301,6 +301,6 @@ python scripts/smoke_server_auth.py --verify-state /tmp/aiassist-auth-state.json
 
 临时状态文件以 `0600` 保存测试凭证，验证后自动删除。须保存在仓库之外，不能提交 Git。业务验证脚本 `scripts/smoke_server_backend.py` 需要先登录，并通过 `AIASSIST_ACCESS_TOKEN` 环境变量提供令牌。
 
-本次未涉及桌面端接入。原有价格标准 JSON 和模型 API Key 仍需按部署文档补充；对应配置缺项不影响登录注册。
+本次未涉及桌面端接入。2026-10-21 已配置同济模型网关与 `DeepSeek-V4-Flash`，真实模型调用和开启模型的异步资源审查验证通过（3 项复核成功、0 项错误）。[模型配置与验证说明](../docs/server_api_key.md)包含配置位置和复现命令，[验证报告](../output/api-key-verification-20261021.json)不包含密钥或登录凭证。原有价格标准 JSON 仍需补充。
 
 密码参数依据：[OWASP Password Storage](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html#scrypt)。实现使用 [Python hashlib.scrypt](https://docs.python.org/3.12/library/hashlib.html#hashlib.scrypt)。长报告流程见 [长报告重复建设检查](../docs/duplicate_long_report_review.md)。
