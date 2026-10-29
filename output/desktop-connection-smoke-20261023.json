@@ -1,0 +1,17 @@
+{
+  "local_bearer": true,
+  "empty_204": true,
+  "expired_token_cleared": true,
+  "cross_origin_blocked": true,
+  "switch_clears_session": true,
+  "failed_switch_keeps_connection": true,
+  "candidate_does_not_receive_current_token": true,
+  "legacy_local_can_connect": true,
+  "new_backend_requires_login": true,
+  "test_user_id": "888089ef-e263-42c2-98e5-8de21eab8346",
+  "server_login_me": true,
+  "server_project_tree": true,
+  "test_project_deleted": true,
+  "logout_revokes_session": true,
+  "success": true
+}

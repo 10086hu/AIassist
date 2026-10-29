@@ -19,8 +19,8 @@ namespace AiReportDesktop;
 
 public partial class MainWindow : Window
 {
-    private const string BackendBaseUrl = "http://127.0.0.1:8000/api";
-    private static readonly HttpClient BackendClient = new() { Timeout = TimeSpan.FromMinutes(10) };
+    private static string BackendBaseUrl => BackendConnection.BaseUrl;
+    private static HttpClient BackendClient => BackendConnection.Client;
 
     private readonly List<CheckBox> _checkBoxes = new();
     private readonly Dictionary<string, List<CheckBox>> _ruleCheckBoxesByModule = new();
@@ -227,6 +227,7 @@ public partial class MainWindow : Window
         PrepareText();
         PrepareNavigation();
         BuildCheckItems();
+        InitializeConnection();
         Loaded += OnWindowLoaded;
     }
 
@@ -519,8 +520,7 @@ public partial class MainWindow : Window
 
     private async void OnWindowLoaded(object sender, RoutedEventArgs e)
     {
-        await LoadProjectsAsync();
-        await LoadRulesAsync();
+        await Task.CompletedTask; // Business requests start after login.
     }
 
     private async Task LoadProjectsAsync()
@@ -1069,7 +1069,7 @@ public partial class MainWindow : Window
         testLlmButton.Click += async (_, _) => await TestLlmConnectionAsync();
         var refreshLlmModelsButton = Button("刷新模型", false);
         refreshLlmModelsButton.Click += async (_, _) => await RefreshLlmModelsAsync();
-        right.Children.Add(SettingsPanel("大模型 API 配置", "配置 DeepSeek 或 OpenAI 兼容接口。密钥仅保存到当前 Windows 用户环境变量，不会在界面中显示。", new UIElement[]
+        right.Children.Add(SettingsPanel("本机大模型 API 配置", "服务器模型由服务器管理；以下设置仅作用于本机。密钥保存到当前 Windows 用户环境变量。", new UIElement[]
         {
             SettingRow("API Key", "留空表示保留现有密钥；输入新值后点击顶部保存设置", _llmApiKeyBox),
             SettingRow("接口地址", "填写到 /v1，不要包含 /chat/completions", _llmBaseUrlBox),
@@ -1078,12 +1078,7 @@ public partial class MainWindow : Window
             ActionRow(refreshLlmModelsButton, testLlmButton),
             _llmConfigStatusTextBlock
         }, new Thickness(0, 14, 0, 0)));
-        right.Children.Add(SettingsPanel("服务连接", "配置客户端访问审查服务的地址和响应策略。", new UIElement[]
-        {
-            SettingRow("服务地址", "当前客户端请求入口", Input("http://127.0.0.1:8000/api")),
-            SettingRow("请求超时", "大文件或复杂规则审查建议使用 60 秒以上", Combo("30 秒", "60 秒", "120 秒")),
-            ActionRow(Button("测试连接", false))
-        }, new Thickness(0, 14, 0, 0)));
+        right.Children.Add(BuildConnectionSettingsPanel());
         right.Children.Add(SettingsPanel("安全与日志", "控制本机操作记录、脱敏和诊断信息。", new UIElement[]
         {
             SettingRow("规则变更记录", "保存规则变更人、时间和说明", Check("启用", true)),
@@ -1682,19 +1677,9 @@ public partial class MainWindow : Window
         EnterButton.Content = isRegister ? "注册并进入系统" : "登录并进入系统";
     }
 
-    private void OnEnterClicked(object sender, RoutedEventArgs e)
-    {
-        var userName = string.IsNullOrWhiteSpace(AccountTextBox.Text) ? "演示用户" : AccountTextBox.Text.Trim();
-        UserTextBlock.Text = $"当前用户：{userName}";
-        LoginPage.Visibility = Visibility.Collapsed;
-        WorkbenchPage.Visibility = Visibility.Visible;
-    }
+    private async void OnEnterClicked(object sender, RoutedEventArgs e) => await EnterBackendAsync();
 
-    private void OnLogoutClicked(object sender, RoutedEventArgs e)
-    {
-        WorkbenchPage.Visibility = Visibility.Collapsed;
-        LoginPage.Visibility = Visibility.Visible;
-    }
+    private async void OnLogoutClicked(object sender, RoutedEventArgs e) => await LogoutBackendAsync();
 
     private void OnChooseFileClicked(object sender, RoutedEventArgs e)
     {
@@ -1798,7 +1783,7 @@ public partial class MainWindow : Window
             if (!await IsBackendAvailableAsync())
             {
                 StatusTextBlock.Text = "后端服务未启动。";
-                MessageBox.Show(this, "无法连接后端服务，请先启动目标项目后端：run_backend.bat（端口 8000）", "后端未启动", MessageBoxButton.OK, MessageBoxImage.Warning);
+                MessageBox.Show(this, $"无法连接后端：{BackendBaseUrl}。请检查网络，或在工作台左侧切换检测后端。", "后端不可达", MessageBoxButton.OK, MessageBoxImage.Warning);
                 return;
             }
 
@@ -2761,7 +2746,7 @@ public partial class MainWindow : Window
             }
             await _documentWebView.EnsureCoreWebView2Async();
             if (generation != _preciseEvidenceGeneration) return;
-            _documentWebView.Source = new Uri(_activePreviewUrl);
+            NavigateAuthenticatedPreview(new Uri(_activePreviewUrl));
         }
         catch (Exception exc)
         {
@@ -2865,7 +2850,7 @@ public partial class MainWindow : Window
                     + $"&paragraph={paragraph}&line={line}"
                     + $"&section={Uri.EscapeDataString(section.Length > 120 ? section[..120] : section)}"
             };
-            _documentWebView.Source = locationUrl.Uri;
+            NavigateAuthenticatedPreview(locationUrl.Uri);
             if (_documentLocationTextBlock != null)
             {
                 _documentLocationTextBlock.Text = "正在加载对应原文位置...";
@@ -3036,7 +3021,7 @@ public partial class MainWindow : Window
         try
         {
             // Navigate explicitly: clicking another excerpt must not depend on an arbitrary delay.
-            core.Navigate(url);
+            NavigateAuthenticatedPreview(destination);
             if (!await loaded.Task.WaitAsync(TimeSpan.FromSeconds(90))) return false;
             var ready = await _documentWebView.ExecuteScriptAsync(url.Contains("precision_rule=", StringComparison.Ordinal)
                 ? "!!window.ruleEvidenceReady && typeof window.locateRuleEvidence === 'function'"
@@ -3097,9 +3082,10 @@ public partial class MainWindow : Window
     {
         if (Uri.TryCreate(path, UriKind.Absolute, out var absolute))
         {
+            if (!BackendConnection.IsApiUrl(absolute)) throw new InvalidOperationException("原文地址不属于当前后端。");
             return absolute.ToString();
         }
-        return new Uri(new Uri("http://127.0.0.1:8000"), path).ToString();
+        return new Uri(new Uri(BackendBaseUrl + "/"), path).ToString();
     }
 
     private UIElement BuildTechnicalJsonViewer(JsonElement root)
@@ -3423,8 +3409,9 @@ public partial class MainWindow : Window
             await LoadRecordsAsync();
             if (IsCompletedTaskStatus(status) || HasResultIds(root))
             {
-                StatusTextBlock.Text = "检测完成，请在“审查记录”查看结果。";
-                AddResultNotice("检测完成，请在“审查记录”查看企业可读审查意见。");
+                var notice = status == "completed" ? "检测完成，请在“审查记录”查看结果。" : $"任务{TaskStatusText(status)}：{FirstNonEmpty(GetString(root, "error"), message)}，请核对各模块结果。";
+                StatusTextBlock.Text = notice;
+                AddResultNotice(notice);
                 return;
             }
 
@@ -3443,7 +3430,7 @@ public partial class MainWindow : Window
         "queued" => "等待检测",
         "running" => "正在检测",
         "completed" => "检测完成",
-        "partial" => "检测完成",
+        "partial" => "部分完成",
         "failed" => "检测失败",
         _ => "检测任务"
     };

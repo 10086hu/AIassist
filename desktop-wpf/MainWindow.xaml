@@ -213,7 +213,8 @@
             </Border>
 
             <Grid Grid.Column="1" Background="{StaticResource PageBrush}">
-                <Border Style="{StaticResource CardBorder}" Width="520" VerticalAlignment="Center" HorizontalAlignment="Center" Padding="36,34">
+                <Border Style="{StaticResource CardBorder}" Width="520" VerticalAlignment="Center" HorizontalAlignment="Center" Padding="36,24" MaxHeight="760" Margin="0,12">
+                    <ScrollViewer VerticalScrollBarVisibility="Auto">
                     <StackPanel>
                         <TextBlock Text="账号入口" FontSize="28" FontWeight="Bold" Foreground="{StaticResource TextBrush}"/>
                         <TextBlock Text="登录或注册后进入工作台，开始可研报告审查。"
@@ -228,6 +229,7 @@
                             <RadioButton x:Name="RegisterModeButton" Grid.Column="1" Content="注册" Style="{StaticResource SegmentRadio}" Checked="OnLoginModeChanged"/>
                         </Grid>
 
+                        <TextBlock x:Name="LoginBackendStatus" TextWrapping="Wrap" Margin="0,6,0,10" Foreground="{StaticResource MutedBrush}"/>
                         <TextBlock Text="账号" Foreground="#344054" Margin="0,0,0,7"/>
                         <TextBox x:Name="AccountTextBox" Style="{StaticResource InputBox}" Margin="0,0,0,14"/>
 
@@ -238,14 +240,13 @@
                             <TextBlock Text="确认密码" Foreground="#344054" Margin="0,0,0,7"/>
                             <PasswordBox x:Name="ConfirmPasswordBox" Style="{StaticResource PasswordInput}" Margin="0,0,0,14"/>
 
-                            <TextBlock Text="单位名称" Foreground="#344054" Margin="0,0,0,7"/>
-                            <TextBox x:Name="OrganizationTextBox" Style="{StaticResource InputBox}" Margin="0,0,0,14"/>
                         </StackPanel>
 
                         <Button x:Name="EnterButton" Content="登录并进入系统" Style="{StaticResource PrimaryButton}" Click="OnEnterClicked"/>
-                        <TextBlock Text="账号信息用于区分当前工作台操作人。"
+                        <TextBlock Text="登录后可在工作台选择本地或服务器后端。注册密码至少12位。"
                                    Foreground="{StaticResource MutedBrush}" Margin="0,18,0,0" TextWrapping="Wrap"/>
                     </StackPanel>
+                    </ScrollViewer>
                 </Border>
             </Grid>
         </Grid>
@@ -261,6 +262,15 @@
                     <StackPanel DockPanel.Dock="Top">
                         <TextBlock Text="AI 审查助手" Foreground="White" FontSize="20" FontWeight="Bold"/>
                         <TextBlock x:Name="UserTextBlock" Text="当前用户：演示用户" Foreground="#D0D5DD" Margin="0,8,0,28"/>
+
+                        <TextBlock Text="检测后端" Foreground="#D0D5DD" Margin="0,0,0,7"/>
+                        <ComboBox x:Name="WorkbenchBackendMode" SelectedIndex="0" Padding="10,8"
+                                  SelectionChanged="OnWorkbenchBackendChanged">
+                            <ComboBoxItem Content="本地后端"/>
+                            <ComboBoxItem Content="服务器后端"/>
+                        </ComboBox>
+                        <Button Content="重新连接" Style="{StaticResource NavButton}" Click="OnReconnectBackendClicked" Padding="0,7"/>
+                        <TextBlock x:Name="WorkbenchBackendStatus" Foreground="#98A2B3" TextWrapping="Wrap" FontSize="11" Margin="0,7,0,20"/>
 
                         <Button Content="完整性检查" Style="{StaticResource ActiveNavButton}" Margin="0,0,0,8"/>
                         <Button Content="可研报告专项检查" Style="{StaticResource NavButton}" Margin="0,0,0,8"/>
