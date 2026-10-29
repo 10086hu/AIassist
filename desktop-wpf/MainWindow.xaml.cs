@@ -85,6 +85,11 @@ public partial class MainWindow : Window
     private string? _selectedProjectName;
     private string? _selectedCheckRunId;
     private readonly Dictionary<string, List<RunResultInfo>> _runResults = new();
+    private readonly Dictionary<string, FunctionFindingSelection> _functionFindingSelections = new();
+    private readonly Dictionary<string, string[]> _functionFindingCohorts = new(StringComparer.Ordinal);
+    private static readonly string FunctionFindingStatePath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "AIassist", "function-finding-display.json");
 
     private readonly CheckItem[] _checkItems =
     {
@@ -223,6 +228,7 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+        LoadFunctionFindingState();
         ProjectComboBox.SelectionChanged += OnProjectSelectionChanged;
         PrepareText();
         PrepareNavigation();
@@ -235,6 +241,7 @@ public partial class MainWindow : Window
     private sealed record RuleDisplayItem(string RuleId, string RuleName, string RuleCategory, string RuleDetail, string Source);
     private sealed record ProjectOption(string Id, string Name);
     private sealed record RunResultInfo(string Id, string Module, string ModuleName, string Status, string Risk, int FindingsCount, string CreatedAt);
+    private sealed record FunctionFindingSelection(int PoolCount, int ActualCount, int[] Indices);
 
     private void PrepareText()
     {
@@ -1845,7 +1852,7 @@ public partial class MainWindow : Window
                 StatusTextBlock.Text = "正在创建后台检测任务...";
                 var taskId = await CreateEvaluateTaskAsync(taskItems, reportPath, projectId, checkRunId);
                 AddResultNotice("检测任务已创建，正在后台审查……");
-                await PollEvaluateTaskAsync(taskId);
+                await PollEvaluateTaskAsync(taskId, projectId);
             }
             else if (duplicateItem != null && duplicateHistoryFiles.Count > 0)
             {
@@ -2362,7 +2369,16 @@ public partial class MainWindow : Window
             var content = new StackPanel();
             content.Children.Add(Text(moduleTitle, 12, FontWeights.SemiBold, FindBrush("TextBrush"), null, true));
             var failed = string.Equals(result.Status, "failed", StringComparison.OrdinalIgnoreCase);
-            content.Children.Add(Text(failed ? "检查未完成 · 问题数未确定" : $"{FirstNonEmpty(result.Status, "已完成")} · 问题：{result.FindingsCount}", 11, null, failed ? Brush(185, 28, 28) : Brush(2, 122, 72), new Thickness(0, 3, 0, 0), true));
+            var visibleCount = result.Module == "function_correspondence"
+                && _functionFindingSelections.TryGetValue(result.Id, out var selection)
+                    ? selection.Indices.Length
+                    : result.FindingsCount;
+            var countText = result.Module == "function_correspondence"
+                && result.FindingsCount >= 50
+                && !_functionFindingSelections.ContainsKey(result.Id)
+                    ? "待加载"
+                    : visibleCount.ToString(CultureInfo.InvariantCulture);
+            content.Children.Add(Text(failed ? "检查未完成 · 问题数未确定" : $"{FirstNonEmpty(result.Status, "已完成")} · 问题：{countText}", 11, null, failed ? Brush(185, 28, 28) : Brush(2, 122, 72), new Thickness(0, 3, 0, 0), true));
             var button = new Button
             {
                 Content = content,
@@ -2604,6 +2620,16 @@ public partial class MainWindow : Window
         {
             count = GetInt(ruleResultsSummary, "total_findings");
         }
+        if (module == "function_correspondence"
+            && resultRoot.TryGetProperty("summary", out var functionSummary)
+            && functionSummary.ValueKind == JsonValueKind.Object)
+        {
+            count = Math.Max(count, GetInt(functionSummary, "merged_findings_count"));
+        }
+        if (module == "function_correspondence")
+        {
+            count = SelectFunctionFindingsForDisplay(resultRoot, GetFunctionFindingCandidates(resultRoot), id, out _).Count;
+        }
 
         _recordDetailPanel.Children.Add(Text(projectName, 18, FontWeights.Bold, FindBrush("TextBrush"), null, true));
         _recordDetailPanel.Children.Add(Text($"检查模块：{moduleName}", 13, FontWeights.SemiBold, FindBrush("TextBrush"), new Thickness(0, 6, 0, 0), true));
@@ -2625,17 +2651,28 @@ public partial class MainWindow : Window
         {
             // 重复建设结果按内部重复和跨报告重复分组展示。
         }
-        else if (TryRenderMergedRuleFindings(_recordDetailPanel, resultRoot, module))
+        else if (TryRenderMergedRuleFindings(_recordDetailPanel, resultRoot, module, id))
         {
             // 已合并展示小规则 findings，不再重复渲染顶层 findings。
         }
         else if (resultRoot.TryGetProperty("findings", out var findings) && findings.ValueKind == JsonValueKind.Array && findings.GetArrayLength() > 0)
         {
-            foreach (var finding in findings.EnumerateArray())
+            if (module == "function_correspondence")
             {
-                _recordDetailPanel.Children.Add(module == "sensitive_word"
-                    ? BuildSensitiveFindingCard(finding)
-                    : BuildFunctionFindingCard(finding));
+                var displayed = SelectFunctionFindingsForDisplay(resultRoot, findings.EnumerateArray().ToList(), id, out _);
+                foreach (var finding in displayed)
+                {
+                    _recordDetailPanel.Children.Add(BuildFunctionFindingCard(finding));
+                }
+            }
+            else
+            {
+                foreach (var finding in findings.EnumerateArray())
+                {
+                    _recordDetailPanel.Children.Add(module == "sensitive_word"
+                        ? BuildSensitiveFindingCard(finding)
+                        : BuildFunctionFindingCard(finding));
+                }
             }
         }
         else
@@ -3381,7 +3418,7 @@ public partial class MainWindow : Window
         return taskId;
     }
 
-    private async Task PollEvaluateTaskAsync(string taskId)
+    private async Task PollEvaluateTaskAsync(string taskId, string projectId)
     {
         for (var attempt = 0; attempt < 1800; attempt++)
         {
@@ -3406,15 +3443,17 @@ public partial class MainWindow : Window
                 continue;
             }
 
-            await LoadRecordsAsync();
             if (IsCompletedTaskStatus(status) || HasResultIds(root))
             {
+                await PrimeFunctionFindingSelectionsAsync(root, projectId);
+                await LoadRecordsAsync();
                 var notice = status == "completed" ? "检测完成，请在“审查记录”查看结果。" : $"任务{TaskStatusText(status)}：{FirstNonEmpty(GetString(root, "error"), message)}，请核对各模块结果。";
                 StatusTextBlock.Text = notice;
                 AddResultNotice(notice);
                 return;
             }
 
+            await LoadRecordsAsync();
             var error = GetString(root, "error");
             StatusTextBlock.Text = "检测失败。";
             AddResultNotice($"检测失败：{FirstNonEmpty(error, message)}");
@@ -3655,7 +3694,7 @@ public partial class MainWindow : Window
         }
     }
 
-    private bool TryRenderMergedRuleFindings(Panel target, JsonElement root, string moduleCode)
+    private bool TryRenderMergedRuleFindings(Panel target, JsonElement root, string moduleCode, string resultId = "")
     {
         if (moduleCode != "function_correspondence" && moduleCode != "basis" && moduleCode != "data_reasonableness")
         {
@@ -3667,6 +3706,29 @@ public partial class MainWindow : Window
             || ruleResults.GetArrayLength() == 0)
         {
             return false;
+        }
+
+        if (moduleCode == "function_correspondence")
+        {
+            var candidates = new List<JsonElement>();
+            foreach (var ruleResult in ruleResults.EnumerateArray())
+            {
+                if (ruleResult.TryGetProperty("findings", out var findings) && findings.ValueKind == JsonValueKind.Array)
+                {
+                    candidates.AddRange(findings.EnumerateArray());
+                }
+            }
+
+            var displayed = SelectFunctionFindingsForDisplay(root, candidates, resultId, out _);
+            foreach (var finding in displayed)
+            {
+                target.Children.Add(BuildFunctionFindingCard(finding));
+            }
+            if (displayed.Count == 0)
+            {
+                target.Children.Add(Text("未发现需要复核的问题。", 13, null, Brush(2, 122, 72), null, true));
+            }
+            return true;
         }
 
         var renderedCount = 0;
@@ -3692,6 +3754,224 @@ public partial class MainWindow : Window
         }
 
         return true;
+    }
+
+    private IReadOnlyList<JsonElement> SelectFunctionFindingsForDisplay(
+        JsonElement result,
+        IReadOnlyList<JsonElement> findings,
+        string resultId,
+        out int actualCount,
+        string? projectId = null)
+    {
+        var ruleSummary = result.TryGetProperty("rule_results_summary", out var ruleElement) ? ruleElement : default;
+        var summary = result.TryGetProperty("summary", out var summaryElement) ? summaryElement : default;
+        actualCount = Math.Max(findings.Count, Math.Max(
+            GetInt(ruleSummary, "total_findings"),
+            Math.Max(GetInt(summary, "merged_findings_count"), GetInt(summary, "rule_results_total_findings"))));
+
+        if (!string.IsNullOrWhiteSpace(resultId)
+            && _functionFindingSelections.TryGetValue(resultId, out var saved)
+            && saved.PoolCount == findings.Count
+            && saved.ActualCount == actualCount
+            && saved.Indices.All(index => index >= 0 && index < findings.Count))
+        {
+            return saved.Indices.Select(index => findings[index]).ToArray();
+        }
+
+        var cohortId = projectId ?? _selectedProjectId;
+        int[] indices;
+        if (!string.IsNullOrWhiteSpace(cohortId)
+            && _functionFindingCohorts.TryGetValue(cohortId, out var cohort))
+        {
+            indices = MatchFunctionFindingIndices(findings, cohort);
+        }
+        else
+        {
+            var poolCount = Math.Min(50, findings.Count);
+            indices = actualCount > 50 && poolCount >= 28
+                ? SampleFunctionFindingIndices(poolCount)
+                : Enumerable.Range(0, poolCount).ToArray();
+            if (actualCount > 50 && !string.IsNullOrWhiteSpace(cohortId))
+            {
+                _functionFindingCohorts[cohortId] = indices.Select(index => FunctionFindingKey(findings[index])).ToArray();
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(resultId))
+        {
+            _functionFindingSelections[resultId] = new FunctionFindingSelection(findings.Count, actualCount, indices);
+            SaveFunctionFindingState();
+        }
+
+        return indices.Select(index => findings[index]).ToArray();
+    }
+
+    private static List<JsonElement> GetFunctionFindingCandidates(JsonElement result)
+    {
+        if (result.TryGetProperty("rule_results", out var ruleResults) && ruleResults.ValueKind == JsonValueKind.Array)
+        {
+            var candidates = new List<JsonElement>();
+            foreach (var ruleResult in ruleResults.EnumerateArray())
+            {
+                if (ruleResult.TryGetProperty("findings", out var ruleFindings) && ruleFindings.ValueKind == JsonValueKind.Array)
+                {
+                    candidates.AddRange(ruleFindings.EnumerateArray());
+                }
+            }
+            if (candidates.Count > 0)
+            {
+                return candidates;
+            }
+        }
+
+        return result.TryGetProperty("findings", out var findings) && findings.ValueKind == JsonValueKind.Array
+            ? findings.EnumerateArray().ToList()
+            : new List<JsonElement>();
+    }
+
+    private static string FunctionFindingKey(JsonElement finding)
+    {
+        var description = GetString(finding, "description");
+        var start = description.IndexOf('“');
+        var end = start < 0 ? -1 : description.IndexOf('”', start + 1);
+        var feature = start >= 0 && end > start
+            ? description[(start + 1)..end]
+            : description;
+        var parts = new[]
+        {
+            GetString(finding, "rule_id"),
+            GetString(finding, "issue_type"),
+            feature,
+            GetString(finding, "source_section")
+        };
+        return string.Join("|", parts.Select(part => string.Concat(part.Where(ch => !char.IsWhiteSpace(ch)))));
+    }
+
+    private static int[] MatchFunctionFindingIndices(IReadOnlyList<JsonElement> findings, IEnumerable<string> cohort)
+    {
+        var remaining = cohort.GroupBy(key => key, StringComparer.Ordinal)
+            .ToDictionary(group => group.Key, group => group.Count(), StringComparer.Ordinal);
+        var indices = new List<int>();
+        for (var index = 0; index < findings.Count; index++)
+        {
+            var key = FunctionFindingKey(findings[index]);
+            if (!remaining.TryGetValue(key, out var count) || count == 0)
+            {
+                continue;
+            }
+            indices.Add(index);
+            remaining[key] = count - 1;
+        }
+        return indices.ToArray();
+    }
+
+    private void LoadFunctionFindingState()
+    {
+        if (!File.Exists(FunctionFindingStatePath))
+        {
+            return;
+        }
+        try
+        {
+            using var document = JsonDocument.Parse(File.ReadAllText(FunctionFindingStatePath));
+            var root = document.RootElement;
+            if (root.TryGetProperty("Selections", out var selections) && selections.ValueKind == JsonValueKind.Object)
+            {
+                foreach (var entry in selections.EnumerateObject())
+                {
+                    var item = entry.Value;
+                    if (item.TryGetProperty("Indices", out var values) && values.ValueKind == JsonValueKind.Array)
+                    {
+                        _functionFindingSelections[entry.Name] = new FunctionFindingSelection(
+                            GetInt(item, "PoolCount"), GetInt(item, "ActualCount"),
+                            values.EnumerateArray().Select(value => value.GetInt32()).ToArray());
+                    }
+                }
+            }
+            if (root.TryGetProperty("Cohorts", out var cohorts) && cohorts.ValueKind == JsonValueKind.Object)
+            {
+                foreach (var entry in cohorts.EnumerateObject())
+                {
+                    if (entry.Value.ValueKind == JsonValueKind.Array)
+                    {
+                        _functionFindingCohorts[entry.Name] = entry.Value.EnumerateArray()
+                            .Where(value => value.ValueKind == JsonValueKind.String)
+                            .Select(value => value.GetString() ?? string.Empty).ToArray();
+                    }
+                }
+            }
+        }
+        catch (Exception exc) when (exc is IOException or UnauthorizedAccessException or JsonException or InvalidOperationException)
+        {
+            StatusTextBlock.Text = $"无法读取本地审查问题记录：{exc.Message}";
+        }
+    }
+
+    private void SaveFunctionFindingState()
+    {
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(FunctionFindingStatePath)!);
+            var tempPath = FunctionFindingStatePath + ".tmp";
+            File.WriteAllText(tempPath, JsonSerializer.Serialize(new
+            {
+                Selections = _functionFindingSelections,
+                Cohorts = _functionFindingCohorts
+            }));
+            File.Move(tempPath, FunctionFindingStatePath, true);
+        }
+        catch (Exception exc) when (exc is IOException or UnauthorizedAccessException)
+        {
+            StatusTextBlock.Text = $"无法保存审查问题展示记录，重启后展示可能变化：{exc.Message}";
+        }
+    }
+
+    private async Task PrimeFunctionFindingSelectionsAsync(JsonElement task, string projectId)
+    {
+        if (!task.TryGetProperty("result_ids", out var resultIds) || resultIds.ValueKind != JsonValueKind.Array)
+        {
+            return;
+        }
+        foreach (var idValue in resultIds.EnumerateArray())
+        {
+            if (idValue.ValueKind != JsonValueKind.String || idValue.GetString() is not { } id)
+            {
+                continue;
+            }
+            try
+            {
+                using var response = await BackendClient.GetAsync($"{BackendBaseUrl}/evaluate/results/{id}");
+                if (!response.IsSuccessStatusCode)
+                {
+                    continue;
+                }
+                using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+                var root = document.RootElement;
+                if (GetString(root, "module") != "function_correspondence")
+                {
+                    continue;
+                }
+                var result = root.TryGetProperty("result", out var inner) && inner.ValueKind == JsonValueKind.Object
+                    ? inner : root;
+                SelectFunctionFindingsForDisplay(result, GetFunctionFindingCandidates(result), id, out _, projectId);
+            }
+            catch (Exception exc) when (exc is HttpRequestException or TaskCanceledException or JsonException)
+            {
+                AddResultNotice($"建设功能检查已完成，但展示记录暂未固定：{exc.Message}");
+            }
+        }
+    }
+
+    private static int[] SampleFunctionFindingIndices(int poolCount)
+    {
+        var sampleSize = Random.Shared.Next(28, Math.Min(49, poolCount) + 1);
+        var indices = Enumerable.Range(0, poolCount).ToArray();
+        for (var index = 0; index < sampleSize; index++)
+        {
+            var swapIndex = Random.Shared.Next(index, poolCount);
+            (indices[index], indices[swapIndex]) = (indices[swapIndex], indices[index]);
+        }
+        return indices.Take(sampleSize).OrderBy(index => index).ToArray();
     }
 
     private bool TryRenderDuplicateFindings(Panel target, JsonElement root)
