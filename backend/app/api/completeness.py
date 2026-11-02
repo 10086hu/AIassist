@@ -137,5 +137,7 @@ def get_source(result_id: str, index: int, project_id: str, db: Session = Depend
     source = next((s for s in row.source_artifacts if s.filename == inventory[index]["filename"]), None)
     if source is None:
         raise HTTPException(404, "原文件快照不存在")
-    return Response(source.content, media_type=source.media_type,
-                    headers={"Content-Disposition": "attachment; filename*=UTF-8''" + quote(source.filename)})
+    return Response(source.content, media_type=mimetypes.guess_type(source.filename)[0] or "application/octet-stream",
+                    headers={"Content-Disposition": "attachment; filename*=UTF-8''" + quote(source.filename),
+                             "X-Content-Type-Options": "nosniff",
+                             "Content-Security-Policy": "sandbox; default-src 'none'"})

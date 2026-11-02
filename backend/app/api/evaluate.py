@@ -215,12 +215,16 @@ def evaluate_result_source(result_id: str, source_id: str, db: Session = Depends
     )
     if artifact is None:
         raise HTTPException(status_code=404, detail="原始报告附件不存在")
-    media_type = artifact.media_type or "application/octet-stream"
+    # Uploaded history can contain untrusted MIME metadata; original files are
+    # downloads, while /preview performs the escaped document rendering.
+    media_type = mimetypes.guess_type(artifact.filename)[0] or "application/octet-stream"
     filename = artifact.filename.replace('"', "")
     return Response(
         content=artifact.content,
         media_type=media_type,
-        headers={"Content-Disposition": f"inline; filename*=UTF-8''{quote(filename)}"},
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}",
+                 "X-Content-Type-Options": "nosniff",
+                 "Content-Security-Policy": "sandbox; default-src 'none'"},
     )
 
 

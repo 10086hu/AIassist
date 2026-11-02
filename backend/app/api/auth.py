@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import secrets
 import time
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
@@ -68,6 +69,7 @@ class UserResponse(BaseModel):
     username: str
     display_name: str
     is_active: bool
+    role: Literal["user", "admin"]
     created_at: datetime
     last_login_at: datetime | None
 

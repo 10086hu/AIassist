@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models import AuthSession, User
 from app.db.session import get_db
+from app.core.config import settings
 
 
 bearer = HTTPBearer(auto_error=False, scheme_name="BearerAuth")
@@ -37,3 +38,22 @@ def get_current_session(
 
 def get_current_user(session: AuthSession = Depends(get_current_session)) -> User:
     return session.user
+
+
+def get_current_admin(user: User = Depends(get_current_user)) -> User:
+    """Enforce roles on the server, independently of which desktop UI is used."""
+    if user.role != "admin":
+        raise HTTPException(403, "此操作需要管理员权限")
+    return user
+
+
+def get_business_user(user: User = Depends(get_current_user)) -> User:
+    """The existing shared workspace is administrative in server mode.
+
+    Local backends continue to run reviews for their signed-in local user.
+    Server users exchange only their own uploads and addressed deliveries via
+    the history API instead of gaining access to every project and attachment.
+    """
+    if settings.backend_mode == "server" and user.role != "admin":
+        raise HTTPException(403, "服务器项目及审查管理需要管理员权限，请使用个人历史传输接口")
+    return user

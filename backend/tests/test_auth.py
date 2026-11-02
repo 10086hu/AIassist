@@ -1,6 +1,7 @@
 """Exercise the deployed application's real auth dependencies and DB transactions."""
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
+from dataclasses import replace
 import importlib
 
 import pytest
@@ -21,6 +22,8 @@ NEW_PASSWORD = "New-auth-passphrase-2026!"
 @pytest.fixture
 def setup(tmp_path, monkeypatch):
     main = importlib.import_module("app.main")
+    auth_dependencies = importlib.import_module("app.core.auth")
+    monkeypatch.setattr(auth_dependencies, "settings", replace(auth_dependencies.settings, backend_mode="local"))
     engine = create_engine(f"sqlite:///{tmp_path / 'auth.db'}", connect_args={"check_same_thread": False})
     factory = sessionmaker(bind=engine)
     Base.metadata.create_all(engine)
@@ -57,6 +60,7 @@ def test_full_lifecycle_and_real_business_access(setup):
     assert response.status_code == 201, response.text
     user = response.json()
     assert user["username"] == "auth_tester" and user["display_name"] == "测试用户"
+    assert user["role"] == "user"
     assert user["created_at"].endswith("Z")
     assert "password" not in response.text and "hash" not in response.text
     response = login(client, username="AUTH_TESTER")
@@ -107,6 +111,7 @@ def test_duplicates_and_uniform_invalid_credentials(setup):
     {"username": "valid", "password": " " * 12},
     {"username": "valid", "password": PASSWORD, "display_name": "  "},
     {"username": "valid", "password": PASSWORD, "is_active": True},
+    {"username": "valid", "password": PASSWORD, "role": "admin"},
 ])
 def test_validation_redacts_inputs(setup, payload):
     client, factory, _ = setup

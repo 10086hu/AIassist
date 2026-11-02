@@ -22,16 +22,23 @@ ENV/
 *.pem
 *.pfx
 *.p12
+*.token
+uisettings.json
 
 # FastAPI / local runtime data
 backend/data/
-.runtime/duplicate_cache/
+/.runtime/
+/.codex-run/
 data/
 !backend/app/modules/price/data/
 !backend/app/modules/price/data/*.json
 *.db
 *.sqlite
 *.sqlite3
+*.db-wal
+*.db-shm
+*.db-journal
+/output/received-*.txt
 
 # .NET / WPF build output
 bin/

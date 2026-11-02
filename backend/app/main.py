@@ -4,10 +4,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.responses import JSONResponse
 
-from app.api import auth, evaluate, projects, completeness
-from app.core.auth import get_current_user
+from app.api import admin, auth, evaluate, projects, completeness, history
+from app.core.auth import get_business_user
 from app.core.config import settings
 from app.db.session import init_db
+from app.core.history_limits import HistoryBodyLimitMiddleware
 
 
 app = FastAPI(
@@ -23,6 +24,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(HistoryBodyLimitMiddleware)
 
 
 @app.on_event("startup")
@@ -46,7 +48,7 @@ async def auth_cache_control(request: Request, call_next):
 
 @app.exception_handler(RequestValidationError)
 async def safe_validation_error(request: Request, exc: RequestValidationError):
-    if request.url.path.startswith("/api/auth/"):
+    if request.url.path.startswith(("/api/auth/", "/api/history/", "/api/admin/history/")):
         # Pydantic's default error includes the rejected input, which could be a
         # plaintext password. Keep useful field diagnostics without that value.
         return JSONResponse(status_code=422, content={"detail": [
@@ -56,7 +58,10 @@ async def safe_validation_error(request: Request, exc: RequestValidationError):
 
 
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
-protected = [Depends(get_current_user)]
+app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
+app.include_router(history.router, prefix="/api/history", tags=["history"])
+app.include_router(history.admin_router, prefix="/api/admin/history", tags=["admin-history"])
+protected = [Depends(get_business_user)]
 app.include_router(projects.router, prefix="/api/projects", tags=["projects"], dependencies=protected)
 app.include_router(evaluate.router, prefix="/api/evaluate", tags=["evaluate"], dependencies=protected)
 app.include_router(completeness.router, prefix="/api/completeness", tags=["completeness"], dependencies=protected)

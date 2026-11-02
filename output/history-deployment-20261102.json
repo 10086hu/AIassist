@@ -1,0 +1,86 @@
+{
+  "server": "10.60.150.179",
+  "verified_at": "2026-11-02T21:56:43+08:00",
+  "image": "aiassist-backend:history-20261102",
+  "image_id": "sha256:4b0eff626b4a36e11d89b0c8243e5b49c08c3c9825f263d5ec3bac649b2cf054",
+  "backend_mode": "server",
+  "administrator": "aiassist_admin",
+  "local_regression_tests_passed": 201,
+  "mysql_boundary_checks": {
+    "concurrent_upload_statuses": [
+      200,
+      200,
+      200,
+      200,
+      200,
+      200
+    ],
+    "concurrent_dispatch_statuses": [
+      200,
+      200,
+      200,
+      200,
+      200,
+      200
+    ],
+    "max_attachment_32_mib_status": 200,
+    "text_65536_bytes_rejected": 422,
+    "status": "passed"
+  },
+  "production_http_checks": {
+    "schema_version": 1,
+    "base_url": "http://10.60.150.179:8000",
+    "run_id": "303b2c90-2049-463c-a2ec-67aa9b4bf3f9",
+    "marker": "history-smoke-303b2c90-2049-463c-a2ec-67aa9b4bf3f9",
+    "client_record_id": "e7df2e11-2953-4899-8b41-62a5f08d0749",
+    "sender_user_id": "9223df8a-359c-4b51-851e-ac39a3371da8",
+    "recipient_user_id": "d9347b99-753c-4255-84c3-b8f38513c7ac",
+    "admin_user_id": "a42caa92-9a24-458b-883d-2c2541b2eea0",
+    "source_attachments": [
+      {
+        "sha256": "c92ac3f0851d04c918289713fbffff9e273fcf6ecfe42599dd8c0ab7e343b3e9",
+        "bytes": 117
+      }
+    ],
+    "phase": "cleaned",
+    "upload_id": "b20028c8-b85f-47e7-8e57-4049b3681219",
+    "project_id": "f5ff6f4e-65ac-51a7-a633-5dd0a4ca6993",
+    "upload_sha256": "d73375b8a90377dca5e859bf4d920b429cbfe7bc543b4669db2f4ebc1af41c83",
+    "delivery_id": "eef4388d-a52e-4381-8f3c-723af0eba926",
+    "delivery_sha256": "63f00dbdb55f603c0bda066ad8ade5bc3c045f3295bbf3e7892300fc31eb7442",
+    "checks": {
+      "authentication_and_roles": "passed",
+      "record_attachment_and_recipient_isolation": "passed",
+      "persistence_after_restart": "passed",
+      "revocation": "passed",
+      "owned_test_project_cleanup": "passed"
+    },
+    "cleanup": {
+      "delivery": "deleted_after_revocation_verification",
+      "upload_and_project": "deleted",
+      "temporary_users": "deleted",
+      "verification_admin_session": "revoked"
+    },
+    "status": "passed"
+  },
+  "local_receive_checks": {
+    "real_server_package_imported_into_local_sqlite": "passed",
+    "retry_deduplicated": "passed",
+    "attachment_integrity_and_preview": "passed"
+  },
+  "workstation_checks": {
+    "workstation_login": "passed",
+    "administrator_role": "admin",
+    "project_count": 1,
+    "user_count": 6,
+    "history_api_in_openapi": "passed"
+  },
+  "business_data_preserved": {
+    "projects": 1,
+    "check_runs": 1,
+    "check_results": 14,
+    "source_artifacts": 9
+  },
+  "backup_path": "/var/backups/aiassist/before-history-20261102",
+  "status": "passed"
+}

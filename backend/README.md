@@ -1,5 +1,13 @@
 # AI Assist 后端：服务器连接与登录注册 API
 
+## 当前源码：管理员／用户历史传输 API
+
+角色权限、用户上传、管理员定向分发、用户收件和本地导入接口已于 **2026-11-02** 部署到 `10.60.150.179`。详见 [客户端接入文档](../docs/history_transfer_api.md) 和 [本次部署与验证记录](../docs/history_server_deployment_20261102.md)。
+
+新版服务器应设置 `BACKEND_MODE=server`，本地设置 `BACKEND_MODE=local`。服务器旧业务管理接口改为仅管理员可访问；已有账号默认仍是普通用户，升级后需通过 `python -m app.cli.manage_admin 用户名 --role admin` 显式指定管理员并重新登录。
+
+当前独立管理员账号为 `aiassist_admin`；已有账号保留为普通用户。初始凭据已单独交付，不保存在仓库或本文件中。
+
 后端已部署在 `10.60.150.179`，使用 FastAPI、SQLAlchemy 和服务器上的独立 MySQL 8。2026-10-20 已完成登录注册功能的部署和验证。本文同时保存在服务器 `/opt/aiassist/README.md` 和 `/opt/aiassist/backend/README.md`。
 
 ## 1. 连接服务器
@@ -36,7 +44,7 @@ ssh -N -L 127.0.0.1:18000:127.0.0.1:8000 root@10.60.150.179
 - 退出当前会话立即撤销当前令牌；退出全部会话或改密会撤销该账号全部令牌。
 - `/api/projects/*`、`/api/evaluate/*`、`/api/completeness/*` 的所有业务接口均需登录，包括文件下载、预览和报告导出。
 - 注册、登录、`/api/health`、`/docs`、`/openapi.json` 允许匿名访问。
-- **业务数据是共享工作空间：所有已注册且启用的用户，登录后可访问同一组项目、报告与任务。当前没有按账号隔离项目，也没有管理员/普通用户角色划分。**
+- **此前部署版本的业务数据是共享工作空间。新增角色版本部署后，服务器统一管理接口仅管理员可访问，普通用户仅可访问自己的上传与收件；本地工作区仍共享。**
 - 当前不包含短信、邮箱验证或忘记密码找回流程。
 
 Swagger 操作：先在 `auth` 中注册、登录，复制响应的 `access_token`，点击右上角 **Authorize**，仅粘贴令牌值，然后调用业务接口。
@@ -209,7 +217,7 @@ unset TOKEN
 | --- | --- |
 | 后端源码 / 部署脚本 | `/opt/aiassist/backend` / `/opt/aiassist/deploy` |
 | 后端服务 | `aiassist-api.service` |
-| Docker 容器 / 镜像 | `aiassist-backend` / `aiassist-backend:auth-20261020` |
+| Docker 容器 / 镜像 | `aiassist-backend` / `aiassist-backend:history-20261102` |
 | 数据库服务 | `aiassist-mysql.service` |
 | MySQL | `8.0.46`，监听 `127.0.0.1:3307`，库名 `aiassist` |
 | 数据库数据 / 应用缓存 | `/var/lib/aiassist-mysql` / `/var/lib/aiassist` |

@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import List, Optional
 from uuid import uuid4
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, LargeBinary, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, LargeBinary, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.dialects.mysql import LONGBLOB, LONGTEXT
 
@@ -31,6 +31,7 @@ class User(Base):
     display_name: Mapped[str] = mapped_column(String(64), nullable=False)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    role: Mapped[str] = mapped_column(String(16), nullable=False, default="user", server_default="user")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     last_login_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
@@ -261,4 +262,53 @@ class AuditLog(Base):
     operator: Mapped[Optional[str]] = mapped_column(String(100))
     module: Mapped[Optional[str]] = mapped_column(String(64))
     detail: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class HistoryUpload(Base):
+    """Immutable receipt for a user's uploaded history package."""
+
+    __tablename__ = "history_uploads"
+    __table_args__ = (UniqueConstraint("user_id", "client_record_id", name="uq_history_upload_sender_record"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), index=True)
+    client_record_id: Mapped[str] = mapped_column(String(36))
+    package_sha256: Mapped[str] = mapped_column(String(64))
+    package_json: Mapped[str] = mapped_column(REPORT_TEXT)
+    # Snapshots remain auditable even if an administrator removes a business project.
+    project_id: Mapped[str] = mapped_column(String(36), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class HistoryDelivery(Base):
+    """Persistent per-recipient inbox; independent of online client connections."""
+
+    __tablename__ = "history_deliveries"
+    __table_args__ = (UniqueConstraint("recipient_user_id", "package_sha256", name="uq_history_delivery_recipient_package"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    recipient_user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), index=True)
+    sender_user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"))
+    project_id: Mapped[str] = mapped_column(String(36), index=True)
+    check_run_id: Mapped[Optional[str]] = mapped_column(String(36))
+    package_sha256: Mapped[str] = mapped_column(String(64))
+    package_json: Mapped[str] = mapped_column(REPORT_TEXT)
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    received_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+
+class HistoryImport(Base):
+    """Local durable receipt: retrying an imported delivery does not duplicate it."""
+
+    __tablename__ = "history_imports"
+    __table_args__ = (UniqueConstraint("user_id", "delivery_id", name="uq_history_import_user_delivery"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"))
+    delivery_id: Mapped[str] = mapped_column(String(36))
+    package_sha256: Mapped[str] = mapped_column(String(64))
+    project_id: Mapped[str] = mapped_column(String(36))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

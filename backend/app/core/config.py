@@ -15,10 +15,19 @@ def _default_database_url() -> str:
     return f"sqlite:///{(Path(data_dir) / 'app.db').as_posix()}"
 
 
+def _backend_mode() -> str:
+    default = "server" if os.getenv("APP_ENV", "dev").lower() == "production" else "local"
+    mode = os.getenv("BACKEND_MODE", default).lower()
+    if mode not in {"local", "server"}:
+        raise ValueError("BACKEND_MODE must be local or server")
+    return mode
+
+
 @dataclass(frozen=True)
 class Settings:
     auth_session_hours: int = int(os.getenv("AUTH_SESSION_HOURS", "24"))
     app_env: str = os.getenv("APP_ENV", "dev")
+    backend_mode: str = _backend_mode()
     database_url: str = os.getenv("DATABASE_URL", _default_database_url())
     cors_origins_raw: str = os.getenv(
         "CORS_ORIGINS",

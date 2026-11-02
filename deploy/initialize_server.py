@@ -89,6 +89,7 @@ def main() -> None:
         write_private(backend_env, (
             "APP_ENV=production\n"
             "AIASSIST_DATA_DIR=/var/lib/aiassist\n"
+            "BACKEND_MODE=server\n"
             f"DATABASE_URL=mysql+pymysql://aiassist:{database_password}@127.0.0.1:3307/aiassist?charset=utf8mb4\n"
             "RULE_API_BASE_URL=http://127.0.0.1:5000/rules\n"
             "CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173\n"

@@ -2,14 +2,13 @@
   "server": "10.60.150.179",
   "source_path": "/opt/aiassist/backend",
   "service": "aiassist-api.service",
-  "image": "aiassist-backend:20261019-2238",
-  "image_id": "sha256:293b161aca40e418cfb6ade0bbf6f8a5249b345ae0289c933d1fc3262f5c5fb7",
-  "captured_at": "2026-10-20T00:12:22.604065+08:00",
-  "verified_app_file_count": 77,
-  "app_manifest_sha256": "253c8dd084c90bbb39706ebffd2577f9879282be8cab4e4337ae56dd557976fa",
-  "runtime_configuration": "Generated on server; .env files, credentials, database and caches excluded",
-  "pending_configuration": [
-    "DEEPSEEK_API_KEY",
-    "shanghai_municipal_class2_fees.json"
-  ]
+  "image": "aiassist-backend:history-20261102",
+  "image_id": "sha256:4b0eff626b4a36e11d89b0c8243e5b49c08c3c9825f263d5ec3bac649b2cf054",
+  "captured_at": "2026-11-02T21:56:43+08:00",
+  "verified_app_file_count": 86,
+  "app_manifest_sha256": "89c3d9008e7e6134278e911a84c2ec1617e05bdf028d629339f9cec5d418fefc",
+  "backend_mode": "server",
+  "backup_path": "/var/backups/aiassist/before-history-20261102",
+  "verification_report": "output/history-deployment-20261102.json",
+  "runtime_configuration": "Server environment and credentials excluded from this file"
 }
