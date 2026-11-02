@@ -1,0 +1,40 @@
+{
+  "run_id": "20e57264eba347e98632d5e73e5628b8",
+  "marker": "desktop-live-20e57264eba347e98632d5e73e5628b8",
+  "server_url": "http://10.60.150.179:8000/api",
+  "local_url": "http://127.0.0.1:8000/api",
+  "status": "passed",
+  "checks": {
+    "independent_real_logins": "passed",
+    "server_package_received_by_csharp": "passed",
+    "receive_retry_deduplication": "passed",
+    "local_history_and_preview": "passed",
+    "original_file_saved_and_verified": "passed",
+    "server_received_state": "passed",
+    "csharp_behavior_tests": "16 passed",
+    "wpf_build": "0 warnings, 0 errors"
+  },
+  "server_user_id": "0e1393e6-2ba3-4851-ad20-339395246068",
+  "server_username": "hist_live_s_20e57264eba3",
+  "local_user_id": "fea86399-b706-4ba2-9a5c-937c67fa244a",
+  "local_username": "hist_live_l_20e57264eba3",
+  "client_record_id": "2332ecc6-e139-45f1-a21a-6cc394073133",
+  "server_upload_id": "7366511d-9d28-4c6a-b6df-57f1ca9a03f4",
+  "server_project_id": "0c24730a-5fbb-593a-a5af-a1b6c88c3ea3",
+  "server_delivery_id": "39d05b1f-4741-48c7-b69e-218493664ca4",
+  "local_project_id": "33de7477-4d78-53c9-aa65-d29e9091f7d6",
+  "local_import_id": "9ffe2869-6575-4c6c-9e99-01b8da1ecaa5",
+  "local_result_id": "626c2b4d-5b85-5b2f-9473-80a6985751cf",
+  "local_source_id": "5f231a23-512b-5938-a6f4-2309636e5267",
+  "downloaded_file": "D:\\AIassist\\output\\received-20e57264eba347e98632d5e73e5628b8.txt",
+  "source_sha256": "c92ac3f0851d04c918289713fbffff9e273fcf6ecfe42599dd8c0ab7e343b3e9",
+  "cleanup": "Temporary local/server accounts, sessions, uploaded project, delivery and local imported project removed. Existing data preserved.",
+  "completed_at": "2026-11-02T22:24:32.3246288+08:00",
+  "desktop_ui_check": "Stopped by user Escape; no claim of completed manual UI verification.",
+  "local_after_cleanup": {
+    "projects": 1,
+    "check_results": 0,
+    "users": 0,
+    "history_imports": 0
+  }
+}

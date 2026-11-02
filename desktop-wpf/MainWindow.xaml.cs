@@ -19,10 +19,11 @@ namespace AiReportDesktop;
 
 public partial class MainWindow : Window
 {
-    private static readonly string BackendBaseUrl =
+    internal static BackendSession ActiveBackendSession { get; private set; } = new(new Uri(
         (Environment.GetEnvironmentVariable("AIASSIST_BACKEND_URL")
-            ?? GetUserEnvironment("AIASSIST_BACKEND_URL", "http://127.0.0.1:8000/api")).Trim().TrimEnd('/');
-    private static readonly HttpClient BackendClient = new() { Timeout = TimeSpan.FromMinutes(10) };
+            ?? GetUserEnvironment("AIASSIST_BACKEND_URL", "http://127.0.0.1:8000/api")).Trim().TrimEnd('/')));
+    private static string BackendBaseUrl => ActiveBackendSession.ApiBase.AbsoluteUri.TrimEnd('/');
+    private static HttpClient BackendClient => ActiveBackendSession.Client;
 
     private readonly List<CheckBox> _checkBoxes = new();
     private readonly Dictionary<string, List<CheckBox>> _ruleCheckBoxesByModule = new();
@@ -89,9 +90,7 @@ public partial class MainWindow : Window
     private readonly Dictionary<string, List<RunResultInfo>> _runResults = new();
     private readonly Dictionary<string, FunctionFindingSelection> _functionFindingSelections = new();
     private readonly Dictionary<string, string[]> _functionFindingCohorts = new(StringComparer.Ordinal);
-    private static readonly string FunctionFindingStatePath = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "AIassist", "function-finding-display.json");
+    private static string FunctionFindingStatePath => GetAuthenticatedDisplayStatePath();
 
     private readonly CheckItem[] _checkItems =
     {
@@ -230,7 +229,6 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
-        LoadFunctionFindingState();
         ProjectComboBox.SelectionChanged += OnProjectSelectionChanged;
         PrepareText();
         PrepareNavigation();
@@ -526,20 +524,29 @@ public partial class MainWindow : Window
         }
     }
 
-    private async void OnWindowLoaded(object sender, RoutedEventArgs e)
+    private void OnWindowLoaded(object sender, RoutedEventArgs e)
     {
-        await LoadProjectsAsync();
-        await LoadRulesAsync();
+        InitializeAuthenticationView();
     }
 
     private async Task LoadProjectsAsync()
     {
+        if (!CanUseActiveWorkspace) return;
+        var session = ActiveBackendSession;
+        var revision = _backendSessionRevision;
         try
         {
-            using var response = await BackendClient.GetAsync($"{BackendBaseUrl}/projects");
+            using var response = await session.Client.GetAsync($"{session.ApiBase.AbsoluteUri.TrimEnd('/')}/projects");
             var responseBody = await response.Content.ReadAsStringAsync();
+            if (!IsCurrentBackendSession(session, revision)) return;
             if (!response.IsSuccessStatusCode)
             {
+                if (response.StatusCode == System.Net.HttpStatusCode.Forbidden)
+                {
+                    _workspaceAccessAllowed = false;
+                    ShowHistoryAccessNotice();
+                    return;
+                }
                 StatusTextBlock.Text = $"项目加载失败：{ExtractErrorMessage(responseBody)}";
                 return;
             }
@@ -571,6 +578,7 @@ public partial class MainWindow : Window
         }
         catch (Exception exc)
         {
+            if (!IsCurrentBackendSession(session, revision)) return;
             StatusTextBlock.Text = $"项目加载失败：{exc.Message}";
         }
     }
@@ -839,6 +847,13 @@ public partial class MainWindow : Window
         {
             refreshButton.Click += async (_, _) => await LoadRecordsAsync();
         }
+        var inboxButton = Button("服务器收件箱", true);
+        inboxButton.Margin = new Thickness(10, 0, 0, 0);
+        inboxButton.VerticalAlignment = VerticalAlignment.Center;
+        inboxButton.Click += OnOpenHistoryInbox;
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        Grid.SetColumn(inboxButton, 2);
+        header.Children.Add(inboxButton);
         page.Children.Add(header);
 
         var body = new Grid { Margin = new Thickness(0, 18, 0, 0) };
@@ -1327,6 +1342,7 @@ public partial class MainWindow : Window
 
     private async Task RefreshPriceBenchmarkStatusAsync()
     {
+        if (!CanUseActiveWorkspace) return;
         if (_priceBenchmarkStatusTextBlock == null)
         {
             return;
@@ -1691,18 +1707,14 @@ public partial class MainWindow : Window
         EnterButton.Content = isRegister ? "注册并进入系统" : "登录并进入系统";
     }
 
-    private void OnEnterClicked(object sender, RoutedEventArgs e)
+    private async void OnEnterClicked(object sender, RoutedEventArgs e)
     {
-        var userName = string.IsNullOrWhiteSpace(AccountTextBox.Text) ? "演示用户" : AccountTextBox.Text.Trim();
-        UserTextBlock.Text = $"当前用户：{userName}";
-        LoginPage.Visibility = Visibility.Collapsed;
-        WorkbenchPage.Visibility = Visibility.Visible;
+        await AuthenticateWorkspaceAsync();
     }
 
-    private void OnLogoutClicked(object sender, RoutedEventArgs e)
+    private async void OnLogoutClicked(object sender, RoutedEventArgs e)
     {
-        WorkbenchPage.Visibility = Visibility.Collapsed;
-        LoginPage.Visibility = Visibility.Visible;
+        await LogoutWorkspaceAsync();
     }
 
     private void OnChooseFileClicked(object sender, RoutedEventArgs e)
@@ -1996,6 +2008,9 @@ public partial class MainWindow : Window
 
     private async Task LoadRulesAsync()
     {
+        if (!CanUseActiveWorkspace) return;
+        var session = ActiveBackendSession;
+        var revision = _backendSessionRevision;
         if (!_rulesByModule.ContainsKey("function_correspondence") || !_rulesByModule.ContainsKey("sensitive_word"))
         {
             RulesListPanel.Children.Clear();
@@ -2003,7 +2018,9 @@ public partial class MainWindow : Window
             _rulesByModule.Clear();
             AddBuiltInRuleModules();
             await LoadRulesForModuleAsync("function_correspondence");
+            if (!IsCurrentBackendSession(session, revision)) return;
             await LoadRulesForModuleAsync("sensitive_word");
+            if (!IsCurrentBackendSession(session, revision)) return;
         }
         else
         {
@@ -2059,6 +2076,9 @@ public partial class MainWindow : Window
 
     private async Task LoadRulesForModuleAsync(string moduleCode)
     {
+        if (!CanUseActiveWorkspace) return;
+        var session = ActiveBackendSession;
+        var revision = _backendSessionRevision;
         if (!HasBackendRuleApi(moduleCode))
         {
             return;
@@ -2071,18 +2091,21 @@ public partial class MainWindow : Window
 
         try
         {
-            using var response = await BackendClient.GetAsync($"{BackendBaseUrl}/evaluate/rules?module={moduleCode}");
+            using var response = await session.Client.GetAsync($"{session.ApiBase.AbsoluteUri.TrimEnd('/')}/evaluate/rules?module={moduleCode}");
+            var responseBody = await response.Content.ReadAsStringAsync();
+            if (!IsCurrentBackendSession(session, revision)) return;
             if (!response.IsSuccessStatusCode)
             {
-                AddRuleLoadError(moduleCode, await response.Content.ReadAsStringAsync());
+                AddRuleLoadError(moduleCode, responseBody);
                 return;
             }
 
-            using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+            using var document = JsonDocument.Parse(responseBody);
             AddRuleSection(document.RootElement);
         }
         catch (Exception exc)
         {
+            if (!IsCurrentBackendSession(session, revision)) return;
             AddRuleLoadError(moduleCode, exc.Message);
         }
     }
@@ -2187,6 +2210,13 @@ public partial class MainWindow : Window
 
     private async Task LoadRecordsAsync()
     {
+        if (!CanUseActiveWorkspace)
+        {
+            ShowHistoryAccessNotice();
+            return;
+        }
+        var session = ActiveBackendSession;
+        var revision = _backendSessionRevision;
         if (_projectTreePanel == null)
         {
             return;
@@ -2204,8 +2234,9 @@ public partial class MainWindow : Window
 
         try
         {
-            using var response = await BackendClient.GetAsync($"{BackendBaseUrl}/projects/tree");
+            using var response = await session.Client.GetAsync($"{session.ApiBase.AbsoluteUri.TrimEnd('/')}/projects/tree");
             var responseBody = await response.Content.ReadAsStringAsync();
+            if (!IsCurrentBackendSession(session, revision)) return;
             if (!response.IsSuccessStatusCode)
             {
                 _projectTreePanel.Children.Clear();
@@ -2219,6 +2250,7 @@ public partial class MainWindow : Window
         }
         catch (Exception exc)
         {
+            if (!IsCurrentBackendSession(session, revision)) return;
             _projectTreePanel.Children.Clear();
             _projectTreePanel.Children.Add(Text($"加载失败：{exc.Message}", 13, null, Brush(180, 35, 24), null, true));
         }
@@ -2583,6 +2615,9 @@ public partial class MainWindow : Window
 
     private async Task LoadRecordDetailAsync(string resultId)
     {
+        if (!CanUseActiveWorkspace) return;
+        var session = ActiveBackendSession;
+        var revision = _backendSessionRevision;
         if (_recordDetailPanel == null)
         {
             return;
@@ -2593,8 +2628,9 @@ public partial class MainWindow : Window
 
         try
         {
-            using var response = await BackendClient.GetAsync($"{BackendBaseUrl}/evaluate/results/{resultId}");
+            using var response = await session.Client.GetAsync($"{session.ApiBase.AbsoluteUri.TrimEnd('/')}/evaluate/results/{resultId}");
             var responseBody = await response.Content.ReadAsStringAsync();
+            if (!IsCurrentBackendSession(session, revision)) return;
             if (!response.IsSuccessStatusCode)
             {
                 _recordDetailPanel.Children.Clear();
@@ -2609,6 +2645,7 @@ public partial class MainWindow : Window
         }
         catch (Exception exc)
         {
+            if (!IsCurrentBackendSession(session, revision)) return;
             _recordDetailPanel.Children.Clear();
             _recordDetailPanel.Children.Add(Text($"加载失败：{exc.Message}", 13, null, Brush(180, 35, 24), null, true));
         }
@@ -2652,6 +2689,7 @@ public partial class MainWindow : Window
         _recordDetailPanel.Children.Add(Text($"检查模块：{moduleName}", 13, FontWeights.SemiBold, FindBrush("TextBrush"), new Thickness(0, 6, 0, 0), true));
         var failed = string.Equals(GetString(resultRoot, "status"), "failed", StringComparison.OrdinalIgnoreCase);
         _recordDetailPanel.Children.Add(Text(failed ? "检查未完成｜问题数量：未确定" : $"风险等级：{risk}｜问题数量：{count}", 13, null, FindBrush("MutedBrush"), new Thickness(0, 4, 0, 8), true));
+        AddOriginalFileDownloads(root);
 
         if (root.TryGetProperty("summary", out var summary) && summary.ValueKind == JsonValueKind.Object)
         {
@@ -2798,7 +2836,7 @@ public partial class MainWindow : Window
                     return;
                 }
             }
-            await _documentWebView.EnsureCoreWebView2Async();
+            await EnsureAuthenticatedPreviewAsync();
             if (generation != _preciseEvidenceGeneration) return;
             _documentWebView.Source = new Uri(_activePreviewUrl);
         }
@@ -2887,7 +2925,7 @@ public partial class MainWindow : Window
 
         try
         {
-            await _documentWebView.EnsureCoreWebView2Async();
+            await EnsureAuthenticatedPreviewAsync();
             if (!string.IsNullOrWhiteSpace(requestedRole)
                 && _previewUrlsByRole.TryGetValue(requestedRole, out var requestedUrl)
                 && !string.Equals(_activePreviewUrl, requestedUrl, StringComparison.OrdinalIgnoreCase))
@@ -3012,7 +3050,7 @@ public partial class MainWindow : Window
     private async Task<bool> EnsureEvidencePreviewAsync(string url, int generation)
     {
         if (_documentWebView == null) return false;
-        await _documentWebView.EnsureCoreWebView2Async();
+        await EnsureAuthenticatedPreviewAsync();
         if (generation != _preciseEvidenceGeneration) return false;
         // Rapid clicks share the pending navigation. Only the latest click may
         // apply its highlight after the document becomes ready.
@@ -3120,9 +3158,11 @@ public partial class MainWindow : Window
         {
             return;
         }
+        var generation = _preciseEvidenceGeneration;
         try
         {
             await _documentWebView.EnsureCoreWebView2Async();
+            if (generation != _preciseEvidenceGeneration) return;
             var encoded = System.Net.WebUtility.HtmlEncode(message);
             _documentWebView.NavigateToString($"<!doctype html><html><body style='margin:0;background:#eef2f7;font-family:Microsoft YaHei,Segoe UI,sans-serif;color:#64748b;display:grid;place-items:center;height:100vh'><div style='padding:28px;text-align:center'>{encoded}</div></body></html>");
         }

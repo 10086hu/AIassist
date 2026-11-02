@@ -1,11 +1,21 @@
 @echo off
 setlocal
 
-cd /d %~dp0backend
+cd /d "%~dp0backend"
 
-set "AIASSIST_DATA_DIR=%TEMP%\AIassist"
+set "APP_ENV=dev"
+set "BACKEND_MODE=local"
+if not defined AIASSIST_DATA_DIR set "AIASSIST_DATA_DIR=%~dp0.runtime"
 if not exist "%AIASSIST_DATA_DIR%" mkdir "%AIASSIST_DATA_DIR%"
-set "DATABASE_URL=sqlite:///%AIASSIST_DATA_DIR:\=/%/app.db"
+if not exist "%AIASSIST_DATA_DIR%" (
+    echo [AI Assist] Failed to create the local data directory.
+    exit /b 1
+)
+set "AIASSIST_DATABASE_DESCRIPTION=Explicit DATABASE_URL override; connection string hidden"
+if not defined DATABASE_URL (
+    set "DATABASE_URL=sqlite:///%AIASSIST_DATA_DIR:\=/%/app.db"
+    set "AIASSIST_DATABASE_DESCRIPTION=%AIASSIST_DATA_DIR%\app.db"
+)
 
 for /f "tokens=2,*" %%A in ('reg query HKCU\Environment /v DEEPSEEK_API_KEY 2^>nul') do set "DEEPSEEK_API_KEY=%%B"
 for /f "tokens=2,*" %%A in ('reg query HKCU\Environment /v DEEPSEEK_API_URL 2^>nul') do set "DEEPSEEK_API_URL=%%B"
@@ -59,7 +69,8 @@ if errorlevel 1 (
 )
 
 echo [AI Assist] Starting FastAPI backend at http://127.0.0.1:8000
-echo [AI Assist] Database: %AIASSIST_DATA_DIR%\app.db
+echo [AI Assist] Mode: local
+echo [AI Assist] Database: %AIASSIST_DATABASE_DESCRIPTION%
 echo [AI Assist] LLM base URL: %DEEPSEEK_API_BASE_URL%
 echo [AI Assist] LLM model: %DEEPSEEK_MODEL%
 if "%DEEPSEEK_API_KEY%"=="" (

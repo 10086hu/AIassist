@@ -327,7 +327,7 @@ public partial class MainWindow
         if (save.ShowDialog(owner) != true) return;
         try
         {
-            using var response = await BackendClient.GetAsync(url);
+            using var response = await BackendClient.GetAsync(AuthenticatedBackendUri(url));
             response.EnsureSuccessStatusCode();
             await File.WriteAllBytesAsync(save.FileName, await response.Content.ReadAsByteArrayAsync());
         }
