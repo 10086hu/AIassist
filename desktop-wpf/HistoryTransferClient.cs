@@ -15,6 +15,8 @@ namespace AiReportDesktop;
 public sealed class BackendSession : IDisposable
 {
     private const int SmallResponseLimit = 2 * 1024 * 1024;
+    private const string UsernameLengthError = "用户名长度应为 3～32 个字符。";
+    private const string UsernameFormatError = "用户名须以英文字母或数字开头，只能包含英文字母、数字、下划线（_）、点（.）和连字符（-）。";
     public Uri ApiBase { get; }
     public HttpClient Client { get; }
     public string? UserId { get; private set; }
@@ -36,12 +38,30 @@ public sealed class BackendSession : IDisposable
         };
     }
 
+    public static string? ValidateCredentials(string username, string password, bool registering)
+    {
+        if (string.IsNullOrWhiteSpace(username)) return "请填写用户名。";
+        var account = username.Trim();
+        if (account.Length is < 3 or > 32) return UsernameLengthError;
+        if (!Regex.IsMatch(account, @"\A[A-Za-z0-9][A-Za-z0-9_.-]{2,31}\z", RegexOptions.CultureInvariant))
+            return UsernameFormatError;
+        if (string.IsNullOrEmpty(password)) return "请填写密码。";
+        // Match Python's character count without trimming or changing the secret.
+        var passwordLength = password.EnumerateRunes().Count();
+        if (passwordLength > 128 || registering && passwordLength < 12)
+            return registering ? "注册密码长度应为 12～128 个字符。" : "登录密码长度应为 1～128 个字符。";
+        if (registering && string.IsNullOrWhiteSpace(password)) return "注册密码不能全为空白字符。";
+        return null;
+    }
+
     public async Task LoginAsync(string username, string password, CancellationToken ct = default)
     {
+        if (ValidateCredentials(username, password, registering: false) is { } error)
+            throw new ArgumentException(error);
         ClearAuthentication();
         using var response = await Client.PostAsJsonAsync(ResolveApiUri("auth/login"),
             new { username = username.Trim(), password }, ct);
-        await EnsureSuccessAsync(response, ct);
+        await EnsureSuccessAsync(response, ct, registering: false);
         using var document = await ReadJsonAsync(response, SmallResponseLimit, ct);
         var root = document.RootElement;
         var token = RequiredString(root, "access_token");
@@ -60,9 +80,11 @@ public sealed class BackendSession : IDisposable
 
     public async Task RegisterAsync(string username, string password, string? displayName = null, CancellationToken ct = default)
     {
+        if (ValidateCredentials(username, password, registering: true) is { } error)
+            throw new ArgumentException(error);
         using var response = await Client.PostAsJsonAsync(ResolveApiUri("auth/register"),
             new { username = username.Trim(), password, display_name = string.IsNullOrWhiteSpace(displayName) ? null : displayName.Trim() }, ct);
-        await EnsureSuccessAsync(response, ct);
+        await EnsureSuccessAsync(response, ct, registering: true);
     }
 
     public async Task LogoutAsync(CancellationToken ct = default)
@@ -135,7 +157,7 @@ public sealed class BackendSession : IDisposable
         if (!IsAuthenticated) throw new InvalidOperationException("请先登录对应的后端账号。");
     }
 
-    internal async Task EnsureSuccessAsync(HttpResponseMessage response, CancellationToken ct)
+    internal async Task EnsureSuccessAsync(HttpResponseMessage response, CancellationToken ct, bool? registering = null)
     {
         if (response.IsSuccessStatusCode) return;
         if (response.StatusCode == HttpStatusCode.Unauthorized) ClearAuthentication();
@@ -151,12 +173,67 @@ public sealed class BackendSession : IDisposable
         try
         {
             using var body = await ReadJsonAsync(response, 64 * 1024, ct);
-            if (body.RootElement.TryGetProperty("detail", out var message) && message.ValueKind == JsonValueKind.String
-                && message.GetString() is { Length: > 0 and <= 400 } text)
-                detail = text;
+            if (body.RootElement.ValueKind == JsonValueKind.Object && body.RootElement.TryGetProperty("detail", out var message))
+            {
+                if (message.ValueKind == JsonValueKind.String && message.GetString() is { Length: > 0 and <= 400 } text)
+                    detail = text;
+                else if (message.ValueKind == JsonValueKind.Array && message.GetArrayLength() > 0)
+                    detail = string.Join("\n", message.EnumerateArray()
+                        .Select(item => DescribeValidationError(item, registering)).Distinct().Take(4));
+            }
         }
         catch (Exception ex) when (ex is JsonException or InvalidDataException or HttpRequestException) { }
         throw new BackendRequestException(detail, response.StatusCode);
+    }
+
+    private static string DescribeValidationError(JsonElement error, bool? registering)
+    {
+        const string generic = "请求参数格式不正确，请检查后重试。";
+        if (error.ValueKind != JsonValueKind.Object) return generic;
+        // Do not render server-provided input, msg or ctx: any may contain a secret.
+        // Only known field/type identifiers select messages owned by this client.
+        var field = error.TryGetProperty("loc", out var location) && location.ValueKind == JsonValueKind.Array
+            && location.GetArrayLength() > 0 && location[location.GetArrayLength() - 1].ValueKind == JsonValueKind.String
+            ? location[location.GetArrayLength() - 1].GetString() : null;
+        var label = field switch
+        {
+            "username" => "用户名",
+            "password" => "密码",
+            "current_password" => "当前密码",
+            "new_password" => "新密码",
+            "display_name" => "显示名称",
+            _ => "请求参数",
+        };
+        var type = error.TryGetProperty("type", out var kind) && kind.ValueKind == JsonValueKind.String ? kind.GetString() : null;
+        return type switch
+        {
+            "missing" => label == "请求参数" ? "缺少必填参数。" : $"请填写{label}。",
+            "string_too_short" or "too_short" => field switch
+            {
+                "username" => UsernameLengthError,
+                "password" when registering == true => "注册密码长度应为 12～128 个字符。",
+                "password" when registering == false => "登录密码长度应为 1～128 个字符。",
+                "password" => "密码长度不足；注册密码至少需要 12 个字符。",
+                "new_password" => "新密码长度应为 12～128 个字符。",
+                "current_password" => "请填写当前密码。",
+                "display_name" => "显示名称长度应为 1～64 个字符。",
+                _ => "请求参数长度不足。",
+            },
+            "string_too_long" or "too_long" => field switch
+            {
+                "username" => UsernameLengthError,
+                "password" or "current_password" or "new_password" => $"{label}最多允许 128 个字符。",
+                "display_name" => "显示名称最多允许 64 个字符。",
+                _ => "请求参数长度超过限制。",
+            },
+            "string_pattern_mismatch" when field == "username" => UsernameFormatError,
+            "string_pattern_mismatch" => $"{label}格式不正确。",
+            "string_type" => $"{label}应为文本。",
+            "value_error" when field is "password" or "new_password" && registering != false => $"{label}不符合要求，不能全为空白字符。",
+            "extra_forbidden" => "请求包含不支持的参数，请确认客户端与后端版本一致。",
+            "json_invalid" => "请求内容不是有效的 JSON，请确认客户端与后端版本一致。",
+            _ => $"{label}不符合要求，请检查后重试。",
+        };
     }
 
     internal static async Task<JsonDocument> ReadJsonAsync(HttpResponseMessage response, int maxBytes, CancellationToken ct)

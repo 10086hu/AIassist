@@ -139,6 +139,7 @@ public partial class MainWindow
 
     private async void OnRunCompletenessCheckClicked(object sender, RoutedEventArgs e)
     {
+        if (!RequireWorkspaceDataAccess()) return;
         if (_completenessRunning) return;
         var project = CompletenessProjectId;
         var path = ReportPathTextBlock.Text;

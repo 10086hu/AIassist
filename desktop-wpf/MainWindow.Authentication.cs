@@ -23,6 +23,32 @@ public partial class MainWindow
 
     private bool CanUseActiveWorkspace => ActiveBackendSession.IsAuthenticated && _workspaceAccessAllowed;
 
+    private bool RequireWorkspaceDataAccess()
+    {
+        if (CanUseActiveWorkspace) return true;
+        var message = ActiveBackendSession.IsAuthenticated
+            ? "当前账号没有此工作区的操作权限。"
+            : "当前为免登录浏览。此操作需要先通过左下角的“登录账号”连接后端。";
+        StatusTextBlock.Text = message;
+        MessageBox.Show(this, message, "操作提示", MessageBoxButton.OK, MessageBoxImage.Information);
+        return false;
+    }
+
+    private void EnterWorkspaceWithoutLogin()
+    {
+        if (_authenticationBusy || ActiveBackendSession.IsAuthenticated) return;
+        _workspaceAccessAllowed = false;
+        PasswordBox.Clear();
+        ConfirmPasswordBox.Clear();
+        UserTextBlock.Text = "当前模式：免登录浏览";
+        AccountActionButton.Content = "登录账号";
+        LoginPage.Visibility = Visibility.Collapsed;
+        WorkbenchPage.Visibility = Visibility.Visible;
+        ApplyWorkspaceNavigationAccess();
+        ShowPage("Report");
+        StatusTextBlock.Text = "已进入工作台，可直接浏览各页面。加载审查记录或执行检测时，请通过左下角登录账号。";
+    }
+
     private void InitializeAuthenticationView()
     {
         if (!_authenticationLifecycleReady)
@@ -58,9 +84,10 @@ public partial class MainWindow
         var username = AccountTextBox.Text.Trim();
         var password = PasswordBox.Password;
         var registering = RegisterModeButton.IsChecked == true;
-        if (string.IsNullOrWhiteSpace(username) || string.IsNullOrEmpty(password))
+        var validationError = BackendSession.ValidateCredentials(username, password, registering);
+        if (validationError != null)
         {
-            SetLoginStatus("请填写账号和密码。", true);
+            SetLoginStatus(validationError, true);
             return;
         }
         if (registering && password != ConfirmPasswordBox.Password)
@@ -93,7 +120,7 @@ public partial class MainWindow
         }
         catch (Exception exception)
         {
-            SetLoginStatus((registered ? "账号已注册，登录未完成：" : "登录未完成：") + exception.Message, true);
+            SetLoginStatus((registered ? "账号已注册，登录未完成：" : registering ? "注册未完成：" : "登录未完成：") + exception.Message, true);
         }
         finally
         {
@@ -120,6 +147,7 @@ public partial class MainWindow
         ResetAuthenticatedWorkspace();
         LoadFunctionFindingState();
         UserTextBlock.Text = $"当前用户：{session.Username}（{(session.Role == "admin" ? "管理员" : "用户")}）";
+        AccountActionButton.Content = "退出登录";
         LoginPage.Visibility = Visibility.Collapsed;
         WorkbenchPage.Visibility = Visibility.Visible;
         StatusTextBlock.Text = $"已登录：{session.ApiBase}。";
@@ -180,6 +208,7 @@ public partial class MainWindow
             UserTextBlock.Text = "未登录";
             EnterButton.IsEnabled = true;
             _authenticationBusy = false;
+            AccountActionButton.Content = "登录账号";
             SetLoginStatus(failure == null ? $"已退出。登录地址：{BackendBaseUrl}"
                 : "本地登录状态已清除；服务器会话撤销未确认：" + failure, failure != null);
         }
@@ -221,14 +250,14 @@ public partial class MainWindow
     private void ApplyWorkspaceNavigationAccess()
     {
         foreach (var button in new[] { _reportNavButton, _specialistNavButton, _rulesNavButton, _settingsNavButton })
-            if (button != null) button.IsEnabled = CanUseActiveWorkspace;
+            if (button != null) button.IsEnabled = !ActiveBackendSession.IsAuthenticated || CanUseActiveWorkspace;
     }
 
     private void ShowHistoryAccessNotice()
     {
         var message = ActiveBackendSession.IsAuthenticated
             ? "已登录服务器。请打开“服务器收件箱”，将分配给你的审查记录保存到本地后查看。"
-            : "请先登录后查看审查记录。";
+            : "当前为免登录浏览。登录账号后可加载审查记录，也可以继续查看其他页面。";
         _projectTreePanel?.Children.Clear();
         _projectTreePanel?.Children.Add(Text(message, 13, null, FindBrush("MutedBrush"), new Thickness(0, 8, 0, 0), true));
         StatusTextBlock.Text = message;

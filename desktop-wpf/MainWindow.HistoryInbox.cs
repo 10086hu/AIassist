@@ -26,6 +26,8 @@ public partial class MainWindow
         var active = ActiveBackendSession;
         // A server may be reached through a loopback SSH tunnel. Probe the
         // server-only inbox instead of treating every loopback session as local.
+        if (active.IsAuthenticated)
+        {
         try
         {
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
@@ -44,6 +46,7 @@ public partial class MainWindow
             // The inbox remains usable for connecting to the other backend.
             if (HistoryTransferClient.IsLocalBackend(active.ApiBase)) _historyLocalSession = active;
             else _historyServerSession = active;
+        }
         }
         var inbox = new HistoryInboxWindow(_historyServerSession, _historyLocalSession) { Owner = this };
         inbox.ShowDialog();

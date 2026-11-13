@@ -184,6 +184,8 @@ public sealed class HistoryInboxWindow : Window
         fields.Children.Add(password);
         panel.Children.Add(new TextBlock { Text = "账号                                  密码", Foreground = Brushes.SlateGray, Margin = new Thickness(0, 0, 0, 3) });
         panel.Children.Add(fields);
+        panel.Children.Add(new TextBlock { Text = "账号为 3～32 位，以英文字母或数字开头，可包含 _ . -；注册密码为 12～128 位。", FontSize = 12,
+            Foreground = Brushes.SlateGray, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 6, 0, 0) });
         var login = ActionButton(local ? "登录本地" : "登录服务器");
         var buttons = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 10, 0, 0) };
         buttons.Children.Add(login);
@@ -221,6 +223,12 @@ public sealed class HistoryInboxWindow : Window
                                     PasswordBox? confirmation, bool register)
     {
         var secret = password.Password;
+        var validationError = BackendSession.ValidateCredentials(username, secret, register);
+        if (validationError != null)
+        {
+            _status.Text = validationError;
+            return;
+        }
         var connected = false;
         await RunAsync(async token =>
         {

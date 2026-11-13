@@ -229,12 +229,16 @@
                         </Grid>
 
                         <TextBlock Text="账号" Foreground="#344054" Margin="0,0,0,7"/>
-                        <TextBox x:Name="AccountTextBox" Style="{StaticResource InputBox}" Margin="0,0,0,14"/>
+                        <TextBox x:Name="AccountTextBox" Style="{StaticResource InputBox}" Margin="0,0,0,4"/>
+                        <TextBlock Text="账号为 3～32 位，以英文字母或数字开头，可包含 _ . -" FontSize="12"
+                                   Foreground="{StaticResource MutedBrush}" Margin="0,0,0,12" TextWrapping="Wrap"/>
 
                         <TextBlock Text="密码" Foreground="#344054" Margin="0,0,0,7"/>
                         <PasswordBox x:Name="PasswordBox" Style="{StaticResource PasswordInput}" Margin="0,0,0,14"/>
 
                         <StackPanel x:Name="RegisterFields" Visibility="Collapsed">
+                            <TextBlock Text="注册密码为 12～128 位，不能全部为空格。" FontSize="12"
+                                       Foreground="{StaticResource MutedBrush}" Margin="0,0,0,10" TextWrapping="Wrap"/>
                             <TextBlock Text="确认密码" Foreground="#344054" Margin="0,0,0,7"/>
                             <PasswordBox x:Name="ConfirmPasswordBox" Style="{StaticResource PasswordInput}" Margin="0,0,0,14"/>
 
@@ -243,7 +247,8 @@
                         </StackPanel>
 
                         <Button x:Name="EnterButton" Content="登录并进入系统" Style="{StaticResource PrimaryButton}" Click="OnEnterClicked"/>
-                        <TextBlock Text="账号信息用于区分当前工作台操作人。"
+                        <Button Content="暂不登录，返回工作台" Style="{StaticResource SecondaryButton}" Click="OnContinueWithoutLoginClicked" Margin="0,12,0,0"/>
+                        <TextBlock Text="本地账号与服务器账号分别注册、分别登录，请确认上方登录地址。"
                                    Foreground="{StaticResource MutedBrush}" Margin="0,18,0,0" TextWrapping="Wrap"/>
                     </StackPanel>
                 </Border>
@@ -260,7 +265,7 @@
                 <DockPanel Margin="22,26,22,22">
                     <StackPanel DockPanel.Dock="Top">
                         <TextBlock Text="AI 审查助手" Foreground="White" FontSize="20" FontWeight="Bold"/>
-                        <TextBlock x:Name="UserTextBlock" Text="当前用户：演示用户" Foreground="#D0D5DD" Margin="0,8,0,28"/>
+                        <TextBlock x:Name="UserTextBlock" Text="当前模式：免登录浏览" Foreground="#D0D5DD" Margin="0,8,0,28"/>
 
                         <Button Content="完整性检查" Style="{StaticResource ActiveNavButton}" Margin="0,0,0,8"/>
                         <Button Content="可研报告专项检查" Style="{StaticResource NavButton}" Margin="0,0,0,8"/>
@@ -272,7 +277,7 @@
                     <StackPanel DockPanel.Dock="Bottom">
                         <TextBlock Text="可研报告智能审查助手" Foreground="#D0D5DD" Margin="0,0,0,4"/>
                         <TextBlock Text="规则、记录、设置集中管理" Foreground="#98A2B3" Margin="0,0,0,18"/>
-                        <Button Content="退出登录" Style="{StaticResource SecondaryButton}" Click="OnLogoutClicked"/>
+                        <Button x:Name="AccountActionButton" Content="登录账号" Style="{StaticResource SecondaryButton}" Click="OnLogoutClicked"/>
                     </StackPanel>
                 </DockPanel>
             </Border>

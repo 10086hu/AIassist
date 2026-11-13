@@ -7,6 +7,12 @@ using System.Text.Json;
 
 var cases = new (string Name, Func<Task> Run)[]
 {
+    ("invalid_credentials_fail_before_network", Tests.InvalidCredentials),
+    ("credential_boundaries_match_backend", Tests.CredentialBoundaries),
+    ("legacy_short_login_password_is_preserved", Tests.LegacyLogin),
+    ("validation_array_explains_fields_without_secrets", Tests.ValidationArray),
+    ("validation_array_missing_fields_is_safe", Tests.ValidationArrayFallback),
+    ("backend_string_error_is_preserved", Tests.StringError),
     ("real_session_tokens_are_separate", Tests.SeparateSessions),
     ("receive_keeps_utf8_and_number_tokens", Tests.Success),
     ("hash_mismatch_never_imports_or_acknowledges", Tests.BadHash),
@@ -36,10 +42,108 @@ return failures == 0 ? 0 : 1;
 static class Tests
 {
     public static void Check(bool condition, string message = "assertion failed") { if (!condition) throw new Exception(message); }
-    public static async Task Throws<T>(Func<Task> run) where T : Exception
-    { try { await run(); } catch (T) { return; } throw new Exception("Expected " + typeof(T).Name); }
+    public static async Task<T> Throws<T>(Func<Task> run) where T : Exception
+    { try { await run(); } catch (T error) { return error; } throw new Exception("Expected " + typeof(T).Name); }
     public static HttpResponseMessage Json(object body, HttpStatusCode status = HttpStatusCode.OK)
         => new(status) { Content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json") };
+
+    public static async Task InvalidCredentials()
+    {
+        var requests = 0;
+        using var session = new BackendSession(new Uri("http://server.test/api"), new Handler((_, _) =>
+        {
+            requests++;
+            return Task.FromResult(Json(new { }));
+        }));
+        foreach (var username in new[] { "", "ab", new string('a', 33), "_account", "bad name", "测试账号", "abc!" })
+        {
+            Check(BackendSession.ValidateCredentials(username, "long-password-123", true)?.Contains("用户名") == true);
+            await Throws<ArgumentException>(() => session.RegisterAsync(username, "long-password-123"));
+            await Throws<ArgumentException>(() => session.LoginAsync(username, "123"));
+        }
+        foreach (var password in new[] { "", "123", new string('p', 129), new string(' ', 12) })
+        {
+            Check(BackendSession.ValidateCredentials("account", password, true)?.Contains("密码") == true);
+            await Throws<ArgumentException>(() => session.RegisterAsync("account", password));
+        }
+        await Throws<ArgumentException>(() => session.LoginAsync("account", ""));
+        await Throws<ArgumentException>(() => session.LoginAsync("account", new string('p', 129)));
+        Check(requests == 0, "Invalid input reached the backend");
+    }
+    public static Task CredentialBoundaries()
+    {
+        foreach (var username in new[] { "abc", " A.B_c-1 ", new string('a', 32) })
+        {
+            Check(BackendSession.ValidateCredentials(username, new string('p', 12), true) == null);
+            Check(BackendSession.ValidateCredentials(username, new string('p', 128), true) == null);
+            Check(BackendSession.ValidateCredentials(username, "1", false) == null);
+        }
+        var unicodePassword = string.Concat(Enumerable.Repeat("😀", 128));
+        Check(BackendSession.ValidateCredentials("account", unicodePassword, true) == null);
+        Check(BackendSession.ValidateCredentials("account", unicodePassword + "😀", true) != null);
+        Check(BackendSession.ValidateCredentials("account", " ", false) == null, "Legacy whitespace passwords must not be altered");
+        return Task.CompletedTask;
+    }
+    public static async Task LegacyLogin()
+    {
+        var requests = 0;
+        using var session = new BackendSession(new Uri("http://server.test/api"), new Handler(async (request, ct) =>
+        {
+            requests++;
+            Check(request.RequestUri!.AbsolutePath == "/api/auth/login");
+            using var body = JsonDocument.Parse(await request.Content!.ReadAsStringAsync(ct));
+            Check(body.RootElement.GetProperty("username").GetString() == "Old_User");
+            Check(body.RootElement.GetProperty("password").GetString() == " 1 ", "Password was trimmed or rejected");
+            return Json(new { access_token = Fixture.ServerToken, user = new { id = Guid.NewGuid(), username = "old_user", role = "user" } });
+        }));
+        await session.LoginAsync(" Old_User ", " 1 ");
+        Check(requests == 1 && session.IsAuthenticated);
+    }
+    public static async Task ValidationArray()
+    {
+        const string secret = "never-echo-password-7391";
+        using var session = new BackendSession(new Uri("http://server.test/api"), new Handler((_, _) => Task.FromResult(Json(new
+        {
+            detail = new object[]
+            {
+                new { loc = new[] { "body", "username" }, type = "string_pattern_mismatch", msg = "Untrusted " + secret, input = secret },
+                new { loc = new[] { "body", "password" }, type = "too_short", msg = "Untrusted " + secret, input = secret, ctx = new { min_length = secret } },
+                new { loc = new[] { "body", "display_name" }, type = "string_too_long", msg = "Untrusted " + secret },
+                new { loc = new[] { "body", secret }, type = secret, msg = secret, input = secret },
+            }
+        }, HttpStatusCode.UnprocessableEntity))));
+        var error = await Throws<BackendRequestException>(() => session.RegisterAsync("valid_user", "valid-password-123"));
+        Check(error.StatusCode == HttpStatusCode.UnprocessableEntity);
+        Check(error.Message.Contains("用户名须以英文字母或数字开头"));
+        Check(error.Message.Contains("注册密码长度应为 12～128"));
+        Check(error.Message.Contains("显示名称最多允许 64"));
+        Check(error.Message.Contains("请求参数不符合要求"));
+        Check(!error.Message.Contains(secret) && !error.Message.Contains("Untrusted"), "Validation error echoed a secret");
+    }
+    public static async Task ValidationArrayFallback()
+    {
+        using var session = new BackendSession(new Uri("http://server.test/api"), new Handler((_, _) => Task.FromResult(Json(new
+        {
+            detail = new object[]
+            {
+                new { loc = new[] { "body", "username" }, type = "missing" },
+                new { loc = new[] { "body", "password" }, type = "string_too_long" },
+                new { type = "too_short", input = "never-print-this-input" },
+                42,
+            }
+        }, HttpStatusCode.UnprocessableEntity))));
+        var error = await Throws<BackendRequestException>(() => session.LoginAsync("account", "123"));
+        Check(error.Message.Contains("请填写用户名") && error.Message.Contains("密码最多允许 128"));
+        Check(error.Message.Contains("请求参数长度不足") && error.Message.Contains("请求参数格式不正确"));
+        Check(!error.Message.Contains("never-print-this-input"));
+    }
+    public static async Task StringError()
+    {
+        using var session = new BackendSession(new Uri("http://server.test/api"), new Handler((_, _) =>
+            Task.FromResult(Json(new { detail = "用户名已存在" }, HttpStatusCode.Conflict))));
+        var error = await Throws<BackendRequestException>(() => session.RegisterAsync("account", "valid-password-123"));
+        Check(error.Message == "用户名已存在" && error.StatusCode == HttpStatusCode.Conflict);
+    }
 
     public static async Task SeparateSessions()
     {

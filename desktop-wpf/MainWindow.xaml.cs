@@ -527,6 +527,8 @@ public partial class MainWindow : Window
     private void OnWindowLoaded(object sender, RoutedEventArgs e)
     {
         InitializeAuthenticationView();
+        LoginPage.Visibility = Visibility.Visible;
+        WorkbenchPage.Visibility = Visibility.Collapsed;
     }
 
     private async Task LoadProjectsAsync()
@@ -606,6 +608,7 @@ public partial class MainWindow : Window
 
     private async void OnCreateProjectClicked(object sender, RoutedEventArgs e)
     {
+        if (!RequireWorkspaceDataAccess()) return;
         var dialog = BuildProjectDialog();
         if (dialog.ShowDialog() != true)
         {
@@ -1369,6 +1372,7 @@ public partial class MainWindow : Window
 
     private async Task ImportPriceBenchmarksAsync()
     {
+        if (!RequireWorkspaceDataAccess()) return;
         var dialog = new OpenFileDialog
         {
             Title = "导入软硬件价格参考库",
@@ -1714,7 +1718,18 @@ public partial class MainWindow : Window
 
     private async void OnLogoutClicked(object sender, RoutedEventArgs e)
     {
+        if (!ActiveBackendSession.IsAuthenticated)
+        {
+            LoginPage.Visibility = Visibility.Visible;
+            WorkbenchPage.Visibility = Visibility.Collapsed;
+            return;
+        }
         await LogoutWorkspaceAsync();
+    }
+
+    private void OnContinueWithoutLoginClicked(object sender, RoutedEventArgs e)
+    {
+        EnterWorkspaceWithoutLogin();
     }
 
     private void OnChooseFileClicked(object sender, RoutedEventArgs e)
@@ -1757,6 +1772,7 @@ public partial class MainWindow : Window
 
     private async void OnStartCheckClicked(object sender, RoutedEventArgs e)
     {
+        if (!RequireWorkspaceDataAccess()) return;
         if (_isChecking)
         {
             return;
