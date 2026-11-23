@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from app.modules.shanghai_review import BaseValidator, ConstructionBasisValidator
+from app.modules.shanghai_review.basis_document import review_basis_document
 
 
 BASIS_RULES: tuple[dict[str, Any], ...] = (
@@ -58,19 +58,16 @@ def run_basis_check_from_document(
     selected_rule_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Run rule rows 7, 9, 12 and 14 for construction basis review."""
-    document = BaseValidator.parse_document(content, filename)
-    if not str(document.get("_full_text") or "").strip():
-        raise ValueError("未能从文档中提取到有效文本，请确认文件不是扫描件或加密文件")
-
-    validation = ConstructionBasisValidator().validate(document)
-    grouped_errors = _group_errors_by_rule(validation.errors)
+    document, checks = review_basis_document(content, filename)
     selected = {str(item).strip() for item in selected_rule_ids or [] if str(item).strip()}
 
     results: list[dict[str, Any]] = []
     for rule in BASIS_RULES:
         if selected and not _rule_selected(rule, selected):
             continue
-        issues = grouped_errors.get(rule["rule_id"], [])
+        issues, metrics = checks[rule['rule_id']]
+        manual_only = bool(issues) and all(issue.get('manual_review') for issue in issues)
+        status = '需人工复核' if manual_only else '发现问题' if issues else '通过'
         severity = _highest_severity([str(issue.get("severity") or "warning") for issue in issues])
         suggestions = _unique_texts(
             [str(issue.get("suggestion") or "").strip() for issue in issues]
@@ -88,10 +85,10 @@ def run_basis_check_from_document(
                 "rule_description": rule["rule_description"],
                 "judgement_condition": rule["judgement_condition"],
                 "passed": not issues,
-                "status": "通过" if not issues else "发现问题",
+                "status": status,
                 "severity": "pass" if not issues else severity,
-                "summary": "未发现问题。" if not issues else f"发现 {len(issues)} 项需复核内容。",
-                "metrics": {"error_count": len(issues), "source_excel_row": rule["excel_row"]},
+                "summary": "已完成可提取证据的一致性核对，未发现问题。" if not issues else f"{status}：{len(issues)} 项内容。",
+                "metrics": {"error_count": len(issues), "source_excel_row": rule["excel_row"], **metrics},
                 "issues": issues,
                 "suggestions": suggestions,
             }
@@ -102,9 +99,9 @@ def run_basis_check_from_document(
         "project_name": project_name,
         "filename": filename,
         "document_format": Path(filename).suffix.lower().lstrip("."),
-        "extracted_characters": len(str(document.get("_full_text") or "")),
-        "sections_found": sorted(key for key in document if not key.startswith("_") and len(key) < 30),
-        "status": "通过" if passed_count == len(results) else "发现问题",
+        "extracted_characters": sum(len(b['quote']) for b in document.blocks),
+        "sections_found": [b['quote'] for _, _, b in document.headings],
+        "status": "通过" if passed_count == len(results) else '发现问题' if any(r['status']=='发现问题' for r in results) else '需人工复核',
         "summary": f"建设依据审查完成：{passed_count}/{len(results)} 项通过。",
         "results": results,
     }

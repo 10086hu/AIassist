@@ -1,0 +1,78 @@
+{
+  "standard_id": "SHANGHAI_MUNICIPAL_CLASS2_2023",
+  "title": "上海市市级数字化项目配置标准（二类费用）",
+  "scope": "上海市市级数字化项目",
+  "source_file": "二.03.上海市市级数字化项目配置标准（二类.docx",
+  "source_sha256": "EF00ABE0F20FF71ADED33741B167D75EA3540A023689AF093986C31D3E924AF7",
+  "source_modified": "2023-06-19",
+  "currency_unit": "万元",
+  "rules": {
+    "consulting": {
+      "name": "咨询（或方案设计）费",
+      "project_types": ["construction"],
+      "base": "direct_construction_cost",
+      "infrastructure_adjustment": 0.8,
+      "infrastructure_application_ratio_max": 0.2,
+      "tiers": [[10, 300, 0, 0.03], [300, 1000, 9, 0.025], [1000, 3000, 26.5, 0.02], [3000, 10000, 66.5, 0.015], [10000, 20000, 171.5, 0.01], [20000, 30000, 271.5, 0.005], [30000, null, 321.5, 0.002]]
+    },
+    "supervision": {
+      "name": "工程监理费",
+      "project_types": ["construction"],
+      "base": "direct_construction_cost",
+      "below_300_rate": 0.03,
+      "control_points": [[300, 9], [500, 11.7], [1000, 13.4], [3000, 23.6], [5000, 40.9], [10000, 75.1], [20000, 161.7], [30000, 280.8], [40000, 430], [50000, 563.3]],
+      "manual_review_above": 50000,
+      "external_standard_above": 60000,
+      "external_standard": "发改办价格〔2007〕670号"
+    },
+    "software_testing": {
+      "name": "软件测试费",
+      "base": "software_development_cost",
+      "minimum": 1,
+      "maximum": 100,
+      "tiers": [[10, 100, 0, 0.03], [100, 500, 3, 0.028], [500, 1000, 14.3, 0.025], [1000, null, 26.7, 0.02]]
+    },
+    "integration": {
+      "name": "系统集成费",
+      "base": "hardware_software_purchase_cost",
+      "maximum_rate": 0.06
+    },
+    "security_assessment": {
+      "name": "安全测评费",
+      "project_types": ["construction"],
+      "base": "direct_construction_cost",
+      "maximum": 150,
+      "tiers": [[10, 100, 2, 0], [100, 1000, 2, 0.02], [1000, 3000, 20, 0.018], [3000, null, 56, 0.015]]
+    },
+    "grade_assessment_level2": {
+      "name": "等级保护二级测评费",
+      "base": "direct_construction_cost",
+      "maximum": 150,
+      "tiers": [[10, 100, 3, 0], [100, 1000, 3, 0.025], [1000, 3000, 25.5, 0.018], [3000, null, 61.5, 0.015]]
+    },
+    "grade_assessment_level3": {
+      "name": "等级保护三级测评费",
+      "base": "direct_construction_cost",
+      "maximum": 150,
+      "tiers": [[10, 100, 4, 0], [100, 1000, 4, 0.03], [1000, 3000, 31, 0.02], [3000, null, 71, 0.015]]
+    },
+    "crypto_assessment": {
+      "name": "密码应用测评费",
+      "project_types": ["construction"],
+      "base": "direct_construction_cost",
+      "maximum": 150,
+      "tiers": [[10, 100, 2, 0], [100, 1000, 2, 0.02], [1000, 3000, 20, 0.018], [3000, null, 56, 0.015]]
+    },
+    "crypto_security_evaluation": {
+      "name": "密码应用安全性评估费",
+      "project_types": ["operation"],
+      "base": "direct_construction_cost",
+      "maximum": 150,
+      "tiers": [[10, 100, 2, 0], [100, 1000, 2, 0.02], [1000, 3000, 20, 0.018], [3000, null, 56, 0.015]]
+    }
+  },
+  "combined_limit": {
+    "maximum_rate_of_total_investment": 0.12,
+    "fee_keys": ["consulting", "supervision", "software_testing", "security_or_grade", "crypto_assessment"]
+  }
+}

@@ -4,8 +4,14 @@ from datetime import datetime
 from typing import List, Optional
 from uuid import uuid4
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, LargeBinary, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, LargeBinary, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.dialects.mysql import LONGBLOB, LONGTEXT
+
+
+# Preserve SQLite types while supporting full reports and memory snapshots on MySQL.
+REPORT_TEXT = Text().with_variant(LONGTEXT(), "mysql")
+SOURCE_BINARY = LargeBinary().with_variant(LONGBLOB(), "mysql")
 
 
 def new_uuid() -> str:
@@ -14,6 +20,43 @@ def new_uuid() -> str:
 
 class Base(DeclarativeBase):
     pass
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    username: Mapped[str] = mapped_column(String(32), unique=True, nullable=False)
+    display_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    role: Mapped[str] = mapped_column(String(16), nullable=False, default="user", server_default="user")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    last_login_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+    sessions: Mapped[List["AuthSession"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan",
+    )
+
+
+class AuthSession(Base):
+    __tablename__ = "auth_sessions"
+
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
+
+    user: Mapped[User] = relationship(back_populates="sessions")
+
+
+class AuthRateLimit(Base):
+    __tablename__ = "auth_rate_limits"
+
+    # Hash of action, principal and time bucket; no raw IP or username is stored.
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
 
 
 class Project(Base):
@@ -46,6 +89,9 @@ class Project(Base):
     check_runs: Mapped[List["CheckRun"]] = relationship(
         back_populates="project",
         cascade="all, delete-orphan",
+    )
+    memory_profile: Mapped[Optional["ProjectMemoryProfile"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan", uselist=False,
     )
 
 
@@ -161,6 +207,9 @@ class CheckRun(Base):
         back_populates="check_run",
         cascade="all, delete-orphan",
     )
+    memory_link: Mapped[Optional["ReviewRunLink"]] = relationship(
+        back_populates="check_run", cascade="all, delete-orphan", uselist=False,
+    )
 
 
 class CheckResult(Base):
@@ -178,7 +227,7 @@ class CheckResult(Base):
     result_label: Mapped[str] = mapped_column(String(64), nullable=False)
     reason: Mapped[str] = mapped_column(Text, nullable=False)
     suggestion: Mapped[Optional[str]] = mapped_column(Text)
-    reference_data: Mapped[str] = mapped_column(Text, default="{}")
+    reference_data: Mapped[str] = mapped_column(REPORT_TEXT, default="{}")
     model_name: Mapped[str] = mapped_column(String(100), default="local-rule-judge")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
@@ -188,6 +237,87 @@ class CheckResult(Base):
         back_populates="check_result",
         cascade="all, delete-orphan",
     )
+    memory_revision: Mapped[Optional["ReviewMemoryRevision"]] = relationship(
+        back_populates="check_result", cascade="all, delete-orphan", uselist=False,
+    )
+    memory_feedback: Mapped[List["IssueFeedbackEvent"]] = relationship(
+        back_populates="check_result", cascade="all, delete-orphan",
+    )
+    memory_jobs: Mapped[List["MemoryReviewJob"]] = relationship(
+        back_populates="check_result", cascade="all, delete-orphan",
+    )
+
+
+class ReviewRunLink(Base):
+    """Additive version metadata; existing check/run tables require no ALTER."""
+
+    __tablename__ = "review_run_links"
+    check_run_id: Mapped[str] = mapped_column(String(36), ForeignKey("check_runs.id"), primary_key=True)
+    baseline_run_id: Mapped[Optional[str]] = mapped_column(String(36))
+    mode: Mapped[str] = mapped_column(String(16), default="auto")
+    track_key: Mapped[str] = mapped_column(String(64), index=True)
+    check_run: Mapped[CheckRun] = relationship(back_populates="memory_link")
+
+
+class ReviewMemoryRevision(Base):
+    """Immutable per-result issue ledger, including resolved and unverified issues."""
+
+    __tablename__ = "review_memory_revisions"
+    result_id: Mapped[str] = mapped_column(String(36), ForeignKey("check_results.id"), primary_key=True)
+    project_id: Mapped[str] = mapped_column(String(36), index=True)
+    module: Mapped[str] = mapped_column(String(32), index=True)
+    track_key: Mapped[str] = mapped_column(String(64), index=True)
+    baseline_result_id: Mapped[Optional[str]] = mapped_column(String(36))
+    source_hash: Mapped[str] = mapped_column(String(64))
+    snapshot_json: Mapped[str] = mapped_column(REPORT_TEXT, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    check_result: Mapped[CheckResult] = relationship(back_populates="memory_revision")
+
+
+class ProjectMemoryProfile(Base):
+    """Human supplied background, scoped to exactly one project."""
+
+    __tablename__ = "project_memory_profiles"
+    project_id: Mapped[str] = mapped_column(String(36), ForeignKey("projects.id"), primary_key=True)
+    context_json: Mapped[str] = mapped_column(REPORT_TEXT, default="{}")
+    actor: Mapped[str] = mapped_column(String(256), default="")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    project: Mapped[Project] = relationship(back_populates="memory_profile")
+
+
+class IssueFeedbackEvent(Base):
+    """Append-only user annotations. They never change a rule finding or verdict."""
+
+    __tablename__ = "issue_feedback_events"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    project_id: Mapped[str] = mapped_column(String(36), index=True)
+    result_id: Mapped[str] = mapped_column(String(36), ForeignKey("check_results.id"), index=True)
+    issue_id: Mapped[str] = mapped_column(String(36), index=True)
+    action: Mapped[str] = mapped_column(String(32))
+    reason: Mapped[str] = mapped_column(REPORT_TEXT)
+    evidence: Mapped[str] = mapped_column(REPORT_TEXT, default="")
+    actor: Mapped[str] = mapped_column(String(256), default="")
+    source: Mapped[str] = mapped_column(String(16), default="local")
+    revokes_event_id: Mapped[Optional[str]] = mapped_column(String(36))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    check_result: Mapped[CheckResult] = relationship(back_populates="memory_feedback")
+
+
+class MemoryReviewJob(Base):
+    """Durable bounded work queue; each explicit continue processes one batch."""
+
+    __tablename__ = "memory_review_jobs"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    project_id: Mapped[str] = mapped_column(String(36), index=True)
+    result_id: Mapped[str] = mapped_column(String(36), ForeignKey("check_results.id"), index=True)
+    status: Mapped[str] = mapped_column(String(32), default="paused")
+    use_llm: Mapped[bool] = mapped_column(Boolean, default=False)
+    items_json: Mapped[str] = mapped_column(REPORT_TEXT, default="[]")
+    lease_token: Mapped[Optional[str]] = mapped_column(String(36))
+    lease_until: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    check_result: Mapped[CheckResult] = relationship(back_populates="memory_jobs")
 
 
 class SourceArtifact(Base):
@@ -203,7 +333,7 @@ class SourceArtifact(Base):
     stage: Mapped[Optional[str]] = mapped_column(String(64))
     filename: Mapped[str] = mapped_column(String(300), nullable=False)
     media_type: Mapped[str] = mapped_column(String(120), default="application/octet-stream")
-    content: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    content: Mapped[bytes] = mapped_column(SOURCE_BINARY, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     check_result: Mapped["CheckResult"] = relationship(back_populates="source_artifacts")
@@ -218,4 +348,53 @@ class AuditLog(Base):
     operator: Mapped[Optional[str]] = mapped_column(String(100))
     module: Mapped[Optional[str]] = mapped_column(String(64))
     detail: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class HistoryUpload(Base):
+    """Immutable receipt for a user's uploaded history package."""
+
+    __tablename__ = "history_uploads"
+    __table_args__ = (UniqueConstraint("user_id", "client_record_id", name="uq_history_upload_sender_record"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), index=True)
+    client_record_id: Mapped[str] = mapped_column(String(36))
+    package_sha256: Mapped[str] = mapped_column(String(64))
+    package_json: Mapped[str] = mapped_column(REPORT_TEXT)
+    # Snapshots remain auditable even if an administrator removes a business project.
+    project_id: Mapped[str] = mapped_column(String(36), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class HistoryDelivery(Base):
+    """Persistent per-recipient inbox; independent of online client connections."""
+
+    __tablename__ = "history_deliveries"
+    __table_args__ = (UniqueConstraint("recipient_user_id", "package_sha256", name="uq_history_delivery_recipient_package"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    recipient_user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), index=True)
+    sender_user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"))
+    project_id: Mapped[str] = mapped_column(String(36), index=True)
+    check_run_id: Mapped[Optional[str]] = mapped_column(String(36))
+    package_sha256: Mapped[str] = mapped_column(String(64))
+    package_json: Mapped[str] = mapped_column(REPORT_TEXT)
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    received_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+
+class HistoryImport(Base):
+    """Local durable receipt: retrying an imported delivery does not duplicate it."""
+
+    __tablename__ = "history_imports"
+    __table_args__ = (UniqueConstraint("user_id", "delivery_id", name="uq_history_import_user_delivery"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"))
+    delivery_id: Mapped[str] = mapped_column(String(36))
+    package_sha256: Mapped[str] = mapped_column(String(64))
+    project_id: Mapped[str] = mapped_column(String(36))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

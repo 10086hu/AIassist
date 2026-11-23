@@ -898,8 +898,11 @@ def match_sensitive_terms(
                     # 处理去空白匹配，比如 "Windows  Server"
                     cname = compact_text(name)
                     if cname and cname in compact_original and not any(x[0] == name for x in matches):
-                        # 位置无法精确映射时用整段上下文
-                        matches.append((name, 0, min(len(normalized_original), len(name))))
+                        offsets = [i for i, ch in enumerate(normalized_original) if not ch.isspace()]
+                        for match in re.finditer(re.escape(cname), compact_original):
+                            left, right = offsets[match.start()], offsets[match.end()-1] + 1
+                            if not any(start == left and end == right for _, start, end in matches):
+                                matches.append((normalized_original[left:right], left, right))
 
             for hit, start, end in matches:
                 if is_false_positive(hit, normalized_original):
@@ -1090,6 +1093,8 @@ def merge_duplicate_findings(findings: List[SensitiveFinding]) -> List[Sensitive
     for f in findings:
         key = (
             f.paragraph_index,
+            f.start,
+            f.end,
             f.normalized_hit.lower(),
             f.section,
             compact_text(f.context)[:80],

@@ -285,14 +285,15 @@ def _with_rule_source_meta(
 
 def _normalize_function_correspondence_result(raw: Dict[str, Any], report_file_path: str, use_llm: bool = False) -> Dict[str, Any]:
     raw_findings = list(raw.get("findings") or [])
-    findings = _merge_function_findings(raw_findings)
-    displayed_findings = findings[:50]
+    findings = _merge_function_findings(raw_findings, limit=None)
     refined_findings, llm_meta = refine_findings(
         module_code="function_correspondence",
-        findings=displayed_findings,
+        findings=findings,
         rules=raw.get("rules_used") or [],
         use_llm=use_llm,
     )
+    memory_findings = refined_findings
+    refined_findings = refined_findings[:50]
 
     summary = dict(raw.get("summary") or {})
     metrics = document_metrics(report_file_path)
@@ -313,6 +314,7 @@ def _normalize_function_correspondence_result(raw: Dict[str, Any], report_file_p
         "status": raw.get("status", "完成"),
         "summary": summary,
         "findings": refined_findings,
+        "memory_findings": memory_findings,
         "rules_used": raw.get("rules_used", []),
         "elapsed_seconds": raw.get("elapsed_seconds", 0),
     }
@@ -320,14 +322,18 @@ def _normalize_function_correspondence_result(raw: Dict[str, Any], report_file_p
 
 def _normalize_sensitive_word_result(raw: Dict[str, Any], report_file_path: str, use_llm: bool = False) -> Dict[str, Any]:
     raw_findings = list(raw.get("findings", []))
-    findings = _merge_sensitive_findings(raw_findings)
-    displayed_findings = findings[:100]
+    if Path(report_file_path).suffix.lower() == '.docx':
+        from app.modules.sensitive_word.source_locations import attach_sensitive_locations
+        attach_sensitive_locations(raw_findings, Path(report_file_path).read_bytes(), Path(report_file_path).name)
+    findings = _merge_sensitive_findings(raw_findings, limit=None)
     refined_findings, llm_meta = refine_findings(
         module_code="sensitive_word",
-        findings=displayed_findings,
+        findings=findings,
         rules=raw.get("rules") or [],
         use_llm=use_llm,
     )
+    memory_findings = refined_findings
+    refined_findings = refined_findings[:100]
 
     risk_summary = dict(raw.get("summary") or {})
     metrics = document_metrics(report_file_path)
@@ -348,6 +354,8 @@ def _normalize_sensitive_word_result(raw: Dict[str, Any], report_file_path: str,
         "module_name": raw.get("module_name", "敏感词检查"),
         "status": "通过" if not refined_findings else "发现问题",
         "findings": refined_findings,
+        "memory_findings": memory_findings,
+        "rules_used": raw.get("rules") or [],
         "risk_summary": risk_summary,
         "suggestions": suggestions,
         "elapsed_seconds": raw.get("elapsed_seconds", 0),
@@ -539,7 +547,7 @@ def _rule_matches_module(rule: Dict[str, Any], module_code: str) -> bool:
     return False
 
 
-def _merge_function_findings(findings: list[dict[str, Any]], limit: int = 50) -> list[dict[str, Any]]:
+def _merge_function_findings(findings: list[dict[str, Any]], limit: int | None = 50) -> list[dict[str, Any]]:
     groups: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
     for item in findings:
         key = (
@@ -571,10 +579,10 @@ def _merge_function_findings(findings: list[dict[str, Any]], limit: int = 50) ->
             -int(item.get("merged_count") or 1),
         )
     )
-    return merged_findings[:limit]
+    return merged_findings[:limit] if limit is not None else merged_findings
 
 
-def _merge_sensitive_findings(findings: list[dict[str, Any]], limit: int = 100) -> list[dict[str, Any]]:
+def _merge_sensitive_findings(findings: list[dict[str, Any]], limit: int | None = 100) -> list[dict[str, Any]]:
     groups: dict[tuple[str, str, str], dict[str, Any]] = {}
     for item in findings:
         key = (
@@ -591,6 +599,11 @@ def _merge_sensitive_findings(findings: list[dict[str, Any]], limit: int = 100) 
             continue
 
         existing = groups[key]
+        if item.get('source_locations'):
+            from app.modules.sensitive_word.source_locations import location_key
+            sources = list(existing.get('source_locations') or []) + item['source_locations']
+            existing['source_locations'] = list({location_key(s): s for s in sources}.values())
+            existing['source_location'] = dict(existing.get('source_location') or {}, entries=existing['source_locations'])
         existing["merged_count"] = int(existing.get("merged_count") or 1) + 1
         examples = list(existing.get("context_examples") or [])
         if context and context not in examples and len(examples) < 3:
@@ -604,7 +617,7 @@ def _merge_sensitive_findings(findings: list[dict[str, Any]], limit: int = 100) 
             -int(item.get("merged_count") or 1),
         )
     )
-    return merged_findings[:limit]
+    return merged_findings[:limit] if limit is not None else merged_findings
 
 
 def _clean_key(value: Any) -> str:

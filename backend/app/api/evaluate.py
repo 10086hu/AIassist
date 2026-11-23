@@ -24,6 +24,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.db.models import CheckResult, CheckRun, Project, SourceArtifact
 from app.db.session import SessionLocal, get_db
+from app.services.issue_memory import fingerprint, make_scope, record_memory, review_history, unique_findings
 from app.modules.content_consistency.service import run_content_consistency_check_from_document
 from app.modules.data_rules.service import (
     run_data_reporting_check_from_document,
@@ -202,6 +203,33 @@ def evaluate_result_detail(result_id: str, db: Session = Depends(get_db)) -> dic
     return _check_result_to_detail(row)
 
 
+@router.get("/results/{result_id}/export")
+def evaluate_result_export(result_id: str, db: Session = Depends(get_db)) -> Response:
+    """导出一条审查记录的完整报告，不受详情页展示数量限制。"""
+    row = db.get(CheckResult, result_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="审查记录不存在")
+
+    detail = _check_result_to_export_detail(row)
+    from app.services.memory_workspace import get_result_memory
+    detail["memory_workspace"] = get_result_memory(db, row)
+    report = _render_result_export_html(detail)
+    project_name = str(detail.get("project_name") or detail.get("report_name") or "审查报告")
+    timestamp = row.created_at.strftime("%Y%m%d_%H%M%S") if row.created_at else ""
+    safe_name = re.sub(r"[\\/:*?\"<>|]+", "_", project_name).strip(" ._") or "审查报告"
+    filename = f"{safe_name}_{timestamp}.html" if timestamp else f"{safe_name}.html"
+    return Response(
+        content=report,
+        media_type="text/html",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="review-report.html"; filename*=UTF-8\'\'{quote(filename)}'
+            ),
+            "Cache-Control": "no-store",
+        },
+    )
+
+
 @router.get("/results/{result_id}/sources/{source_id}")
 def evaluate_result_source(result_id: str, source_id: str, db: Session = Depends(get_db)) -> Response:
     """读取审查记录保存的原始报告快照，供历史报告定位后重新打开。"""
@@ -215,12 +243,17 @@ def evaluate_result_source(result_id: str, source_id: str, db: Session = Depends
     )
     if artifact is None:
         raise HTTPException(status_code=404, detail="原始报告附件不存在")
-    media_type = artifact.media_type or "application/octet-stream"
+    # Received history contains caller-supplied MIME metadata. Original files
+    # are downloads; the separate /preview route renders escaped document text.
+    media_type = mimetypes.guess_type(artifact.filename)[0] or "application/octet-stream"
     filename = artifact.filename.replace('"', "")
     return Response(
         content=artifact.content,
         media_type=media_type,
-        headers={"Content-Disposition": f"inline; filename*=UTF-8''{quote(filename)}"},
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}",
+                 "Cache-Control": "no-store",
+                 "X-Content-Type-Options": "nosniff",
+                 "Content-Security-Policy": "sandbox; default-src 'none'"},
     )
 
 
@@ -436,6 +469,8 @@ def _evaluate_duplicate_compare_sync(
             normalized["source_documents"] = source_documents
             result_row = db.get(CheckResult, result_id)
             if result_row is not None:
+                normalized.update((_load_reference_payload(result_row).get("result") or {}))
+                normalized["source_documents"] = source_documents
                 result_row.reference_data = _json_dumps(
                     {
                         "project_name": project.name,
@@ -978,19 +1013,22 @@ def _run_evaluate_task(
                     _set_task(task_id, progress=progress_last, stage="duplicate", message=message)
 
                 task_context["duplicate_progress"] = duplicate_progress
-                result = _run_module_check(
-                    db=db,
-                    module=module,
-                    temp_path=temp_path,
-                    source_filename=original_filename,
-                    project=project,
-                    project_name=project_name,
-                    department=department,
-                    rule_source=rule_source,
-                    use_llm=use_llm,
-                    selected_rule_ids=selected_rules.get(module) or [],
-                    task_context=task_context,
-                )
+                with review_history(db, project.id, module, original_filename, check_run.id,
+                                    selected_rules.get(module) or []):
+                    result = _run_module_check(
+                        db=db,
+                        module=module,
+                        temp_path=temp_path,
+                        source_filename=original_filename,
+                        project=project,
+                        project_name=project_name,
+                        department=department,
+                        rule_source=rule_source,
+                        use_llm=use_llm,
+                        selected_rule_ids=selected_rules.get(module) or [],
+                        task_context=task_context,
+                    )
+                    result["memory_scope"] = make_scope(module, result)
                 _attach_finding_locations(result, Path(temp_path).read_bytes(), original_filename)
                 summary = _result_summary(result)
                 severity = _highest_result_severity(result)
@@ -1643,6 +1681,7 @@ def _store_check_result(
     check_run_id: str | None = None,
     report_name: str | None = None,
 ) -> str:
+    result.setdefault("memory_scope", make_scope(module, result))
     serializable_result = jsonable_encoder(result)
     result_json = {
         "project_name": project.name,
@@ -1710,6 +1749,7 @@ def _store_duplicate_source_artifacts(
                 "preview_url": f"/api/evaluate/results/{result_id}/sources/{artifact.id}/preview",
             }
         )
+    _record_result_memory(db, result_id, current[0], current[1])
     return result
 
 
@@ -1730,7 +1770,27 @@ def _store_current_source_artifact(
     )
     db.add(artifact)
     db.flush()
+    _record_result_memory(db, result_id, content, filename)
     return artifact
+
+
+def _record_result_memory(db: Session, result_id: str, content: bytes, filename: str) -> None:
+    """Memory failure is visible but must never invalidate an existing check."""
+    row = db.get(CheckResult, result_id)
+    if row is None:
+        return
+    try:
+        with db.begin_nested():
+            record_memory(db, row, content, filename)
+    except Exception:
+        traceback.print_exc()
+        payload = _load_reference_payload(row)
+        result = payload.setdefault("result", {})
+        result["issue_memory"] = {
+            "status": "unavailable",
+            "message": "本次问题记忆未完成，原有检测结果已保留；历史问题不会被自动标记为已解决。",
+        }
+        row.reference_data = _json_dumps(payload)
 
 
 def _store_result_source_artifact(
@@ -1744,6 +1804,10 @@ def _store_result_source_artifact(
 
 
 def _precise_rule_module(rule_id: str) -> str | None:
+    if rule_id == 'SENSITIVE_WORD_SOURCE':
+        return 'sensitive_word'
+    if rule_id in {"BASIS_007", "BASIS_009", "BASIS_012", "BASIS_014"}:
+        return "basis"
     if rule_id in {"R15_SECURITY_PAAS_CRYPTO_QUANTITY", "R16_SERVER_OS_QUANTITY", "R16_DB_SERVER_DATABASE_QUANTITY"}:
         return "resource"
     if rule_id in {"DATA_REASON_001", "DATA_REASON_002", "DATA_REASON_024"}:
@@ -1886,6 +1950,7 @@ def _render_rule_evidence_preview(content: bytes, filename: str) -> str:
  tr.rule-evidence-target>td {background:#fff0a6}
  .rule-evidence-scope {background:#e8f1ff!important;outline:2px dashed #4a77ba}
  .rule-evidence-candidate {outline-style:dashed!important}
+ mark.sensitive-word-target {background:#ffe16b;color:inherit;outline:2px solid #e5a014;scroll-margin-top:80px}
  h4,h5,h6 {font-size:16px;line-height:1.5;margin:16px 0 10px}
 </style>
 <script>
@@ -1894,8 +1959,51 @@ def _render_rule_evidence_preview(content: bytes, filename: str) -> str:
  const all = () => Array.from(document.querySelectorAll('[data-e-kind]'));
  const num = (el,key) => Number(el.getAttribute('data-e-'+key) || 0);
  const attr = (el,key) => el.getAttribute('data-e-'+key) || '';
- const clear = () => document.querySelectorAll('.rule-evidence-target,.rule-evidence-scope,.rule-evidence-candidate')
-   .forEach(el => el.classList.remove('rule-evidence-target','rule-evidence-scope','rule-evidence-candidate'));
+ const clear = () => {
+   document.querySelectorAll('mark.sensitive-word-target').forEach(mark => {
+     const parent = mark.parentNode;
+     mark.replaceWith(...mark.childNodes);
+     parent.normalize();
+   });
+   document.querySelectorAll('.rule-evidence-target,.rule-evidence-scope,.rule-evidence-candidate')
+     .forEach(el => el.classList.remove('rule-evidence-target','rule-evidence-scope','rule-evidence-candidate'));
+ };
+ const wordHighlight = (target,loc) => {
+   const raw = String(loc.quote || '');
+   const start = Number(loc.char_start), end = Number(loc.char_end);
+   const chars = Array.from(raw);
+   if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end <= start || end > chars.length
+       || norm(chars.slice(start,end).join('')) !== norm(loc.hit_text)) return null;
+   const from = norm(chars.slice(0,start).join('')).length, to = norm(chars.slice(0,end).join('')).length;
+   const walker = document.createTreeWalker(target, NodeFilter.SHOW_TEXT);
+   const pieces = []; let compactText = '', node;
+   while ((node = walker.nextNode())) {
+     const offsets = [];
+     for (let i=0; i<node.data.length;) {
+       const ch = String.fromCodePoint(node.data.codePointAt(i));
+       const normalized = norm(ch);
+       for (let j=0; j<normalized.length; j++) offsets.push([i,i+ch.length]);
+       compactText += normalized;
+       i += ch.length;
+     }
+     pieces.push({node, offsets});
+   }
+   if (compactText !== norm(raw) || compactText.slice(from,to) !== norm(loc.hit_text)) return null;
+   let cursor = 0; const segments = [];
+   for (const piece of pieces) {
+     const left = Math.max(0,from-cursor), right = Math.min(piece.offsets.length,to-cursor);
+     if (left < right) segments.push({node:piece.node,start:piece.offsets[left][0],end:piece.offsets[right-1][1]});
+     cursor += piece.offsets.length;
+   }
+   const marks = [];
+   for (const segment of segments.reverse()) {
+     const range = document.createRange();
+     range.setStart(segment.node,segment.start); range.setEnd(segment.node,segment.end);
+     const mark = document.createElement('mark'); mark.className = 'sensitive-word-target';
+     range.surroundContents(mark); marks.unshift(mark);
+   }
+   return marks;
+ };
  window.clearRuleEvidence = clear;
  window.locateRuleEvidence = payload => {
    clear();
@@ -1934,6 +2042,12 @@ def _render_rule_evidence_preview(content: bytes, filename: str) -> str:
      return {status:'section_mismatch',matched_count:0};
    if (!quote || (actual !== quote && !(quote.length >= 4 && actual.includes(quote))))
      return {status:'text_mismatch',matched_count:0};
+   if (loc.verified_sensitive) {
+     const marks = wordHighlight(target,loc);
+     if (!marks || !marks.length) return {status:'word_mismatch',matched_count:0};
+     marks[0].scrollIntoView({behavior:'instant',block:'center'});
+     return {status:'word_matched',matched_count:marks.length};
+   }
    const status = scoped ? 'scope' : loc.match_status === 'ambiguous' ? 'candidate' : addressed ? 'matched' : 'text_match';
    const targets = [target];
    if (table && row && !column) {
@@ -2200,6 +2314,10 @@ def _normalize_duplicate_result(result: DuplicateInternalResponse) -> dict[str, 
                 "rule_basis": "独立建设单元、重叠交付范围及双侧原文证据的大模型复核",
                 "source_section": prefix,
                 "comparison_type": comparison_type,
+                "memory_kind": "重复建设对应单元",
+                "memory_entity": json.dumps(sorted([str(pair.get("left_unit") or pair.get("item_name") or ""),
+                                                     str(pair.get("right_unit") or pair.get("related_item_name") or "")])
+                                            + ([right_report] if is_cross else []), ensure_ascii=False),
                 "item_report_name": left_report,
                 "related_report_name": right_report,
                 "item_stage": pair.get("item_stage") or "",
@@ -2318,13 +2436,15 @@ def _normalize_document_rule_result(result: dict[str, Any], module: str, use_llm
                         if item and evidence
                         else evidence or issue.get("section") or ""
                     ),
-                    "revision_advice": _first_text(suggestions) or "请根据规则要求补充说明、核对数据或调整相关章节表述。",
+                    "revision_advice": (issue.get('suggestion') if module == 'basis' else None) or _first_text(suggestions) or "请根据规则要求补充说明、核对数据或调整相关章节表述。",
                     "rule_basis": rule_name,
                     "rule_id": rule_id,
                     "rule_name": rule_name,
                     "source_section": issue.get("section") or module,
                     "evidence_examples": [item for item in [issue.get("evidence"), rule_result.get("summary")] if item],
                     "merged_count": 1,
+                    **({key: issue[key] for key in ('source_locations', 'source_location', 'manual_review') if key in issue}
+                       if module == 'basis' else {}),
                     **(rule_result['evidence_locations'][issue_index]
                        if module == 'data_reasonableness' and rule_id in {'18', '21', '24', 'DATA_REASON_001', 'DATA_REASON_002', 'DATA_REASON_024'}
                        and issue_index < len(rule_result.get('evidence_locations', [])) else {}),
@@ -2350,6 +2470,13 @@ def _normalize_document_rule_result(result: dict[str, Any], module: str, use_llm
     }
     if module in {"basis", "data_reasonableness"}:
         rule_results = _build_function_rule_results(normalized, findings, default_source=module)
+        if module == 'basis':
+            by_id = {str(r.get('rule_id')): r for r in raw_results}
+            for rule_result in rule_results:
+                raw_rule = by_id.get(str(rule_result.get('rule_id')), {})
+                rule_result.update(status=raw_rule.get('status', rule_result['status']),
+                                   passed=raw_rule.get('passed', rule_result['passed']),
+                                   metrics=raw_rule.get('metrics', {}))
         normalized["rule_results"] = rule_results
         normalized["rule_results_summary"] = _summary_from_rule_results(rule_results)
         summary["rule_results_count"] = len(rule_results)
@@ -2370,6 +2497,8 @@ def _normalize_security_result(result: dict[str, Any]) -> dict[str, Any]:
                 "revision_advice": item.get("revision_advice") or "请补充4.7安全需求分析中的安全风险分析、安全等级定位、数据分类分级、安全防护措施和密码应用措施。",
                 "rule_basis": item.get("rule_basis") or "安全需求分析合规性审查规则",
                 "rule_id": item.get("rule_id") or "SECURITY_REASON_001",
+                "memory_kind": "安全需求分析整体合规",
+                "memory_entity": "4.7安全需求分析",
                 "rule_name": item.get("rule_name") or "安全需求分析合规性审查规则",
                 "rule_category": item.get("rule_category") or "内容合规性审查规则",
                 "source_section": item.get("source_section") or "4.7安全需求分析",
@@ -2395,6 +2524,10 @@ def _normalize_security_result(result: dict[str, Any]) -> dict[str, Any]:
             "findings": findings,
         }
     )
+    review = (payload.get("raw_result") or {}).get("llm_review") or {}
+    payload["memory_rule_outcomes"] = [{"rule_id": "SECURITY_REASON_001",
+        "passed": review.get("passed") is True and not review.get("skipped")
+                  and not review.get("llm_error_type") and not findings}]
     return payload
 
 
@@ -2419,6 +2552,7 @@ def _normalize_resource_result(result: ResourceCheckResponse, use_llm: bool = Fa
         findings.append(
             {
                 "display_title": item.get("resource_name") or item.get("rule_name") or "资源申请检查项",
+                "item": item.get("resource_name") or item.get("rule_name") or "资源申请检查项",
                 "risk_level": risk_level,
                 "review_opinion": item.get("reason") or item.get("result_label") or "资源申请存在需复核事项。",
                 "evidence_summary": evidence,
@@ -2459,6 +2593,11 @@ def _normalize_resource_result(result: ResourceCheckResponse, use_llm: bool = Fa
         "checked_rule_count": data.get("checked_rule_count", 0),
         "summary": summary,
         "findings": findings,
+        "memory_rule_outcomes": [
+            {"rule_id": item.get("rule_code") or item.get("rule_name"),
+             "passed": _normalize_issue_degree(item.get("severity") or "需人工确认") == "通过"}
+            for item in data.get("findings") or []
+        ],
         "raw_result": data,
     }
 
@@ -2591,10 +2730,34 @@ def _attach_finding_locations(
     filename: str,
 ) -> dict[str, Any]:
     """Add stable, machine-readable source locations without changing finding text."""
-    lines = _extract_location_lines(content, filename)
+    verified_basis = result.get('module_code') == 'basis' and all(
+        (f.get('source_location') or {}).get('verified_basis') for f in result.get('findings', []))
+    verified_sensitive = result.get('module_code') == 'sensitive_word' and all(
+        (f.get('source_location') or {}).get('verified_sensitive') for f in result.get('findings', []))
+    lines = [] if verified_basis or verified_sensitive else _extract_location_lines(content, filename)
 
     def enrich(finding: dict[str, Any]) -> None:
         if not isinstance(finding, dict):
+            return
+        if result.get('module_code') == 'sensitive_word' and (finding.get('source_location') or {}).get('verified_sensitive'):
+            sources = finding.get('source_locations') or []
+            finding['source_highlights'] = [dict(s, highlight=True) for s in sources]
+            finding['location_hint'] = '；'.join(_format_single_source_hint(s, '') for s in sources) or '未找到可核验的敏感词原文位置，请重新检测原报告。'
+            finding['revision_target'] = {'source_location': finding['source_location'],
+                'highlights': finding['source_highlights'], 'location_hint': finding['location_hint'],
+                'advice': finding.get('revision_advice') or ''}
+            return
+        if result.get('module_code') == 'basis' and (finding.get('source_location') or {}).get('verified_basis'):
+            # Evidence addresses were created by the same DocumentIndex used
+            # by the precise preview. Never replace them with short-number
+            # searches, including when no specific evidence could be found.
+            sources = finding.get('source_locations') or []
+            finding['source_highlights'] = [dict(source, highlight=True) for source in sources]
+            finding['location_hint'] = '；'.join(_format_single_source_hint(source, '') for source in sources) or '尚无可核验的具体位置'
+            finding['revision_target'] = {'source_location': finding['source_location'],
+                                          'highlights': finding['source_highlights'],
+                                          'location_hint': finding['location_hint'],
+                                          'advice': finding.get('revision_advice') or ''}
             return
         # The five rules already carry verified document coordinates. Preserve
         # them through the public display layer; do not parse their evidence again.
@@ -2766,6 +2929,7 @@ def _attach_finding_locations(
                 enrich(item)
 
     enrich_findings(result.get("findings"))
+    enrich_findings(result.get("memory_findings"))
     for rule_result in result.get("rule_results") or []:
         if isinstance(rule_result, dict):
             enrich_findings(rule_result.get("findings"))
@@ -3036,6 +3200,191 @@ def _check_result_to_detail(row: CheckResult) -> dict[str, Any]:
         "findings": findings,
         "source_documents": source_documents,
     }
+
+
+def _check_result_to_export_detail(row: CheckResult) -> dict[str, Any]:
+    """Build the untruncated result payload used by report export."""
+    payload = _load_reference_payload(row)
+    result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+    _upgrade_stored_finding_locations(result)
+    return {
+        **_check_result_to_list_item(row),
+        "result": result,
+        "findings": unique_findings(result),
+        "source_documents": result.get("source_documents") or _source_artifacts_to_list(row),
+    }
+
+
+def _render_result_export_html(detail: dict[str, Any]) -> str:
+    """Render a self-contained, printable HTML report for one check result."""
+    result = detail.get("result") if isinstance(detail.get("result"), dict) else {}
+    findings = detail.get("findings") if isinstance(detail.get("findings"), list) else []
+    rule_results = result.get("rule_results") if isinstance(result.get("rule_results"), list) else []
+    status = str(detail.get("status") or result.get("status") or "")
+    risk = str(detail.get("risk_level") or result.get("risk_level") or "")
+    title = str(detail.get("project_name") or detail.get("report_name") or "审查报告")
+    module_name = str(detail.get("module_name") or result.get("module_name") or "")
+    created_at = str(detail.get("created_at") or "")
+    summary = result.get("summary") if isinstance(result.get("summary"), dict) else detail.get("summary")
+    source_documents = detail.get("source_documents") if isinstance(detail.get("source_documents"), list) else []
+
+    def esc(value: Any) -> str:
+        return html.escape(str(value), quote=True)
+
+    def json_block(value: Any) -> str:
+        try:
+            text = json.dumps(value, ensure_ascii=False, indent=2, default=str)
+        except (TypeError, ValueError):
+            text = str(value)
+        return f"<pre class=\"json\">{esc(text)}</pre>"
+
+    def finding_card(finding: Any, index: int, rule_name: str = "") -> str:
+        if not isinstance(finding, dict):
+            return f"<article class=\"finding\"><h3>问题 {index}</h3>{json_block(finding)}</article>"
+        heading = str(finding.get("display_title") or finding.get("title") or finding.get("name") or finding.get("rule_name") or f"问题 {index}")
+        severity = str(finding.get("risk_level") or finding.get("severity") or "需人工确认")
+        opinion = finding.get("review_opinion") or finding.get("opinion") or finding.get("reason") or finding.get("description") or ""
+        evidence = finding.get("evidence_summary") or finding.get("evidence") or finding.get("location_hint") or ""
+        advice = finding.get("revision_advice") or finding.get("suggestion") or ""
+        rule = rule_name or finding.get("rule_name") or finding.get("rule_id") or ""
+        rows = [
+            ("问题跟踪", (finding.get("issue_memory") or {}).get("label", "")),
+            ("本次修订", (finding.get("issue_memory") or {}).get("change_summary", "")),
+            ("审查结论", opinion),
+            ("证据/定位", evidence),
+            ("修改建议", advice),
+            ("规则", rule),
+        ]
+        missing_value = '<span class="muted">未提供</span>'
+        fields = "".join(
+            f"<div class=\"field\"><dt>{esc(label)}</dt><dd>{esc(value) if value else missing_value}</dd></div>"
+            for label, value in rows
+        )
+        return f"<article class=\"finding\"><div class=\"finding-title\"><h3>{esc(heading)}</h3><span class=\"severity\">{esc(severity)}</span></div><dl>{fields}</dl><details><summary>查看该问题完整数据</summary>{json_block(finding)}</details></article>"
+
+    all_findings = unique_findings({"memory_findings": findings, "rule_results": rule_results})
+    rendered_keys: set[str] = set()
+    rule_sections: list[str] = []
+    for rule_index, rule_result in enumerate(rule_results, 1):
+        if not isinstance(rule_result, dict):
+            rule_sections.append(f"<section><h2>规则结果 {rule_index}</h2>{json_block(rule_result)}</section>")
+            continue
+        rule_name = str(rule_result.get("rule_name") or rule_result.get("name") or rule_result.get("rule_id") or f"规则 {rule_index}")
+        rule_findings = rule_result.get("findings") if isinstance(rule_result.get("findings"), list) else []
+        cards = []
+        for item in rule_findings:
+            if isinstance(item, dict):
+                key = fingerprint(item)
+                if key in rendered_keys:
+                    continue
+                rendered_keys.add(key)
+            cards.append(finding_card(item, len(cards) + 1, rule_name))
+        rule_cards = "".join(cards)
+        if not rule_cards:
+            rule_cards = f"<p class=\"muted\">{esc(rule_result.get('result_label') or rule_result.get('status') or '未发现问题')}</p>"
+        rule_sections.append(f"<section><h2>{esc(rule_name)}</h2>{rule_cards}</section>")
+
+    extra_findings = [item for item in all_findings if fingerprint(item) not in rendered_keys]
+    finding_section = "".join(finding_card(item, index) for index, item in enumerate(extra_findings, 1))
+    if not finding_section:
+        finding_section = '<p class="muted">审查意见按下列规则分组展示。</p>' if all_findings else '<p class="muted">本次检测未形成问题项。</p>'
+    count = len(all_findings)
+    summary_html = json_block(summary) if summary else '<p class="muted">未提供汇总信息</p>'
+    raw_html = json_block(result)
+    source_names = [
+        str(item.get("filename") or item.get("name") or "")
+        for item in source_documents
+        if isinstance(item, dict) and (item.get("filename") or item.get("name"))
+    ]
+    sources_html = (
+        "<ul>" + "".join(f"<li>{esc(name)}</li>" for name in source_names) + "</ul>"
+        if source_names else '<p class="muted">未保存源文件信息</p>'
+    )
+    memory = result.get("issue_memory") or {}
+    memory_html = ""
+    if isinstance(memory, dict) and memory:
+        rows = "".join(f"<li>{label}：{esc(memory.get(key, 0))} 项</li>" for key, label in (
+            ("baseline_open_count", "上次未解决"), ("resolved_count", "本次确认解决"),
+            ("persistent_count", "仍然存在"), ("changed_count", "内容有变化"),
+            ("reopened_count", "再次出现"), ("new_count", "本次首次发现"), ("unconfirmed_count", "待确认")))
+        history = "".join(
+            f"<article class=\"finding\"><h3>{esc(item.get('label', '历史问题'))}：{esc((item.get('finding') or {}).get('display_title') or (item.get('finding') or {}).get('title') or '历史问题')}</h3><p>{esc(item.get('reason') or '')}</p></article>"
+            for item in memory.get("historical_items") or [] if isinstance(item, dict))
+        memory_html = f"<section><h2>修订进展与问题跟踪</h2><p>{esc(memory.get('message') or '')}</p><ul>{rows}</ul>{history}</section>"
+        comparisons = []
+        for item in memory.get("revision_reviews") or []:
+            if not isinstance(item, dict):
+                continue
+            comparisons.append(
+                '<article class="finding"><h3>' + esc(item.get("label") or item.get("status") or "整改核验")
+                + '</h3><p>' + esc(item.get("summary") or item.get("reason") or "")
+                + '</p><dl><div class="field"><dt>上次证据</dt><dd>' + esc(item.get("previous_evidence") or "未提供")
+                + '</dd></div><div class="field"><dt>本次证据</dt><dd>' + esc(item.get("current_evidence") or "尚无充分证据")
+                + '</dd></div></dl></article>')
+        if comparisons:
+            memory_html += '<section><h2>历史问题整改对照</h2>' + ''.join(comparisons) + '</section>'
+    workspace = detail.get("memory_workspace") or {}
+    workspace_html = ""
+    if isinstance(workspace, dict):
+        context = workspace.get("context") or {}
+        facts = (context.get("facts") or []) if isinstance(context, dict) else []
+        fact_rows = ''.join('<li>' + esc(item.get("key") or "项目背景") + '：'
+                            + esc(item.get("value") or "") + '（来源：'
+                            + esc(item.get("source") or "人工提供") + '）</li>'
+                            for item in facts if isinstance(item, dict))
+        action_labels = {"false_positive": "疑似误报", "resolved": "已整改，待规则复检验证",
+                         "not_applicable": "本项目不适用", "needs_review": "需要再次核实", "revoke": "撤销此前人工意见"}
+        feedback_events = [item for item in workspace.get("feedback") or [] if isinstance(item, dict)]
+        event_ids = {item.get("id") for item in feedback_events if item.get("id")}
+        for issue in workspace.get("issues") or []:
+            event = issue.get("feedback") if isinstance(issue, dict) else None
+            if isinstance(event, dict) and event.get("id") and event["id"] not in event_ids:
+                feedback_events.append(event)
+                event_ids.add(event["id"])
+        feedback_rows = ''.join(
+            '<article class="finding"><h3>人工意见：' + esc(action_labels.get(item.get("action"), "补充意见"))
+            + '</h3><p>' + esc(item.get("reason") or "") + '</p><p>证明/补充：'
+            + esc(item.get("evidence") or "未提供") + '</p><p class="muted">记录人：'
+            + esc(item.get("actor_name") or item.get("actor") or "") + ' · '
+            + esc(item.get("created_at") or "") + '</p></article>'
+            for item in feedback_events)
+        jobs = workspace.get("jobs") or []
+        job_labels = {"paused": "待继续", "running": "正在整理", "completed": "已整理",
+                      "needs_attention": "部分项目需处理", "pending": "待处理", "failed": "未完成", "skipped": "已跳过"}
+        job_rows = []
+        for job in jobs:
+            if not isinstance(job, dict):
+                continue
+            item_rows = ''.join(
+                '<article class="finding"><h3>' + esc(item.get("title") or "审查问题") + ' · '
+                + esc(job_labels.get(item.get("status"), "待核实")) + '</h3><p>'
+                + esc(item.get("summary") or "尚未整理") + '</p><p>依据：'
+                + esc(item.get("evidence") or "未提供") + '</p></article>'
+                for item in job.get("items") or [] if isinstance(item, dict))
+            job_rows.append('<h3>' + ("大模型辅助整理" if job.get("use_llm") else "原规则意见整理")
+                            + ' · ' + esc(job_labels.get(job.get("status"), "待核实")) + '</h3><p>已处理 '
+                            + esc(job.get("completed", 0)) + ' / ' + esc(job.get("total", 0)) + ' 项</p>' + item_rows)
+        if fact_rows or feedback_rows or jobs:
+            workspace_html = ('<section><h2>项目记忆与人工确认</h2>'
+                              '<p class="muted">以下为导出时的项目参考信息和人工意见，原始规则结论保留；人工确认不代表规则重新通过。</p>'
+                              + ('<ul>' + fact_rows + '</ul>' if fact_rows else '') + feedback_rows
+                              + ('<h3>辅助整理任务</h3>' + ''.join(job_rows) if job_rows else '') + '</section>')
+    return f"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{esc(title)} - 审查报告</title>
+<style>
+*{{box-sizing:border-box}} body{{margin:0;background:#f4f7fb;color:#172b4d;font:14px/1.65 "Microsoft YaHei",Arial,sans-serif}} .page{{max-width:1080px;margin:0 auto;padding:36px 28px 60px}} header{{background:#fff;border-top:4px solid #1769aa;padding:24px 28px;box-shadow:0 2px 10px #17324d12}} h1{{margin:0 0 8px;font-size:26px;color:#123b63}} h2{{font-size:18px;color:#1769aa;margin:26px 0 12px;border-bottom:1px solid #dbe5ef;padding-bottom:8px}} h3{{margin:0;font-size:16px;color:#173b61}} .meta{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:18px}} .meta div{{background:#f4f8fc;padding:10px 12px;border:1px solid #e1eaf2}} .label,dt{{color:#687b91;font-size:12px}} .value{{display:block;font-weight:600;margin-top:3px}} .finding{{background:#fff;border:1px solid #dce6ef;border-left:4px solid #e49328;padding:16px 18px;margin:12px 0;page-break-inside:avoid}} .finding-title{{display:flex;justify-content:space-between;gap:16px;align-items:center}} .severity{{color:#a95b00;background:#fff3df;padding:2px 9px;white-space:nowrap}} dl{{margin:12px 0 0}} .field{{display:grid;grid-template-columns:90px 1fr;gap:14px;border-top:1px solid #edf1f5;padding:7px 0}} dd{{margin:0;white-space:pre-wrap;overflow-wrap:anywhere}} .muted{{color:#718198}} details{{margin-top:12px}} summary{{color:#1769aa;cursor:pointer}} .json{{background:#f7f9fb;border:1px solid #e6edf3;padding:12px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.5 Consolas,"Microsoft YaHei",monospace}} footer{{color:#718198;font-size:12px;margin-top:30px}} @media(max-width:700px){{.page{{padding:18px 12px}}.meta{{grid-template-columns:repeat(2,1fr)}}}} @media print{{body{{background:#fff}}.page{{max-width:none;padding:0}}header,.finding{{box-shadow:none}}details{{display:block}}details>summary{{display:none}}}}
+</style></head><body><main class="page">
+<header><h1>{esc(title)}</h1><div class="muted">审查报告 · 可打印/可归档 HTML</div><div class="meta"><div><span class="label">检查模块</span><span class="value">{esc(module_name)}</span></div><div><span class="label">检测状态</span><span class="value">{esc(status)}</span></div><div><span class="label">风险等级</span><span class="value">{esc(risk)}</span></div><div><span class="label">检测时间</span><span class="value">{esc(created_at)}</span></div></div></header>
+<section><h2>检测汇总</h2>{summary_html}<p>审查问题总数：<strong>{count}</strong></p></section>
+{memory_html}
+{workspace_html}
+<section><h2>审查意见</h2>{finding_section}</section>
+{''.join(rule_sections)}
+<section><h2>检测文件</h2>{sources_html}</section>
+<section><h2>完整结果数据</h2><details open><summary>展开原始检测结果</summary>{raw_html}</details></section>
+<footer>报告由项目审查系统根据本次检测记录生成。报告内容对应记录生成时的检测结果。</footer>
+</main></body></html>"""
 
 
 def _upgrade_stored_finding_locations(result: dict[str, Any]) -> None:

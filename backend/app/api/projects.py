@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from app.db.models import CheckResult, CheckRun, Project
 from app.db.session import get_db
 from app.schemas import CheckRunCreate, ProjectCreate, ProjectOut
+from app.services.issue_memory import link_run
 
 
 router = APIRouter()
@@ -44,6 +45,12 @@ def create_check_run(project_id: str, payload: CheckRunCreate, db: Session = Dep
         status="running",
     )
     db.add(run)
+    db.flush()
+    try:
+        link_run(db, run, payload.memory_baseline_id)
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     db.commit()
     db.refresh(run)
     return _check_run_to_dict(run)
@@ -53,6 +60,19 @@ def create_check_run(project_id: str, payload: CheckRunCreate, db: Session = Dep
 def project_tree(db: Session = Depends(get_db)) -> dict[str, list[dict[str, object]]]:
     projects = list(db.scalars(select(Project).order_by(Project.updated_at.desc(), Project.created_at.desc())).all())
     return {"items": [_project_tree_to_dict(project) for project in projects]}
+
+
+@router.get("/{project_id}/review-baselines")
+def review_baselines(project_id: str, db: Session = Depends(get_db)) -> dict[str, object]:
+    if db.get(Project, project_id) is None:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    runs = db.query(CheckRun).filter(
+        CheckRun.project_id == project_id,
+        CheckRun.check_results.any(CheckResult.check_subtype == "aggregate"),
+    ).order_by(CheckRun.created_at.desc(), CheckRun.id.desc()).limit(100).all()
+    return {"items": [{"id": run.id, "report_name": run.source_filename or run.report_name,
+                       "created_at": run.created_at.isoformat() if run.created_at else "",
+                       "status": run.status} for run in runs]}
 
 
 @router.delete("/{project_id}")

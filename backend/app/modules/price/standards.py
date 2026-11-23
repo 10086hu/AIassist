@@ -37,6 +37,8 @@ class FeeEvaluation:
 @lru_cache(maxsize=1)
 def load_municipal_class2_standard() -> dict[str, Any]:
     path = Path(__file__).with_name("data") / "shanghai_municipal_class2_fees.json"
+    if not path.is_file():
+        raise ValueError("价格核价标准配置缺失：shanghai_municipal_class2_fees.json，请补充标准文件后重试。")
     return json.loads(path.read_text(encoding="utf-8"))
 
 

@@ -1,15 +1,20 @@
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.responses import JSONResponse
 
-from app.api import evaluate, projects, completeness
+from app.api import admin, auth, evaluate, projects, completeness, history, memory
+from app.core.auth import get_business_user
 from app.core.config import settings
 from app.db.session import init_db
+from app.core.history_limits import HistoryBodyLimitMiddleware
 
 
 app = FastAPI(
     title="可行性报告 AI 评估助手",
-    description="模块2/5/8 MVP backend. Week 1-2 implements project skeleton and internal duplicate check.",
-    version="0.1.0",
+    description="可研报告智能审查后端。先通过 /api/auth/login 登录，再使用 Bearer 令牌访问业务接口。",
+    version="0.2.0",
 )
 
 app.add_middleware(
@@ -19,6 +24,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(HistoryBodyLimitMiddleware)
 
 
 @app.on_event("startup")
@@ -31,6 +37,32 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-app.include_router(projects.router, prefix="/api/projects", tags=["projects"])
-app.include_router(evaluate.router, prefix="/api/evaluate", tags=["evaluate"])
-app.include_router(completeness.router, prefix="/api/completeness", tags=["completeness"])
+@app.middleware("http")
+async def auth_cache_control(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/api/auth/") or request.headers.get("authorization"):
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+    return response
+
+
+@app.exception_handler(RequestValidationError)
+async def safe_validation_error(request: Request, exc: RequestValidationError):
+    if request.url.path.startswith(("/api/auth/", "/api/history/", "/api/admin/history/")):
+        # Pydantic's default error includes the rejected input, which could be a
+        # plaintext password. Keep useful field diagnostics without that value.
+        return JSONResponse(status_code=422, content={"detail": [
+            {key: error[key] for key in ("loc", "msg", "type")} for error in exc.errors()
+        ]})
+    return await request_validation_exception_handler(request, exc)
+
+
+app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
+app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
+app.include_router(history.router, prefix="/api/history", tags=["history"])
+app.include_router(history.admin_router, prefix="/api/admin/history", tags=["admin-history"])
+protected = [Depends(get_business_user)]
+app.include_router(projects.router, prefix="/api/projects", tags=["projects"], dependencies=protected)
+app.include_router(evaluate.router, prefix="/api/evaluate", tags=["evaluate"], dependencies=protected)
+app.include_router(completeness.router, prefix="/api/completeness", tags=["completeness"], dependencies=protected)
+app.include_router(memory.router, dependencies=protected)

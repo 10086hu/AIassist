@@ -27,6 +27,7 @@ class ProjectOut(BaseModel):
 class CheckRunCreate(BaseModel):
     report_name: str = Field(min_length=1, max_length=300)
     source_filename: Optional[str] = None
+    memory_baseline_id: Optional[str] = None
 
 
 class FunctionPointOut(BaseModel):

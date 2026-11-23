@@ -8,13 +8,13 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-from app.core.llm_json import parse_json_object_from_text
 from app.core.direct_http import urlopen_direct
 
 
 DEFAULT_MODEL = "DeepSeek-V4-Flash"
 DEFAULT_API_BASE_URL = "https://api.deepseek.com"
 DEFAULT_TIMEOUT_SECONDS = 12
+REVIEW_MAX_OUTPUT_TOKENS = 2400
 TRANSPORT = "openai_chat_completions"
 
 
@@ -28,6 +28,10 @@ class MissingContentError(ValueError):
     def __init__(self, debug: dict[str, Any]) -> None:
         self.debug = debug
         super().__init__("llm_response_missing_content")
+
+
+class InvalidReviewResponseError(ValueError):
+    """Reject unusable replies without copying model reasoning into errors."""
 
 
 class ExtractedContent:
@@ -138,7 +142,7 @@ def review_finding_with_llm(
             api_key=api_key,
             model=model,
             timeout=timeout,
-            max_tokens=700,
+            max_tokens=REVIEW_MAX_OUTPUT_TOKENS,
         )
         normalized = _normalize_review(payload, model, finding, context or "")
         normalized["enabled"] = True
@@ -177,7 +181,7 @@ def review_security_document_with_llm(
             api_key=api_key,
             model=model,
             timeout=timeout,
-            max_tokens=700,
+            max_tokens=REVIEW_MAX_OUTPUT_TOKENS,
         )
         normalized = _normalize_security_review(payload, model, packet)
         normalized["enabled"] = True
@@ -236,13 +240,17 @@ def _post_chat_completion(
         "messages": [
             {
                 "role": "system",
-                "content": "你是可研报告审查复核助手。只输出合法 JSON，不输出 Markdown。",
+                "content": "你是可研报告审查复核助手。只输出完整合法 JSON，不输出 Markdown、分析过程或推理内容。审查意见、修改建议、依据均使用中文，产品名称和技术缩写可保留原文。",
             },
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.1,
         "max_tokens": max_tokens,
     }
+    if model.lower().startswith("deepseek-v4"):
+        # Match the existing V4 extraction configuration and leave room for
+        # the final JSON rather than spending the output budget on reasoning.
+        body["reasoning_effort"] = "low"
     if use_response_format:
         body["response_format"] = {"type": "json_object"}
 
@@ -273,27 +281,32 @@ def extract_message_content(response: Any) -> str:
 
 
 def _extract_message_content(response: Any) -> ExtractedContent:
+    choices = _get_response_value(response, "choices")
+    first_choice = choices[0] if isinstance(choices, (list, tuple)) and choices else _get_response_value(choices, 0)
+    finish_reason = _get_response_value(first_choice, "finish_reason")
+    if finish_reason == "length":
+        raise InvalidReviewResponseError("llm_response_truncated")
+    if finish_reason == "content_filter" or _has_text(_get_nested_response_value(first_choice, ("message", "refusal"))):
+        raise InvalidReviewResponseError("llm_response_refused")
+
     for key in ("output_text", "content"):
         content = _get_response_value(response, key)
-        if _has_text(content):
-            return ExtractedContent(_safe_content_text(content), key)
+        text = _safe_content_text(content) if _has_text(content) else ""
+        if text:
+            return ExtractedContent(text, key)
 
-    choices = _get_response_value(response, "choices")
     if not choices:
         raise ValueError("llm_response_missing_choices")
 
-    first_choice = choices[0] if isinstance(choices, (list, tuple)) else _get_response_value(choices, 0)
     for path in (
         ("message", "content"),
-        ("message", "reasoning"),
-        ("message", "reasoning_content"),
-        ("message", "refusal"),
         ("delta", "content"),
         ("text",),
     ):
         content = _get_nested_response_value(first_choice, path)
-        if _has_text(content):
-            return ExtractedContent(_safe_content_text(content), ".".join(str(item) for item in path))
+        text = _safe_content_text(content) if _has_text(content) else ""
+        if text:
+            return ExtractedContent(text, ".".join(str(item) for item in path))
 
     raise MissingContentError(_missing_content_debug(response, first_choice))
 
@@ -323,40 +336,37 @@ def _has_text(value: Any) -> bool:
 
 
 def _safe_content_text(value: Any) -> str:
-    raw_text = str(value)
-    stripped = _strip_think_blocks(raw_text)
-    if stripped:
-        return stripped
-    return _short_text(raw_text.strip(), 500)
+    return _strip_think_blocks(str(value))
 
 
 def _parse_model_content(content: str) -> dict[str, Any]:
-    raw_text = str(content or "")
-    text = _strip_think_blocks(raw_text)
-    if not text and raw_text.strip():
-        text = _short_text(raw_text.strip(), 300)
-    if text.startswith("```"):
-        text = text.strip("`")
-        if text.lower().startswith("json"):
-            text = text[4:].strip()
+    text = _strip_think_blocks(str(content or "")).lstrip("\ufeff")
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.IGNORECASE | re.DOTALL)
+    if fenced:
+        text = fenced.group(1).strip()
     try:
-        parsed = parse_json_object_from_text(text)
-    except Exception:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        # Support a short preamble around a complete object, but never scan
+        # nested objects inside truncated JSON and mistake them for the reply.
+        if text.startswith(("{", "[")):
+            raise InvalidReviewResponseError("llm_response_invalid_json") from None
         start = text.find("{")
         end = text.rfind("}")
         if start < 0 or end <= start:
-            return {"content": text, "_raw_text": text}
+            raise InvalidReviewResponseError("llm_response_invalid_json") from None
         try:
-            parsed = parse_json_object_from_text(text[start : end + 1])
-        except Exception:
-            return {"content": text, "_raw_text": text}
+            parsed = json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            raise InvalidReviewResponseError("llm_response_invalid_json") from None
     if not isinstance(parsed, dict):
-        return {"content": text, "_raw_text": text}
+        raise InvalidReviewResponseError("llm_response_invalid_json")
     return parsed
 
 
 def _strip_think_blocks(content: str) -> str:
-    return re.sub(r"<think>.*?</think>", "", content or "", flags=re.IGNORECASE | re.DOTALL).strip()
+    # An unclosed thinking block is also reasoning, not a partial final answer.
+    return re.sub(r"<think\b[^>]*>.*?(?:</think\s*>|$)", "", content or "", flags=re.IGNORECASE | re.DOTALL).strip()
 
 
 def _provider_error_detail(response: Any) -> dict[str, Any]:
@@ -395,21 +405,44 @@ def _safe_json_preview(value: Any) -> str:
         return str(value)
 
 
+def _validate_review_payload(payload: dict[str, Any]) -> None:
+    fields = (
+        ("user_reason", "reason"),
+        ("user_suggestion", "rewrite_suggestion", "suggestion"),
+        ("user_basis", "basis", "evidence_basis"),
+    )
+    for aliases in fields:
+        value = next((payload[key] for key in aliases if key in payload), None)
+        if not isinstance(value, str) or not value.strip():
+            raise InvalidReviewResponseError("llm_response_incomplete_review")
+        if re.search(r"</?think\b", value, re.IGNORECASE) or re.search(
+            r"\b(?:we need(?: to)?|let['’]s (?:reason|analy[sz]e|think)|need (?:to )?(?:analy[sz]e|evaluate|answer)|i (?:need to|should))\b",
+            value, re.IGNORECASE,
+        ):
+            raise InvalidReviewResponseError("llm_response_contains_reasoning")
+        if not re.search(r"[\u3400-\u9fff]", value):
+            raise InvalidReviewResponseError("llm_response_non_chinese_review")
+    judgement = payload.get("judgement", payload.get("is_valid"))
+    if not isinstance(judgement, (str, bool)) or (isinstance(judgement, str) and not judgement.strip()):
+        raise InvalidReviewResponseError("llm_response_incomplete_review")
+
+
 def _normalize_review(payload: dict[str, Any], model: str, finding: dict[str, Any], context: str) -> dict[str, Any]:
-    raw_text = _short_text(payload.get("_raw_text") or payload.get("content") or "")
+    _validate_review_payload(payload)
+    raw_text = _review_text(payload.get("_raw_text") or payload.get("content") or "")
     fallback_suggestion = str(finding.get("suggestion") or "")
     fallback_basis = str(finding.get("evidence") or finding.get("source_section") or context or "")
     display_title = _short_text(payload.get("display_title") or payload.get("title") or payload.get("issue_title"), 80)
     feature_label = _short_text(payload.get("feature_label") or payload.get("item_label"), 80)
-    user_reason = _short_text(payload.get("user_reason") or payload.get("reason") or raw_text)
-    user_suggestion = _short_text(
+    user_reason = _review_text(payload.get("user_reason") or payload.get("reason") or raw_text)
+    user_suggestion = _review_text(
         payload.get("user_suggestion")
         or payload.get("rewrite_suggestion")
         or payload.get("suggestion")
         or _extract_suggestion_from_text(raw_text)
         or fallback_suggestion
     )
-    user_basis = _short_text(payload.get("user_basis") or payload.get("basis") or payload.get("evidence_basis") or fallback_basis)
+    user_basis = _review_text(payload.get("user_basis") or payload.get("basis") or payload.get("evidence_basis") or fallback_basis)
     return {
         "enabled": True,
         "model": model,
@@ -420,8 +453,8 @@ def _normalize_review(payload: dict[str, Any], model: str, finding: dict[str, An
         "user_reason": user_reason,
         "user_suggestion": user_suggestion,
         "user_basis": user_basis,
-        "evidence_summary": _short_text(payload.get("evidence_summary") or user_basis),
-        "revision_advice": _short_text(payload.get("revision_advice") or user_suggestion),
+        "evidence_summary": _review_text(payload.get("evidence_summary") or user_basis),
+        "revision_advice": _review_text(payload.get("revision_advice") or user_suggestion),
         "reason": user_reason,
         "rewrite_suggestion": user_suggestion,
         "confidence": payload.get("confidence"),
@@ -601,7 +634,10 @@ def _build_security_prompt(rule: dict[str, Any], packet: dict[str, Any]) -> str:
 
 
 def _normalize_security_review(payload: dict[str, Any], model: str, packet: dict[str, Any]) -> dict[str, Any]:
-    raw_text = _short_text(payload.get("_raw_text") or payload.get("content") or "")
+    _validate_review_payload(payload)
+    if "passed" in payload and not isinstance(payload["passed"], bool):
+        raise InvalidReviewResponseError("llm_response_incomplete_review")
+    raw_text = _review_text(payload.get("_raw_text") or payload.get("content") or "")
     passed_value = payload.get("passed")
     if passed_value is None:
         passed_value = str(payload.get("judgement") or "").strip() in {"通过", "合规", "满足要求", "pass", "passed"}
@@ -616,26 +652,23 @@ def _normalize_security_review(payload: dict[str, Any], model: str, packet: dict
         or ("通过" if passed else "需人工确认"),
         120,
     )
-    user_reason = _short_text(
+    user_reason = _review_text(
         payload.get("user_reason")
         or payload.get("reason")
         or packet.get("local_reason")
         or raw_text,
-        240,
     )
-    user_suggestion = _short_text(
+    user_suggestion = _review_text(
         payload.get("user_suggestion")
         or payload.get("rewrite_suggestion")
         or payload.get("suggestion")
         or packet.get("local_suggestion"),
-        240,
     )
-    user_basis = _short_text(
+    user_basis = _review_text(
         payload.get("user_basis")
         or payload.get("basis")
         or payload.get("evidence_basis")
         or packet.get("evidence_summary"),
-        240,
     )
     return {
         "passed": passed,
@@ -650,7 +683,7 @@ def _normalize_security_review(payload: dict[str, Any], model: str, packet: dict
         "matched_points": _string_list(payload.get("matched_points") or packet.get("matched_points")),
         "need_human_review": payload.get("need_human_review"),
         "confidence": payload.get("confidence"),
-        "evidence_summary": _short_text(payload.get("evidence_summary") or packet.get("evidence_summary") or raw_text, 260),
+        "evidence_summary": _review_text(payload.get("evidence_summary") or packet.get("evidence_summary") or raw_text),
         "review_version": "security_document_review_v1",
     }
 
@@ -671,6 +704,8 @@ def _safe_error_message(exc: Exception) -> str:
 
 
 def _error_type(exc: Exception) -> str:
+    if isinstance(exc, InvalidReviewResponseError):
+        return "invalid_review_response"
     if isinstance(exc, LlmProviderError):
         return "provider_error"
     if isinstance(exc, urllib.error.HTTPError):
@@ -697,6 +732,11 @@ def _string_list(value: Any) -> list[str]:
         return [str(item).strip() for item in value if str(item).strip()]
     text = str(value).strip()
     return [text] if text else []
+
+
+def _review_text(value: Any) -> str:
+    """Keep the full review, including paragraphs, for storage and display."""
+    return str(value or "").strip()
 
 
 def _short_text(value: Any, max_chars: int = 220) -> str:
