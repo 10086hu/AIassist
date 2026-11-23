@@ -123,7 +123,8 @@ def test_document_text_is_escaped_and_index_not_mutated():
     ("DATA_REASON_001", "data_reasonableness"),
     ("DATA_REASON_002", "data_reasonableness"),
     ("DATA_REASON_024", "data_reasonableness"),
-    ("FUNC_CORR_004", None), ("BASIS_007", None),
+    ("FUNC_CORR_004", None), ("BASIS_007", "basis"),
+    ("BASIS_009", "basis"), ("BASIS_012", "basis"), ("BASIS_014", "basis"),
 ])
 def test_only_target_rules_opt_in(rule, module):
     assert _precise_rule_module(rule) == module
