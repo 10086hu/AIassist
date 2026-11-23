@@ -139,12 +139,13 @@ public partial class MainWindow
 
     private async void OnRunCompletenessCheckClicked(object sender, RoutedEventArgs e)
     {
+        if (!RequireWorkspaceDataAccess()) return;
         if (_completenessRunning) return;
         var project = CompletenessProjectId;
         var path = ReportPathTextBlock.Text;
         if (string.IsNullOrWhiteSpace(project) || !File.Exists(path))
         {
-            MessageBox.Show(this, "请先选择项目和有效报告文件。", "完整性检查");
+            AppMessageBox.Show(this, "请先选择项目和有效报告文件。", "完整性检查", MessageBoxButton.OK, MessageBoxImage.Warning);
             return;
         }
         ResetCompletenessResult();
@@ -219,17 +220,21 @@ public partial class MainWindow
     private async Task LoadCompletenessHistoryAsync(int offset = 0)
     {
         if (_completenessHistory == null) return;
+        var session = ActiveBackendSession;
+        var revision = _backendSessionRevision;
         var project = CompletenessProjectId;
         var generation = ++_completenessHistoryGeneration;
         if (offset == 0) _completenessHistory.Children.Clear();
+        if (!CanUseActiveWorkspace) return;
         if (string.IsNullOrWhiteSpace(project)) { _completenessHistory.Children.Add(Text("请先选择项目。", 13)); return; }
         try
         {
-            using var response = await BackendClient.GetAsync($"{BackendBaseUrl}/completeness/reports?project_id={Uri.EscapeDataString(project)}&offset={offset}");
+            using var response = await session.Client.GetAsync($"{session.ApiBase.AbsoluteUri.TrimEnd('/')}/completeness/reports?project_id={Uri.EscapeDataString(project)}&offset={offset}");
             var body = await response.Content.ReadAsStringAsync();
             if (!response.IsSuccessStatusCode) throw new InvalidOperationException(ExtractErrorMessage(body));
             using var doc = JsonDocument.Parse(body);
-            if (project != CompletenessProjectId || generation != _completenessHistoryGeneration) return;
+            if (project != CompletenessProjectId || generation != _completenessHistoryGeneration
+                || !IsCurrentBackendSession(session, revision)) return;
             var entries = doc.RootElement.GetProperty("items").EnumerateArray().ToArray();
             foreach (var entry in entries)
             {
@@ -251,12 +256,13 @@ public partial class MainWindow
                 {
                     try
                     {
-                        using var detail = await BackendClient.GetAsync($"{BackendBaseUrl}/completeness/reports/{id}?project_id={Uri.EscapeDataString(project)}");
+                        if (!IsCurrentBackendSession(session, revision)) return;
+                        using var detail = await session.Client.GetAsync($"{session.ApiBase.AbsoluteUri.TrimEnd('/')}/completeness/reports/{id}?project_id={Uri.EscapeDataString(project)}");
                         detail.EnsureSuccessStatusCode();
                         using var json = JsonDocument.Parse(await detail.Content.ReadAsStringAsync());
-                        ShowCompletenessReport(json.RootElement.Clone());
+                        if (IsCurrentBackendSession(session, revision)) ShowCompletenessReport(json.RootElement.Clone());
                     }
-                    catch (Exception exc) { MessageBox.Show(this, "历史报告加载失败：" + exc.Message); }
+                    catch (Exception exc) { AppMessageBox.Show(this, "历史报告加载失败：" + exc.Message, "提示", MessageBoxButton.OK, MessageBoxImage.Error); }
                 };
                 _completenessHistory.Children.Add(button);
             }
@@ -269,20 +275,22 @@ public partial class MainWindow
                 _completenessHistory.Children.Add(more);
             }
         }
-        catch (Exception exc) { if (project == CompletenessProjectId && generation == _completenessHistoryGeneration) _completenessHistory.Children.Add(Text("历史加载失败：" + exc.Message, 12, null, null, null, true)); }
+        catch (Exception exc) { if (project == CompletenessProjectId && generation == _completenessHistoryGeneration && IsCurrentBackendSession(session, revision)) _completenessHistory.Children.Add(Text("历史加载失败：" + exc.Message, 12, null, null, null, true)); }
     }
 
     private async void OnViewCompletenessResultClicked(object sender, RoutedEventArgs e)
     {
         await CheckCompletenessFileChangeAsync();
         if (_latestCompleteness is JsonElement report) ShowCompletenessReport(report);
-        else MessageBox.Show(this, "尚无本次检查报告，请执行检查或从历史记录中查看。", "完整性报告");
+        else AppMessageBox.Show(this, "尚无本次检查报告，请执行检查或从历史记录中查看。", "完整性报告");
     }
 
     private void ShowCompletenessReport(JsonElement report)
     {
+        var reportBase = BackendBaseUrl;
         var panel = new StackPanel { Margin = new Thickness(24) };
-        var dialog = new Window { Owner = this, Title = "完整性检查报告", Width = 950, Height = 720, WindowStartupLocation = WindowStartupLocation.CenterOwner, Content = new ScrollViewer { Content = panel, VerticalScrollBarVisibility = ScrollBarVisibility.Auto } };
+        var dialog = new Window { Owner = this, Title = "完整性检查报告", Width = 950, Height = 720, MinWidth = 640, MinHeight = 420, WindowStartupLocation = WindowStartupLocation.CenterOwner, ShowInTaskbar = false, FontFamily = FontFamily, Background = Brushes.White, Content = new ScrollViewer { Content = panel, VerticalScrollBarVisibility = ScrollBarVisibility.Auto } };
+        DesktopWindowFrame.Apply(dialog);
         panel.Children.Add(Text(GetString(report, "filename"), 20, FontWeights.Bold, null, null, true));
         panel.Children.Add(Text("结论：" + GetString(report, "label") + "　检查时间：" + GetString(report, "created_at"), 14, null, null, new Thickness(0, 10, 0, 10), true));
         panel.Children.Add(Text("规则版本：" + GetString(report, "version") + "。历史报告保留检查当时的判定尺度。", 12, null, FindBrush("MutedBrush"), null, true));
@@ -292,7 +300,7 @@ public partial class MainWindow
         var project = GetString(report, "project_id");
         var id = GetString(report, "id");
         var export = Button("导出报告（HTML，可打印为PDF）", false);
-        export.Click += async (_, _) => await SaveCompletenessDownloadAsync($"{BackendBaseUrl}/completeness/reports/{id}/export?project_id={Uri.EscapeDataString(project)}", "完整性检查报告.html", "HTML报告|*.html", dialog);
+        export.Click += async (_, _) => await SaveCompletenessDownloadAsync($"{reportBase}/completeness/reports/{id}/export?project_id={Uri.EscapeDataString(project)}", "完整性检查报告.html", "HTML报告|*.html", dialog);
         panel.Children.Add(export);
         var index = 0;
         foreach (var source in report.GetProperty("inventory").EnumerateArray())
@@ -300,7 +308,7 @@ public partial class MainWindow
             var n = index++;
             var filename = GetString(source, "filename");
             var download = Button("下载本次原文件：" + filename, false);
-            download.Click += async (_, _) => await SaveCompletenessDownloadAsync($"{BackendBaseUrl}/completeness/reports/{id}/sources/{n}?project_id={Uri.EscapeDataString(project)}", filename, "原文件|*.*", dialog);
+            download.Click += async (_, _) => await SaveCompletenessDownloadAsync($"{reportBase}/completeness/reports/{id}/sources/{n}?project_id={Uri.EscapeDataString(project)}", filename, "原文件|*.*", dialog);
             panel.Children.Add(download);
             panel.Children.Add(Text("SHA256：" + GetString(source, "sha256"), 11, null, FindBrush("MutedBrush"), null, true));
         }
@@ -312,7 +320,7 @@ public partial class MainWindow
             {
                 var location = string.Join(" · ", evidence.EnumerateObject().Where(x => x.Name is not "quote" and not "is_heading" and not "is_caption").Select(x => (x.Name switch { "filename" => "文件", "section" => "章节", "paragraph" => "正文段落", "table_index" => "表格", "table_path" => "嵌套表", "row_index" => "行", "page" => "页码", "line" => "文本行", "sheet" => "工作表", _ => x.Name }) + ": " + x.Value.ToString()));
                 panel.Children.Add(Text(location, 11, null, FindBrush("MutedBrush"), new Thickness(0, 8, 0, 2), true));
-                panel.Children.Add(new Border { Background = Brush(255, 250, 220), Padding = new Thickness(10), Child = Text(GetString(evidence, "quote"), 13, null, null, null, true) });
+                panel.Children.Add(new Border { Background = Brush(239, 246, 255), CornerRadius = new CornerRadius(8), Padding = new Thickness(10), Child = Text(GetString(evidence, "quote"), 13, null, null, null, true) });
             }
             var advice = GetString(item, "advice");
             if (!string.IsNullOrWhiteSpace(advice)) panel.Children.Add(Text("建议：" + advice, 13, null, null, new Thickness(0, 6, 0, 0), true));
@@ -327,10 +335,10 @@ public partial class MainWindow
         if (save.ShowDialog(owner) != true) return;
         try
         {
-            using var response = await BackendClient.GetAsync(url);
+            using var response = await BackendClient.GetAsync(AuthenticatedBackendUri(url));
             response.EnsureSuccessStatusCode();
             await File.WriteAllBytesAsync(save.FileName, await response.Content.ReadAsByteArrayAsync());
         }
-        catch (Exception exc) { MessageBox.Show(owner, "保存失败：" + exc.Message); }
+        catch (Exception exc) { AppMessageBox.Show(owner, "保存失败：" + exc.Message, "提示", MessageBoxButton.OK, MessageBoxImage.Error); }
     }
 }

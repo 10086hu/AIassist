@@ -1,0 +1,150 @@
+{
+  "schema_version": 3,
+  "project": {
+    "id": "ca23f12f-d29b-4946-8299-b0b63050121c",
+    "name": "记忆测试",
+    "department": null,
+    "description": null,
+    "status": "draft",
+    "created_at": "2026-11-15T07:27:28.087989Z",
+    "updated_at": "2026-11-15T07:27:28.087989Z"
+  },
+  "check_runs": [
+    {
+      "id": "7769b51a-84d2-4bd6-9745-19aba52ce6e9",
+      "report_name": "样例.docx",
+      "source_filename": null,
+      "status": "completed",
+      "created_at": "2026-11-15T07:27:28.089993Z",
+      "updated_at": "2026-11-15T07:27:28.089993Z"
+    }
+  ],
+  "results": [
+    {
+      "id": "2af102a4-e486-4315-82cc-ff4d9f73ffe1",
+      "check_run_id": "7769b51a-84d2-4bd6-9745-19aba52ce6e9",
+      "module": "resource",
+      "check_subtype": "aggregate",
+      "item_id": null,
+      "related_item_id": null,
+      "severity": "warning",
+      "score": null,
+      "result_label": "warning",
+      "reason": "原规则结论",
+      "suggestion": null,
+      "reference_data": {
+        "result": {
+          "findings": [
+            {
+              "reason": "原意见"
+            }
+          ]
+        }
+      },
+      "model_name": "local-rule-judge",
+      "created_at": "2026-11-15T07:27:28.089993Z"
+    }
+  ],
+  "sources": [
+    {
+      "id": "9c679508-f44e-44d1-9c79-d2675db3f9ad",
+      "check_result_id": "2af102a4-e486-4315-82cc-ff4d9f73ffe1",
+      "role": "current",
+      "stage": null,
+      "filename": "记忆升级验证.txt",
+      "media_type": "text/plain",
+      "content_base64": "6aG555uu6K6w5b+G56ys5LiJ54mI5Lyg6L6T5rWL6K+V5oql5ZGK77yb5YyF5ZCr5Y6f6KeE5YiZ6K+B5o2u44CC",
+      "sha256": "bf703918ecf74198c005a46278e8ffcb29b3729fb57e0ef56f170fe392ad2a8e",
+      "created_at": "2026-11-15T07:27:28.093997Z"
+    }
+  ],
+  "memory": {
+    "run_links": [],
+    "revisions": [
+      {
+        "result_id": "2af102a4-e486-4315-82cc-ff4d9f73ffe1",
+        "module": "resource",
+        "track_key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "baseline_result_id": null,
+        "source_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "snapshot": {
+          "issues": [
+            {
+              "issue_id": "3a6a4341-99ce-4825-9ae8-6e8ce38bd023",
+              "status": "persistent",
+              "finding": {
+                "title": "问题0",
+                "reason": "原始审查意见",
+                "evidence": "原文0",
+                "severity": "warning"
+              }
+            },
+            {
+              "issue_id": "a7237769-cb92-4a50-bf80-771e4cfe1ab7",
+              "status": "new",
+              "finding": {
+                "title": "问题1",
+                "reason": "原始审查意见",
+                "evidence": "原文1",
+                "severity": "error"
+              }
+            }
+          ],
+          "scope": {},
+          "track_key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "source_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "summary": {
+            "baseline_result_id": null
+          }
+        },
+        "created_at": "2026-11-15T07:27:28.091995Z"
+      }
+    ],
+    "missing_references": [],
+    "profile": {
+      "facts": [
+        {
+          "key": "建设范围",
+          "value": "仅升级已有平台",
+          "source": "合成测试背景"
+        }
+      ],
+      "aliases": [
+        {
+          "canonical": "业务平台",
+          "variants": [
+            "原有系统"
+          ]
+        }
+      ],
+      "actor": "合成测试员",
+      "updated_at": "2026-11-15T07:27:28.135860Z"
+    },
+    "feedback": [
+      {
+        "id": "4a1a19ac-c833-4d0f-ad4d-cb023897d939",
+        "result_id": "2af102a4-e486-4315-82cc-ff4d9f73ffe1",
+        "issue_id": "3a6a4341-99ce-4825-9ae8-6e8ce38bd023",
+        "action": "revoke",
+        "reason": "继续核查",
+        "evidence": "",
+        "actor": "合成测试员",
+        "source": "local",
+        "revokes_event_id": "e16bf66a-d19c-406d-b4f0-a75bcfda833f",
+        "created_at": "2026-11-15T07:27:28.135860Z"
+      },
+      {
+        "id": "e16bf66a-d19c-406d-b4f0-a75bcfda833f",
+        "result_id": "2af102a4-e486-4315-82cc-ff4d9f73ffe1",
+        "issue_id": "3a6a4341-99ce-4825-9ae8-6e8ce38bd023",
+        "action": "resolved",
+        "reason": "已补充说明",
+        "evidence": "第3章",
+        "actor": "合成测试员",
+        "source": "local",
+        "revokes_event_id": null,
+        "created_at": "2026-11-15T07:27:28.135860Z"
+      }
+    ]
+  }
+}

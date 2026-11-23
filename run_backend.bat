@@ -1,11 +1,27 @@
 @echo off
 setlocal
 
-cd /d %~dp0backend
+cd /d "%~dp0backend"
 
-set "AIASSIST_DATA_DIR=%TEMP%\AIassist"
+set "APP_ENV=dev"
+set "BACKEND_MODE=local"
+rem Preserve the legacy database instead of silently opening a new empty one.
+if not defined AIASSIST_DATA_DIR (
+    if not defined DATABASE_URL (
+        if exist "%TEMP%\AIassist\app.db" set "AIASSIST_DATA_DIR=%TEMP%\AIassist"
+    )
+)
+if not defined AIASSIST_DATA_DIR set "AIASSIST_DATA_DIR=%~dp0.runtime"
 if not exist "%AIASSIST_DATA_DIR%" mkdir "%AIASSIST_DATA_DIR%"
-set "DATABASE_URL=sqlite:///%AIASSIST_DATA_DIR:\=/%/app.db"
+if not exist "%AIASSIST_DATA_DIR%" (
+    echo [AI Assist] Failed to create the local data directory.
+    exit /b 1
+)
+set "AIASSIST_DATABASE_DESCRIPTION=Explicit DATABASE_URL override; connection string hidden"
+if not defined DATABASE_URL (
+    set "DATABASE_URL=sqlite:///%AIASSIST_DATA_DIR:\=/%/app.db"
+    set "AIASSIST_DATABASE_DESCRIPTION=%AIASSIST_DATA_DIR%\app.db"
+)
 
 for /f "tokens=2,*" %%A in ('reg query HKCU\Environment /v DEEPSEEK_API_KEY 2^>nul') do set "DEEPSEEK_API_KEY=%%B"
 for /f "tokens=2,*" %%A in ('reg query HKCU\Environment /v DEEPSEEK_API_URL 2^>nul') do set "DEEPSEEK_API_URL=%%B"
@@ -26,31 +42,40 @@ if "%DUPLICATE_LLM_MAX_TOKENS%"=="" set "DUPLICATE_LLM_MAX_TOKENS=6000"
 set "NO_PROXY=llmapi.tongji.edu.cn,192.168.174.218,localhost,127.0.0.1,%NO_PROXY%"
 set "no_proxy=%NO_PROXY%"
 
-if not exist ".venv\Scripts\python.exe" (
-    echo [AI Assist] Creating Python virtual environment...
-    python -m venv .venv
-    if errorlevel 1 (
-        echo [AI Assist] Failed to create virtual environment. Please check Python installation.
-        pause
-        exit /b 1
-    )
-
-    echo [AI Assist] Installing backend dependencies...
-    call ".venv\Scripts\activate.bat"
-    python -m pip install -r requirements.txt
-    if errorlevel 1 (
-        echo [AI Assist] Failed to install dependencies.
-        pause
-        exit /b 1
-    )
+rem A copied virtual environment can reference Python from another computer.
+rem Use it only if it works; create a separate local environment otherwise.
+set "AIASSIST_PYTHON=.venv\Scripts\python.exe"
+if exist "%AIASSIST_PYTHON%" (
+    "%AIASSIST_PYTHON%" -c "import sys" >nul 2>nul
+    if errorlevel 1 set "AIASSIST_PYTHON=.venv-local\Scripts\python.exe"
 ) else (
-    call ".venv\Scripts\activate.bat"
+    set "AIASSIST_PYTHON=.venv-local\Scripts\python.exe"
 )
-
-python -c "import uvicorn" >nul 2>nul
+if not exist "%AIASSIST_PYTHON%" (
+    echo [AI Assist] Creating a Python environment for this computer...
+    python -m venv .venv-local
+    if errorlevel 1 (
+        echo [AI Assist] Failed to create environment. Install Python 3.10 or later.
+        pause
+        exit /b 1
+    )
+)
+"%AIASSIST_PYTHON%" -c "import sys; assert sys.version_info >= (3, 10)" >nul 2>nul
 if errorlevel 1 (
-    echo [AI Assist] Installing missing backend dependencies...
-    python -m pip install -r requirements.txt
+    echo [AI Assist] Repairing the local environment with the current Python...
+    python -m venv --upgrade .venv-local
+    set "AIASSIST_PYTHON=.venv-local\Scripts\python.exe"
+)
+"%AIASSIST_PYTHON%" -c "import sys; assert sys.version_info >= (3, 10)" >nul 2>nul
+if errorlevel 1 (
+    echo [AI Assist] A working Python 3.10 or later is required.
+    pause
+    exit /b 1
+)
+"%AIASSIST_PYTHON%" -c "import uvicorn, fastapi, sqlalchemy, multipart, docx, openpyxl, requests, pdfplumber, PIL" >nul 2>nul
+if errorlevel 1 (
+    echo [AI Assist] Installing backend dependencies...
+    "%AIASSIST_PYTHON%" -m pip install -r requirements.txt
     if errorlevel 1 (
         echo [AI Assist] Failed to install dependencies.
         pause
@@ -59,7 +84,8 @@ if errorlevel 1 (
 )
 
 echo [AI Assist] Starting FastAPI backend at http://127.0.0.1:8000
-echo [AI Assist] Database: %AIASSIST_DATA_DIR%\app.db
+echo [AI Assist] Mode: local
+echo [AI Assist] Database: %AIASSIST_DATABASE_DESCRIPTION%
 echo [AI Assist] LLM base URL: %DEEPSEEK_API_BASE_URL%
 echo [AI Assist] LLM model: %DEEPSEEK_MODEL%
 if "%DEEPSEEK_API_KEY%"=="" (
@@ -67,7 +93,7 @@ if "%DEEPSEEK_API_KEY%"=="" (
 )
 echo [AI Assist] Auto-restart is enabled for unexpected backend exits.
 :backend_loop
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+"%AIASSIST_PYTHON%" -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 if errorlevel 1 (
     echo [AI Assist] Backend exited unexpectedly. Restarting in 3 seconds...
     timeout /t 3 /nobreak >nul

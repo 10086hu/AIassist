@@ -1,4 +1,4 @@
-using Microsoft.Win32;
+﻿using Microsoft.Win32;
 using System.IO;
 using System.Globalization;
 using System.Net.Http;
@@ -19,8 +19,11 @@ namespace AiReportDesktop;
 
 public partial class MainWindow : Window
 {
-    private static string BackendBaseUrl => BackendConnection.BaseUrl;
-    private static HttpClient BackendClient => BackendConnection.Client;
+    internal static BackendSession ActiveBackendSession { get; private set; } = new(new Uri(
+        (Environment.GetEnvironmentVariable("AIASSIST_BACKEND_URL")
+            ?? GetUserEnvironment("AIASSIST_BACKEND_URL", "http://127.0.0.1:8000/api")).Trim().TrimEnd('/')));
+    private static string BackendBaseUrl => ActiveBackendSession.ApiBase.AbsoluteUri.TrimEnd('/');
+    private static HttpClient BackendClient => ActiveBackendSession.Client;
 
     private readonly List<CheckBox> _checkBoxes = new();
     private readonly Dictionary<string, List<CheckBox>> _ruleCheckBoxesByModule = new();
@@ -51,6 +54,7 @@ public partial class MainWindow : Window
     private string _activeRuleModule = "function_correspondence";
     private string? _activeRecordId;
     private int _preciseEvidenceGeneration;
+    private int _recordDetailGeneration;
     private Task<bool>? _evidencePreviewLoadTask;
     private string? _evidencePreviewLoadingUrl;
     private Button? _reportNavButton;
@@ -76,6 +80,9 @@ public partial class MainWindow : Window
     private bool _isSavingLlmSettings;
     private TextBlock? _llmConfigStatusTextBlock;
     private CheckBox? _llmReviewCheckBox;
+    private ComboBox? _memoryBaselineCombo;
+    private string? _memoryBaselineProjectId;
+    private int _memoryBaselinesGeneration;
     private bool _isCompletenessChecked;
     private bool _isChecking;
     private List<string> _duplicateHistoryFiles = new();
@@ -85,11 +92,6 @@ public partial class MainWindow : Window
     private string? _selectedProjectName;
     private string? _selectedCheckRunId;
     private readonly Dictionary<string, List<RunResultInfo>> _runResults = new();
-    private readonly Dictionary<string, FunctionFindingSelection> _functionFindingSelections = new();
-    private readonly Dictionary<string, string[]> _functionFindingCohorts = new(StringComparer.Ordinal);
-    private static readonly string FunctionFindingStatePath = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "AIassist", "function-finding-display.json");
 
     private readonly CheckItem[] _checkItems =
     {
@@ -228,12 +230,11 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
-        LoadFunctionFindingState();
+        DesktopWindowFrame.Apply(this);
         ProjectComboBox.SelectionChanged += OnProjectSelectionChanged;
         PrepareText();
         PrepareNavigation();
         BuildCheckItems();
-        InitializeConnection();
         Loaded += OnWindowLoaded;
     }
 
@@ -241,7 +242,7 @@ public partial class MainWindow : Window
     private sealed record RuleDisplayItem(string RuleId, string RuleName, string RuleCategory, string RuleDetail, string Source);
     private sealed record ProjectOption(string Id, string Name);
     private sealed record RunResultInfo(string Id, string Module, string ModuleName, string Status, string Risk, int FindingsCount, string CreatedAt);
-    private sealed record FunctionFindingSelection(int PoolCount, int ActualCount, int[] Indices);
+    private sealed record MemoryBaselineOption(string Id, string Label);
 
     private void PrepareText()
     {
@@ -440,8 +441,18 @@ public partial class MainWindow : Window
         heading.Children.Add(Text("选择项目、报告和专项检测范围，创建任务并查看进度。", 13, null, FindBrush("MutedBrush"), new Thickness(0, 6, 0, 0), true));
         _specialistPage.Children.Add(heading);
         _llmReviewCheckBox = new CheckBox { Content = "其他专项检测启用大模型辅助复核（重复建设检查始终使用大模型）", IsChecked = false, Margin = new Thickness(0, 16, 0, 0) };
-        Grid.SetRow(_llmReviewCheckBox, 3);
-        _specialistPage.Children.Add(_llmReviewCheckBox);
+        var reviewOptions = new StackPanel();
+        reviewOptions.Children.Add(_llmReviewCheckBox);
+        reviewOptions.Children.Add(Text("问题记忆基准", 13, FontWeights.SemiBold, FindBrush("TextBrush"), new Thickness(0, 12, 0, 6)));
+        _memoryBaselineCombo = new ComboBox { DisplayMemberPath = "Label", Padding = new Thickness(8),
+            HorizontalAlignment = HorizontalAlignment.Left, MinWidth = 360, MaxWidth = 780 };
+        _memoryBaselineCombo.ItemsSource = DefaultMemoryBaselines();
+        _memoryBaselineCombo.SelectedIndex = 0;
+        reviewOptions.Children.Add(_memoryBaselineCombo);
+        reviewOptions.Children.Add(Text("同名报告默认延续最近一次检测；报告改名后请选择上次版本。不同报告请选择“作为新报告”。", 12,
+            null, FindBrush("MutedBrush"), new Thickness(0, 5, 0, 8), true));
+        Grid.SetRow(reviewOptions, 3);
+        _specialistPage.Children.Add(reviewOptions);
         for (var i = 0; i < specialistContent.Length; i++)
         {
             Grid.SetRow(specialistContent[i], i + 4);
@@ -525,19 +536,31 @@ public partial class MainWindow : Window
         }
     }
 
-    private async void OnWindowLoaded(object sender, RoutedEventArgs e)
+    private void OnWindowLoaded(object sender, RoutedEventArgs e)
     {
-        await Task.CompletedTask; // Business requests start after login.
+        InitializeAuthenticationView();
+        LoginPage.Visibility = Visibility.Visible;
+        WorkbenchPage.Visibility = Visibility.Collapsed;
     }
 
     private async Task LoadProjectsAsync()
     {
+        if (!CanUseActiveWorkspace) return;
+        var session = ActiveBackendSession;
+        var revision = _backendSessionRevision;
         try
         {
-            using var response = await BackendClient.GetAsync($"{BackendBaseUrl}/projects");
+            using var response = await session.Client.GetAsync($"{session.ApiBase.AbsoluteUri.TrimEnd('/')}/projects");
             var responseBody = await response.Content.ReadAsStringAsync();
+            if (!IsCurrentBackendSession(session, revision)) return;
             if (!response.IsSuccessStatusCode)
             {
+                if (response.StatusCode == System.Net.HttpStatusCode.Forbidden)
+                {
+                    _workspaceAccessAllowed = false;
+                    ShowHistoryAccessNotice();
+                    return;
+                }
                 StatusTextBlock.Text = $"项目加载失败：{ExtractErrorMessage(responseBody)}";
                 return;
             }
@@ -569,6 +592,7 @@ public partial class MainWindow : Window
         }
         catch (Exception exc)
         {
+            if (!IsCurrentBackendSession(session, revision)) return;
             StatusTextBlock.Text = $"项目加载失败：{exc.Message}";
         }
     }
@@ -582,6 +606,7 @@ public partial class MainWindow : Window
             _selectedProjectName = null;
             _selectedCheckRunId = null;
             UpdateDeleteSelectionButtonState();
+            await LoadMemoryBaselinesAsync();
             await LoadCompletenessHistoryAsync();
             return;
         }
@@ -590,12 +615,54 @@ public partial class MainWindow : Window
         _selectedProjectName = project.Name;
         _selectedCheckRunId = null;
         UpdateDeleteSelectionButtonState();
+        await LoadMemoryBaselinesAsync();
         await LoadCompletenessHistoryAsync();
         StatusTextBlock.Text = $"已选择项目：{project.Name}。请选择报告并开始检测。";
     }
 
+    private static List<MemoryBaselineOption> DefaultMemoryBaselines() => new()
+    {
+        new("", "自动关联：同名报告最近一次检测"),
+        new("new", "作为新报告：不关联历史问题")
+    };
+
+    private async Task LoadMemoryBaselinesAsync()
+    {
+        if (_memoryBaselineCombo == null) return;
+        var projectId = _selectedProjectId;
+        var session = ActiveBackendSession;
+        var revision = _backendSessionRevision;
+        var generation = ++_memoryBaselinesGeneration;
+        var selectedId = _memoryBaselineProjectId == projectId
+            ? (_memoryBaselineCombo.SelectedItem as MemoryBaselineOption)?.Id ?? "" : "";
+        _memoryBaselineProjectId = projectId;
+        var options = DefaultMemoryBaselines();
+        _memoryBaselineCombo.ItemsSource = options;
+        _memoryBaselineCombo.SelectedIndex = 0;
+        if (string.IsNullOrWhiteSpace(projectId) || !CanUseActiveWorkspace) return;
+        try
+        {
+            using var response = await session.Client.GetAsync($"{session.ApiBase.AbsoluteUri.TrimEnd('/')}/projects/{Uri.EscapeDataString(projectId)}/review-baselines");
+            if (!response.IsSuccessStatusCode) return;
+            using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+            if (generation != _memoryBaselinesGeneration || projectId != _selectedProjectId
+                || !IsCurrentBackendSession(session, revision)) return;
+            if (document.RootElement.TryGetProperty("items", out var items) && items.ValueKind == JsonValueKind.Array)
+                foreach (var item in items.EnumerateArray())
+                    options.Add(new MemoryBaselineOption(GetString(item, "id"),
+                        $"{GetString(item, "report_name")}  |  {GetString(item, "created_at").Replace('T', ' ')}"));
+            _memoryBaselineCombo.ItemsSource = options.ToArray();
+            _memoryBaselineCombo.SelectedItem = options.FirstOrDefault(x => x.Id == selectedId) ?? options[0];
+        }
+        catch
+        {
+            // Automatic same-name matching remains available if this list cannot load.
+        }
+    }
+
     private async void OnCreateProjectClicked(object sender, RoutedEventArgs e)
     {
+        if (!RequireWorkspaceDataAccess()) return;
         var dialog = BuildProjectDialog();
         if (dialog.ShowDialog() != true)
         {
@@ -626,7 +693,7 @@ public partial class MainWindow : Window
             var responseBody = await response.Content.ReadAsStringAsync();
             if (!response.IsSuccessStatusCode)
             {
-                MessageBox.Show(this, $"创建项目失败：{ExtractErrorMessage(responseBody)}", "创建项目失败", MessageBoxButton.OK, MessageBoxImage.Warning);
+                AppMessageBox.Show(this, $"创建项目失败：{ExtractErrorMessage(responseBody)}", "创建项目失败", MessageBoxButton.OK, MessageBoxImage.Warning);
                 return;
             }
 
@@ -638,65 +705,75 @@ public partial class MainWindow : Window
         }
         catch (Exception exc)
         {
-            MessageBox.Show(this, $"创建项目失败：{exc.Message}", "创建项目失败", MessageBoxButton.OK, MessageBoxImage.Warning);
+            AppMessageBox.Show(this, $"创建项目失败：{exc.Message}", "创建项目失败", MessageBoxButton.OK, MessageBoxImage.Warning);
         }
     }
 
     private Window BuildProjectDialog()
     {
-        Window dialog = null!;
-        var nameBox = new TextBox { Margin = new Thickness(0, 6, 0, 12), Padding = new Thickness(8, 6, 8, 6) };
-        var departmentBox = new TextBox { Margin = new Thickness(0, 6, 0, 12), Padding = new Thickness(8, 6, 8, 6) };
+        var dialog = new AppDialog("新建项目", "项目用于归档同一项目下的多次报告检查。", "＋") { Owner = this };
+        var inputStyle = (Style)dialog.FindResource("DialogInput");
+        var nameBox = new TextBox { Style = inputStyle, Margin = new Thickness(0, 8, 0, 0) };
+        var departmentBox = new TextBox { Style = inputStyle, Margin = new Thickness(0, 8, 0, 18) };
         var descriptionBox = new TextBox
         {
-            Margin = new Thickness(0, 6, 0, 16),
-            Padding = new Thickness(8, 6, 8, 6),
-            Height = 72,
+            Style = inputStyle,
+            Margin = new Thickness(0, 8, 0, 0),
+            Height = 96,
             AcceptsReturn = true,
             TextWrapping = TextWrapping.Wrap,
             VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
         };
-        var panel = new StackPanel { Margin = new Thickness(22) };
-        panel.Children.Add(Text("新建项目", 20, FontWeights.Bold, FindBrush("TextBrush")));
-        panel.Children.Add(Text("项目用于归档同一项目下的多次报告检查。", 13, null, FindBrush("MutedBrush"), new Thickness(0, 6, 0, 14), true));
+        System.Windows.Automation.AutomationProperties.SetName(nameBox, "项目名称");
+        System.Windows.Automation.AutomationProperties.SetName(departmentBox, "所属部门（可选）");
+        System.Windows.Automation.AutomationProperties.SetName(descriptionBox, "项目说明（可选）");
+        var panel = new StackPanel();
         panel.Children.Add(Text("项目名称", 13, FontWeights.SemiBold, FindBrush("TextBrush")));
         panel.Children.Add(nameBox);
+        var nameError = Text("请输入项目名称。", 12, null, Brushes.Firebrick, new Thickness(0, 6, 0, 0));
+        nameError.Visibility = Visibility.Collapsed;
+        panel.Children.Add(nameError);
+        panel.Children.Add(new Border { Height = 18 });
         panel.Children.Add(Text("所属部门（可选）", 13, FontWeights.SemiBold, FindBrush("TextBrush")));
         panel.Children.Add(departmentBox);
         panel.Children.Add(Text("项目说明（可选）", 13, FontWeights.SemiBold, FindBrush("TextBrush")));
         panel.Children.Add(descriptionBox);
         var buttons = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
-        var cancelButton = Button("取消", false);
+        var cancelButton = new Button { Content = "取消", Style = (Style)dialog.FindResource("DialogSecondaryButton"), IsCancel = true };
         cancelButton.Click += (_, _) => dialog.Close();
-        var confirmButton = Button("创建项目", true);
+        var confirmButton = new Button
+        {
+            Content = "创建项目",
+            Style = (Style)dialog.FindResource("DialogPrimaryButton"),
+            Margin = new Thickness(12, 0, 0, 0),
+            IsDefault = true,
+        };
+        nameBox.TextChanged += (_, _) =>
+        {
+            if (!string.IsNullOrWhiteSpace(nameBox.Text))
+            {
+                nameError.Visibility = Visibility.Collapsed;
+            }
+        };
         confirmButton.Click += (_, _) =>
         {
             if (string.IsNullOrWhiteSpace(nameBox.Text))
             {
-                MessageBox.Show(dialog, "请输入项目名称。", "项目名称不能为空", MessageBoxButton.OK, MessageBoxImage.Warning);
+                nameError.Visibility = Visibility.Visible;
                 nameBox.Focus();
                 return;
             }
 
-            panel.Tag = new ProjectDialogValues(nameBox.Text.Trim(), departmentBox.Text.Trim(), descriptionBox.Text.Trim());
+            // The existing create handler reads the values from the window's root content.
+            dialog.DialogRoot.Tag = new ProjectDialogValues(nameBox.Text.Trim(), departmentBox.Text.Trim(), descriptionBox.Text.Trim());
             dialog.Tag = nameBox.Text.Trim();
             dialog.DialogResult = true;
         };
         buttons.Children.Add(cancelButton);
         buttons.Children.Add(confirmButton);
-        panel.Children.Add(buttons);
-
-        dialog = new Window
-        {
-            Title = "新建项目",
-            Owner = this,
-            WindowStartupLocation = WindowStartupLocation.CenterOwner,
-            SizeToContent = SizeToContent.WidthAndHeight,
-            Width = 440,
-            ResizeMode = ResizeMode.NoResize,
-            Content = panel,
-            Background = Brushes.White,
-        };
+        dialog.DialogBody.Content = panel;
+        dialog.DialogFooter.Content = buttons;
+        dialog.Loaded += (_, _) => nameBox.Focus();
         return dialog;
     }
 
@@ -709,7 +786,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        var confirm = MessageBox.Show(
+        var confirm = AppMessageBox.Show(
             this,
             $"确定删除项目“{projectName}”吗？项目下的报告检查记录和检查结果也会被删除。",
             "删除项目",
@@ -726,7 +803,7 @@ public partial class MainWindow : Window
             var responseBody = await response.Content.ReadAsStringAsync();
             if (!response.IsSuccessStatusCode)
             {
-                MessageBox.Show(this, $"删除项目失败：{ExtractErrorMessage(responseBody)}", "删除项目失败", MessageBoxButton.OK, MessageBoxImage.Warning);
+                AppMessageBox.Show(this, $"删除项目失败：{ExtractErrorMessage(responseBody)}", "删除项目失败", MessageBoxButton.OK, MessageBoxImage.Warning);
                 return;
             }
 
@@ -748,7 +825,7 @@ public partial class MainWindow : Window
         }
         catch (Exception exc)
         {
-            MessageBox.Show(this, $"删除项目失败：{exc.Message}", "删除项目失败", MessageBoxButton.OK, MessageBoxImage.Warning);
+            AppMessageBox.Show(this, $"删除项目失败：{exc.Message}", "删除项目失败", MessageBoxButton.OK, MessageBoxImage.Warning);
         }
     }
 
@@ -758,6 +835,7 @@ public partial class MainWindow : Window
         {
             report_name = Path.GetFileNameWithoutExtension(reportPath),
             source_filename = Path.GetFileName(reportPath),
+            memory_baseline_id = (_memoryBaselineCombo?.SelectedItem as MemoryBaselineOption)?.Id,
         });
         using var request = new StringContent(payload, Encoding.UTF8, "application/json");
         using var response = await BackendClient.PostAsync($"{BackendBaseUrl}/projects/{Uri.EscapeDataString(projectId)}/check-runs", request);
@@ -837,6 +915,19 @@ public partial class MainWindow : Window
         {
             refreshButton.Click += async (_, _) => await LoadRecordsAsync();
         }
+        var inboxButton = Button("服务器收件箱", true);
+        inboxButton.Margin = new Thickness(10, 0, 0, 0);
+        inboxButton.VerticalAlignment = VerticalAlignment.Center;
+        inboxButton.Click += OnOpenHistoryInbox;
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        Grid.SetColumn(inboxButton, 2);
+        header.Children.Add(inboxButton);
+        var contextButton = Button("项目背景", false);
+        contextButton.Margin = new Thickness(10, 0, 0, 0);
+        contextButton.Click += async (_, _) => await EditProjectContextAsync();
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        Grid.SetColumn(contextButton, 3);
+        header.Children.Add(contextButton);
         page.Children.Add(header);
 
         var body = new Grid { Margin = new Thickness(0, 18, 0, 0) };
@@ -1076,7 +1167,7 @@ public partial class MainWindow : Window
         testLlmButton.Click += async (_, _) => await TestLlmConnectionAsync();
         var refreshLlmModelsButton = Button("刷新模型", false);
         refreshLlmModelsButton.Click += async (_, _) => await RefreshLlmModelsAsync();
-        right.Children.Add(SettingsPanel("本机大模型 API 配置", "服务器模型由服务器管理；以下设置仅作用于本机。密钥保存到当前 Windows 用户环境变量。", new UIElement[]
+        right.Children.Add(SettingsPanel("大模型 API 配置", "配置 DeepSeek 或 OpenAI 兼容接口。密钥仅保存到当前 Windows 用户环境变量，不会在界面中显示。", new UIElement[]
         {
             SettingRow("API Key", "留空表示保留现有密钥；输入新值后点击顶部保存设置", _llmApiKeyBox),
             SettingRow("接口地址", "填写到 /v1，不要包含 /chat/completions", _llmBaseUrlBox),
@@ -1085,7 +1176,12 @@ public partial class MainWindow : Window
             ActionRow(refreshLlmModelsButton, testLlmButton),
             _llmConfigStatusTextBlock
         }, new Thickness(0, 14, 0, 0)));
-        right.Children.Add(BuildConnectionSettingsPanel());
+        right.Children.Add(SettingsPanel("服务连接", "配置客户端访问审查服务的地址和响应策略。", new UIElement[]
+        {
+            SettingRow("服务地址", "当前客户端请求入口（通过 AIASSIST_BACKEND_URL 配置）", Input(BackendBaseUrl)),
+            SettingRow("请求超时", "大文件或复杂规则审查建议使用 60 秒以上", Combo("30 秒", "60 秒", "120 秒")),
+            ActionRow(Button("测试连接", false))
+        }, new Thickness(0, 14, 0, 0)));
         right.Children.Add(SettingsPanel("安全与日志", "控制本机操作记录、脱敏和诊断信息。", new UIElement[]
         {
             SettingRow("规则变更记录", "保存规则变更人、时间和说明", Check("启用", true)),
@@ -1212,13 +1308,13 @@ public partial class MainWindow : Window
         if (string.IsNullOrWhiteSpace(baseUrl) || string.IsNullOrWhiteSpace(model)
             || _llmLoadedModelsRevision != _llmModelsRevision || !_llmModelBox.Items.Contains(model))
         {
-            MessageBox.Show(this, "请获取当前接口的可用模型，并从列表中选择模型后保存。", "保存失败", MessageBoxButton.OK, MessageBoxImage.Warning);
+            AppMessageBox.Show(this, "请获取当前接口的可用模型，并从列表中选择模型后保存。", "保存失败", MessageBoxButton.OK, MessageBoxImage.Warning);
             return;
         }
 
         if (string.IsNullOrWhiteSpace(apiKey) && !HasUserApiKey())
         {
-            MessageBox.Show(this, "请输入 API Key。", "保存失败", MessageBoxButton.OK, MessageBoxImage.Warning);
+            AppMessageBox.Show(this, "请输入 API Key。", "保存失败", MessageBoxButton.OK, MessageBoxImage.Warning);
             return;
         }
 
@@ -1255,12 +1351,12 @@ public partial class MainWindow : Window
             }
             _llmConfigStatusTextBlock!.Text = "已保存到当前 Windows 用户环境变量；请重启后端后生效。";
             StatusTextBlock.Text = "大模型配置已保存，请重启后端。";
-            MessageBox.Show(this, "大模型配置已保存。请重启后端，新的 API Key 和模型配置才会生效。", "保存成功", MessageBoxButton.OK, MessageBoxImage.Information);
+            AppMessageBox.Show(this, "大模型配置已保存。请重启后端，新的 API Key 和模型配置才会生效。", "保存成功", MessageBoxButton.OK, MessageBoxImage.Information);
         }
         catch (Exception exc)
         {
             _llmConfigStatusTextBlock!.Text = "配置保存失败。";
-            MessageBox.Show(this, $"大模型配置保存失败：{exc.Message}", "保存失败", MessageBoxButton.OK, MessageBoxImage.Warning);
+            AppMessageBox.Show(this, $"大模型配置保存失败：{exc.Message}", "保存失败", MessageBoxButton.OK, MessageBoxImage.Warning);
         }
 
         await Task.CompletedTask;
@@ -1320,6 +1416,7 @@ public partial class MainWindow : Window
 
     private async Task RefreshPriceBenchmarkStatusAsync()
     {
+        if (!CanUseActiveWorkspace) return;
         if (_priceBenchmarkStatusTextBlock == null)
         {
             return;
@@ -1346,6 +1443,7 @@ public partial class MainWindow : Window
 
     private async Task ImportPriceBenchmarksAsync()
     {
+        if (!RequireWorkspaceDataAccess()) return;
         var dialog = new OpenFileDialog
         {
             Title = "导入软硬件价格参考库",
@@ -1397,7 +1495,14 @@ public partial class MainWindow : Window
         stack.Children.Add(Text("规则目录", 18, FontWeights.Bold, FindBrush("TextBrush"), new Thickness(0, 0, 0, 6)));
         stack.Children.Add(Text("按审查场景组织，快速定位规则集。", 13, null, FindBrush("MutedBrush"), new Thickness(0, 0, 0, 14), true));
         stack.Children.Add(Text("正在读取规则库...", 13, null, FindBrush("MutedBrush"), null, true));
-        return Card(stack, new Thickness(16), new Thickness(0, 0, 14, 0));
+        var scroller = new ScrollViewer
+        {
+            Content = stack,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Visible,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+            PanningMode = PanningMode.VerticalOnly,
+        };
+        return Card(scroller, new Thickness(16), new Thickness(0, 0, 14, 0));
     }
 
     private Border BuildRuleEditor()
@@ -1406,7 +1511,14 @@ public partial class MainWindow : Window
         _rulesEditorPanel = stack;
         stack.Children.Add(Text("规则详情", 18, FontWeights.Bold, FindBrush("TextBrush"), new Thickness(0, 0, 0, 6)));
         stack.Children.Add(Text("选择左侧模块后展示真实规则，默认全选。", 13, null, FindBrush("MutedBrush"), new Thickness(0, 0, 0, 14), true));
-        return Card(stack, new Thickness(18), new Thickness(0, 0, 14, 0));
+        var scroller = new ScrollViewer
+        {
+            Content = stack,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+            PanningMode = PanningMode.VerticalOnly,
+        };
+        return Card(scroller, new Thickness(18), new Thickness(0, 0, 14, 0));
     }
 
     private Border RuleItem(string title, string count, string status, Brush accent, bool selected)
@@ -1417,7 +1529,7 @@ public partial class MainWindow : Window
         row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         row.Children.Add(new Border { Background = accent, CornerRadius = new CornerRadius(3), Margin = new Thickness(0, 2, 12, 2) });
         var copy = new StackPanel { Margin = new Thickness(12, 0, 0, 0) };
-        copy.Children.Add(Text(title, 14, FontWeights.SemiBold, FindBrush("TextBrush")));
+        copy.Children.Add(Text(title, 14, FontWeights.SemiBold, FindBrush("TextBrush"), null, true));
         copy.Children.Add(Text(count, 12, null, FindBrush("MutedBrush"), new Thickness(0, 3, 0, 0)));
         Grid.SetColumn(copy, 1);
         row.Children.Add(copy);
@@ -1682,11 +1794,31 @@ public partial class MainWindow : Window
         var isRegister = RegisterModeButton.IsChecked == true;
         RegisterFields.Visibility = isRegister ? Visibility.Visible : Visibility.Collapsed;
         EnterButton.Content = isRegister ? "注册并进入系统" : "登录并进入系统";
+        SetLoginStatus(isRegister
+            ? "账号为 3～32 位英文字母或数字，可含 _ . -；注册密码为 12～128 位。"
+            : $"登录地址：{BackendBaseUrl}");
     }
 
-    private async void OnEnterClicked(object sender, RoutedEventArgs e) => await EnterBackendAsync();
+    private async void OnEnterClicked(object sender, RoutedEventArgs e)
+    {
+        await AuthenticateWorkspaceAsync();
+    }
 
-    private async void OnLogoutClicked(object sender, RoutedEventArgs e) => await LogoutBackendAsync();
+    private async void OnLogoutClicked(object sender, RoutedEventArgs e)
+    {
+        if (!ActiveBackendSession.IsAuthenticated)
+        {
+            LoginPage.Visibility = Visibility.Visible;
+            WorkbenchPage.Visibility = Visibility.Collapsed;
+            return;
+        }
+        await LogoutWorkspaceAsync();
+    }
+
+    private void OnContinueWithoutLoginClicked(object sender, RoutedEventArgs e)
+    {
+        EnterWorkspaceWithoutLogin();
+    }
 
     private void OnChooseFileClicked(object sender, RoutedEventArgs e)
     {
@@ -1728,6 +1860,7 @@ public partial class MainWindow : Window
 
     private async void OnStartCheckClicked(object sender, RoutedEventArgs e)
     {
+        if (!RequireWorkspaceDataAccess()) return;
         if (_isChecking)
         {
             return;
@@ -1735,20 +1868,20 @@ public partial class MainWindow : Window
 
         if (ReportPathTextBlock.Text == "尚未选择可研报告")
         {
-            MessageBox.Show(this, "请先选择可研报告文件。", "缺少报告", MessageBoxButton.OK, MessageBoxImage.Warning);
+            AppMessageBox.Show(this, "请先选择可研报告文件。", "缺少报告", MessageBoxButton.OK, MessageBoxImage.Warning);
             return;
         }
 
         if (string.IsNullOrWhiteSpace(_selectedProjectId))
         {
-            MessageBox.Show(this, "请先选择所属项目，或新建一个项目。", "缺少项目", MessageBoxButton.OK, MessageBoxImage.Warning);
+            AppMessageBox.Show(this, "请先选择所属项目，或新建一个项目。", "缺少项目", MessageBoxButton.OK, MessageBoxImage.Warning);
             return;
         }
 
         var reportPath = ReportPathTextBlock.Text;
         if (!File.Exists(reportPath))
         {
-            MessageBox.Show(this, "选择的报告文件不存在，请重新选择。", "文件不存在", MessageBoxButton.OK, MessageBoxImage.Warning);
+            AppMessageBox.Show(this, "选择的报告文件不存在，请重新选择。", "文件不存在", MessageBoxButton.OK, MessageBoxImage.Warning);
             return;
         }
 
@@ -1760,14 +1893,14 @@ public partial class MainWindow : Window
             .ToList();
         if (selectedItems.Count == 0)
         {
-            MessageBox.Show(this, "请至少选择一个检测项。", "缺少检测项", MessageBoxButton.OK, MessageBoxImage.Warning);
+            AppMessageBox.Show(this, "请至少选择一个检测项。", "缺少检测项", MessageBoxButton.OK, MessageBoxImage.Warning);
             return;
         }
 
         var runnableItems = selectedItems.Where(item => IsRunnableModule(item.ModuleCode)).ToList();
         if (runnableItems.Count == 0)
         {
-            MessageBox.Show(this, "请选择已接入后端的检测项后重试。", "暂无可执行检测项", MessageBoxButton.OK, MessageBoxImage.Information);
+            AppMessageBox.Show(this, "请选择已接入后端的检测项后重试。", "暂无可执行检测项", MessageBoxButton.OK, MessageBoxImage.Information);
             return;
         }
 
@@ -1780,6 +1913,7 @@ public partial class MainWindow : Window
         try
         {
             _isChecking = true;
+            if (_memoryBaselineCombo != null) _memoryBaselineCombo.IsEnabled = false;
             if (startButton != null)
             {
                 startButton.IsEnabled = false;
@@ -1790,7 +1924,7 @@ public partial class MainWindow : Window
             if (!await IsBackendAvailableAsync())
             {
                 StatusTextBlock.Text = "后端服务未启动。";
-                MessageBox.Show(this, $"无法连接后端：{BackendBaseUrl}。请检查网络，或在工作台左侧切换检测后端。", "后端不可达", MessageBoxButton.OK, MessageBoxImage.Warning);
+                AppMessageBox.Show(this, "无法连接后端服务，请先启动目标项目后端：run_backend.bat（端口 8000）", "后端未启动", MessageBoxButton.OK, MessageBoxImage.Warning);
                 return;
             }
 
@@ -1815,6 +1949,8 @@ public partial class MainWindow : Window
 
             var checkRunId = await CreateCheckRunAsync(projectId, reportPath);
             _selectedCheckRunId = checkRunId;
+            // The chosen baseline applies to this run; later uploads follow its latest revision.
+            if (_memoryBaselineCombo != null) _memoryBaselineCombo.SelectedIndex = 0;
 
             var taskItems = runnableItems.ToList();
             var duplicateItem = taskItems.FirstOrDefault(item => item.ModuleCode == "duplicate");
@@ -1852,7 +1988,7 @@ public partial class MainWindow : Window
                 StatusTextBlock.Text = "正在创建后台检测任务...";
                 var taskId = await CreateEvaluateTaskAsync(taskItems, reportPath, projectId, checkRunId);
                 AddResultNotice("检测任务已创建，正在后台审查……");
-                await PollEvaluateTaskAsync(taskId, projectId);
+                await PollEvaluateTaskAsync(taskId);
             }
             else if (duplicateItem != null && duplicateHistoryFiles.Count > 0)
             {
@@ -1877,6 +2013,7 @@ public partial class MainWindow : Window
         finally
         {
             _isChecking = false;
+            if (_memoryBaselineCombo != null) _memoryBaselineCombo.IsEnabled = true;
             if (startButton != null)
             {
                 startButton.IsEnabled = true;
@@ -1931,12 +2068,7 @@ public partial class MainWindow : Window
 
     private List<string>? AskDuplicateHistoryFiles()
     {
-        var answer = MessageBox.Show(
-            this,
-            "本次重复建设检查是否有对应的往期可研报告、历史批复报告或历史功能点清单需要一起比对？",
-            "重复建设检查",
-            MessageBoxButton.YesNoCancel,
-            MessageBoxImage.Question);
+        var answer = ShowDuplicateHistoryDialog();
 
         if (answer == MessageBoxResult.Cancel)
         {
@@ -1957,7 +2089,7 @@ public partial class MainWindow : Window
 
         if (dialog.ShowDialog(this) != true || dialog.FileNames.Length == 0)
         {
-            MessageBox.Show(this, "未选择往期文件，本次取消重复建设检查。", "缺少往期文件", MessageBoxButton.OK, MessageBoxImage.Information);
+            AppMessageBox.Show(this, "未选择往期文件，本次取消重复建设检查。", "缺少往期文件", MessageBoxButton.OK, MessageBoxImage.Information);
             return null;
         }
 
@@ -2042,6 +2174,9 @@ public partial class MainWindow : Window
 
     private async Task LoadRulesForModuleAsync(string moduleCode)
     {
+        if (!CanUseActiveWorkspace) return;
+        var session = ActiveBackendSession;
+        var revision = _backendSessionRevision;
         if (!HasBackendRuleApi(moduleCode))
         {
             return;
@@ -2054,18 +2189,21 @@ public partial class MainWindow : Window
 
         try
         {
-            using var response = await BackendClient.GetAsync($"{BackendBaseUrl}/evaluate/rules?module={moduleCode}");
+            using var response = await session.Client.GetAsync($"{session.ApiBase.AbsoluteUri.TrimEnd('/')}/evaluate/rules?module={moduleCode}");
+            var responseBody = await response.Content.ReadAsStringAsync();
+            if (!IsCurrentBackendSession(session, revision)) return;
             if (!response.IsSuccessStatusCode)
             {
-                AddRuleLoadError(moduleCode, await response.Content.ReadAsStringAsync());
+                AddRuleLoadError(moduleCode, responseBody);
                 return;
             }
 
-            using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+            using var document = JsonDocument.Parse(responseBody);
             AddRuleSection(document.RootElement);
         }
         catch (Exception exc)
         {
+            if (!IsCurrentBackendSession(session, revision)) return;
             AddRuleLoadError(moduleCode, exc.Message);
         }
     }
@@ -2170,6 +2308,13 @@ public partial class MainWindow : Window
 
     private async Task LoadRecordsAsync()
     {
+        if (!CanUseActiveWorkspace)
+        {
+            ShowHistoryAccessNotice();
+            return;
+        }
+        var session = ActiveBackendSession;
+        var revision = _backendSessionRevision;
         if (_projectTreePanel == null)
         {
             return;
@@ -2187,8 +2332,9 @@ public partial class MainWindow : Window
 
         try
         {
-            using var response = await BackendClient.GetAsync($"{BackendBaseUrl}/projects/tree");
+            using var response = await session.Client.GetAsync($"{session.ApiBase.AbsoluteUri.TrimEnd('/')}/projects/tree");
             var responseBody = await response.Content.ReadAsStringAsync();
+            if (!IsCurrentBackendSession(session, revision)) return;
             if (!response.IsSuccessStatusCode)
             {
                 _projectTreePanel.Children.Clear();
@@ -2199,9 +2345,11 @@ public partial class MainWindow : Window
             using var document = JsonDocument.Parse(responseBody);
             _projectTreeRoot = document.RootElement.Clone();
             RenderProjectTree(document.RootElement);
+            await LoadMemoryBaselinesAsync();
         }
         catch (Exception exc)
         {
+            if (!IsCurrentBackendSession(session, revision)) return;
             _projectTreePanel.Children.Clear();
             _projectTreePanel.Children.Add(Text($"加载失败：{exc.Message}", 13, null, Brush(180, 35, 24), null, true));
         }
@@ -2369,16 +2517,7 @@ public partial class MainWindow : Window
             var content = new StackPanel();
             content.Children.Add(Text(moduleTitle, 12, FontWeights.SemiBold, FindBrush("TextBrush"), null, true));
             var failed = string.Equals(result.Status, "failed", StringComparison.OrdinalIgnoreCase);
-            var visibleCount = result.Module == "function_correspondence"
-                && _functionFindingSelections.TryGetValue(result.Id, out var selection)
-                    ? selection.Indices.Length
-                    : result.FindingsCount;
-            var countText = result.Module == "function_correspondence"
-                && result.FindingsCount >= 50
-                && !_functionFindingSelections.ContainsKey(result.Id)
-                    ? "待加载"
-                    : visibleCount.ToString(CultureInfo.InvariantCulture);
-            content.Children.Add(Text(failed ? "检查未完成 · 问题数未确定" : $"{FirstNonEmpty(result.Status, "已完成")} · 问题：{countText}", 11, null, failed ? Brush(185, 28, 28) : Brush(2, 122, 72), new Thickness(0, 3, 0, 0), true));
+            content.Children.Add(Text(failed ? "检查未完成 · 问题数未确定" : $"{FirstNonEmpty(result.Status, "已完成")} · 问题：{result.FindingsCount}", 11, null, failed ? Brush(185, 28, 28) : Brush(2, 122, 72), new Thickness(0, 3, 0, 0), true));
             var button = new Button
             {
                 Content = content,
@@ -2411,7 +2550,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        var confirm = MessageBox.Show(
+        var confirm = AppMessageBox.Show(
             this,
             runId.StartsWith("legacy:", StringComparison.OrdinalIgnoreCase)
                 ? $"确定删除历史检查记录“{runName}”吗？该记录组下的结果都会删除，项目和其他检查不受影响。"
@@ -2431,7 +2570,7 @@ public partial class MainWindow : Window
             var responseBody = await response.Content.ReadAsStringAsync();
             if (!response.IsSuccessStatusCode)
             {
-                MessageBox.Show(this, $"删除本次检查失败：{ExtractErrorMessage(responseBody)}", "删除失败", MessageBoxButton.OK, MessageBoxImage.Warning);
+                AppMessageBox.Show(this, $"删除本次检查失败：{ExtractErrorMessage(responseBody)}", "删除失败", MessageBoxButton.OK, MessageBoxImage.Warning);
                 return;
             }
 
@@ -2450,7 +2589,7 @@ public partial class MainWindow : Window
         }
         catch (Exception exc)
         {
-            MessageBox.Show(this, $"删除本次检查失败：{exc.Message}", "删除失败", MessageBoxButton.OK, MessageBoxImage.Warning);
+            AppMessageBox.Show(this, $"删除本次检查失败：{exc.Message}", "删除失败", MessageBoxButton.OK, MessageBoxImage.Warning);
         }
     }
 
@@ -2566,6 +2705,11 @@ public partial class MainWindow : Window
 
     private async Task LoadRecordDetailAsync(string resultId)
     {
+        if (!CanUseActiveWorkspace) return;
+        var session = ActiveBackendSession;
+        var revision = _backendSessionRevision;
+        var detailGeneration = ++_recordDetailGeneration;
+        ResetProjectMemoryWorkspace();
         if (_recordDetailPanel == null)
         {
             return;
@@ -2576,8 +2720,9 @@ public partial class MainWindow : Window
 
         try
         {
-            using var response = await BackendClient.GetAsync($"{BackendBaseUrl}/evaluate/results/{resultId}");
+            using var response = await session.Client.GetAsync($"{session.ApiBase.AbsoluteUri.TrimEnd('/')}/evaluate/results/{resultId}");
             var responseBody = await response.Content.ReadAsStringAsync();
+            if (!IsCurrentBackendSession(session, revision) || detailGeneration != _recordDetailGeneration) return;
             if (!response.IsSuccessStatusCode)
             {
                 _recordDetailPanel.Children.Clear();
@@ -2592,6 +2737,7 @@ public partial class MainWindow : Window
         }
         catch (Exception exc)
         {
+            if (!IsCurrentBackendSession(session, revision) || detailGeneration != _recordDetailGeneration) return;
             _recordDetailPanel.Children.Clear();
             _recordDetailPanel.Children.Add(Text($"加载失败：{exc.Message}", 13, null, Brush(180, 35, 24), null, true));
         }
@@ -2620,18 +2766,19 @@ public partial class MainWindow : Window
         {
             count = GetInt(ruleResultsSummary, "total_findings");
         }
-        if (module == "function_correspondence"
-            && resultRoot.TryGetProperty("summary", out var functionSummary)
-            && functionSummary.ValueKind == JsonValueKind.Object)
-        {
-            count = Math.Max(count, GetInt(functionSummary, "merged_findings_count"));
-        }
-        if (module == "function_correspondence")
-        {
-            count = SelectFunctionFindingsForDisplay(resultRoot, GetFunctionFindingCandidates(resultRoot), id, out _).Count;
-        }
-
-        _recordDetailPanel.Children.Add(Text(projectName, 18, FontWeights.Bold, FindBrush("TextBrush"), null, true));
+        var titleRow = new Grid { Margin = new Thickness(0, 0, 0, 2) };
+        titleRow.ColumnDefinitions.Add(new ColumnDefinition());
+        titleRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        titleRow.Children.Add(Text(projectName, 18, FontWeights.Bold, FindBrush("TextBrush"), null, true));
+        var exportButton = Button("导出报告", false);
+        exportButton.Padding = new Thickness(10, 6, 10, 6);
+        exportButton.Margin = new Thickness(12, 0, 0, 0);
+        exportButton.ToolTip = "导出本次检测的完整审查报告";
+        exportButton.IsEnabled = !string.IsNullOrWhiteSpace(id);
+        exportButton.Click += async (_, _) => await ExportRecordAsync(id, projectName);
+        Grid.SetColumn(exportButton, 1);
+        titleRow.Children.Add(exportButton);
+        _recordDetailPanel.Children.Add(titleRow);
         _recordDetailPanel.Children.Add(Text($"检查模块：{moduleName}", 13, FontWeights.SemiBold, FindBrush("TextBrush"), new Thickness(0, 6, 0, 0), true));
         var failed = string.Equals(GetString(resultRoot, "status"), "failed", StringComparison.OrdinalIgnoreCase);
         _recordDetailPanel.Children.Add(Text(failed ? "检查未完成｜问题数量：未确定" : $"风险等级：{risk}｜问题数量：{count}", 13, null, FindBrush("MutedBrush"), new Thickness(0, 4, 0, 8), true));
@@ -2645,34 +2792,28 @@ public partial class MainWindow : Window
             }
         }
 
+        AddOriginalFileDownloads(root);
+        RenderIssueMemory(_recordDetailPanel, resultRoot);
+        AddProjectMemoryPanel(_recordDetailPanel, id);
         RenderResultNotices(_recordDetailPanel, resultRoot);
 
-        if (module == "duplicate" && TryRenderDuplicateFindings(_recordDetailPanel, resultRoot))
+        if (failed)
+        {
+            _recordDetailPanel.Children.Add(Text("本次检查执行失败，尚未形成有效结论；请修复后重新检测。", 13, null, Brush(185, 28, 28), null, true));
+        }
+        else if (module == "duplicate" && TryRenderDuplicateFindings(_recordDetailPanel, resultRoot))
         {
             // 重复建设结果按内部重复和跨报告重复分组展示。
         }
-        else if (TryRenderMergedRuleFindings(_recordDetailPanel, resultRoot, module, id))
+        else if (TryRenderMergedRuleFindings(_recordDetailPanel, resultRoot, module))
         {
             // 已合并展示小规则 findings，不再重复渲染顶层 findings。
         }
         else if (resultRoot.TryGetProperty("findings", out var findings) && findings.ValueKind == JsonValueKind.Array && findings.GetArrayLength() > 0)
         {
-            if (module == "function_correspondence")
+            foreach (var finding in findings.EnumerateArray())
             {
-                var displayed = SelectFunctionFindingsForDisplay(resultRoot, findings.EnumerateArray().ToList(), id, out _);
-                foreach (var finding in displayed)
-                {
-                    _recordDetailPanel.Children.Add(BuildFunctionFindingCard(finding));
-                }
-            }
-            else
-            {
-                foreach (var finding in findings.EnumerateArray())
-                {
-                    _recordDetailPanel.Children.Add(module == "sensitive_word"
-                        ? BuildSensitiveFindingCard(finding)
-                        : BuildFunctionFindingCard(finding));
-                }
+                _recordDetailPanel.Children.Add(module == "sensitive_word" ? BuildSensitiveFindingCard(finding) : BuildFunctionFindingCard(finding));
             }
         }
         else
@@ -2688,6 +2829,122 @@ public partial class MainWindow : Window
             Content = BuildTechnicalJsonViewer(root)
         };
         _recordDetailPanel.Children.Add(expander);
+    }
+
+    private void RenderIssueMemory(Panel target, JsonElement result)
+    {
+        if (!result.TryGetProperty("issue_memory", out var memory) || memory.ValueKind != JsonValueKind.Object) return;
+        var panel = new StackPanel();
+        panel.Children.Add(Text("修订进展与问题跟踪", 15, FontWeights.SemiBold, FindBrush("TextBrush"), null, true));
+        panel.Children.Add(Text(GetString(memory, "message"), 12, null, FindBrush("MutedBrush"), new Thickness(0, 5, 0, 8), true));
+        RenderRevisionReviews(panel, memory);
+        if (GetString(memory, "status") != "unavailable")
+        {
+            var baseline = GetBool(memory, "has_baseline");
+            var summary = baseline
+                ? $"上次未解决 {GetInt(memory, "baseline_open_count")} 项  ·  本次确认解决 {GetInt(memory, "resolved_count")} 项\n"
+                    + $"仍存在 {GetInt(memory, "persistent_count")} 项  ·  内容变化 {GetInt(memory, "changed_count")} 项  ·  再次出现 {GetInt(memory, "reopened_count")} 项\n"
+                    + $"本次首次发现 {GetInt(memory, "new_count")} 项  ·  待确认 {GetInt(memory, "unconfirmed_count")} 项"
+                : $"首次记录问题 {GetInt(memory, "new_count")} 项，后续修订将逐项跟踪。";
+            if (memory.TryGetProperty("progress", out var progress) && progress.ValueKind == JsonValueKind.Object)
+            {
+                summary = $"上次待处理 {GetInt(progress, "baseline_open_count")} 项  ·  本轮确认整改 {GetInt(progress, "resolved_this_revision")} 项\n"
+                    + $"当前待处理 {GetInt(progress, "remaining_open_count")} 项  ·  本次首次发现 {GetInt(progress, "new_count")} 项  ·  待确认 {GetInt(progress, "unconfirmed_count")} 项";
+                AddTextIf(panel, "统计说明", GetString(progress, "message"), FindBrush("MutedBrush"));
+                if (!GetBool(progress, "source_read_complete"))
+                    AddTextIf(panel, "本次读取范围", FirstNonEmpty(GetString(progress, "source_limitation"), "部分原文未完整读取，未核实的问题保留待确认状态。"), Brush(181, 71, 8));
+            }
+            panel.Children.Add(Text(summary, 13, FontWeights.SemiBold, FindBrush("TextBrush"), null, true));
+            if (GetBool(memory, "same_file"))
+                panel.Children.Add(Text("本次上传文件与对照版本相同，仍执行完整检测并保留历史问题状态。", 12, null,
+                    FindBrush("MutedBrush"), new Thickness(0, 7, 0, 0), true));
+            if (GetInt(memory, "unconfirmed_count") > 0)
+                panel.Children.Add(Text("“待确认”表示缺少充分的解决证据或本次未完成核验，不等同于已解决。", 12,
+                    null, Brush(181, 71, 8), new Thickness(0, 7, 0, 0), true));
+            if (memory.TryGetProperty("historical_items", out var history) && history.ValueKind == JsonValueKind.Array)
+            {
+                var historyPanel = new StackPanel();
+                foreach (var item in history.EnumerateArray())
+                {
+                    if (!item.TryGetProperty("finding", out var old) || old.ValueKind != JsonValueKind.Object) continue;
+                    var block = new StackPanel { Margin = new Thickness(0, 7, 0, 7) };
+                    block.Children.Add(Text($"{GetString(item, "label")}：{FirstNonEmpty(GetString(old, "display_title"), GetString(old, "title"), GetString(old, "issue_type"), GetString(old, "rule_name"), "历史问题")}",
+                        13, FontWeights.SemiBold, FindBrush("TextBrush"), null, true));
+                    block.Children.Add(Text(GetString(item, "reason"), 12, null, FindBrush("MutedBrush"), null, true));
+                    AddTextIf(block, "上次意见", FirstNonEmpty(GetString(old, "review_opinion"), GetString(old, "reason")), FindBrush("MutedBrush"));
+                    var previousId = FirstNonEmpty(GetString(item, "last_seen_result_id"), GetString(item, "previous_result_id"));
+                    if (!string.IsNullOrWhiteSpace(previousId))
+                    {
+                        var button = Button("查看对应历史记录", false);
+                        button.HorizontalAlignment = HorizontalAlignment.Left;
+                        button.Margin = new Thickness(0, 5, 0, 0);
+                        button.Click += async (_, _) => await LoadRecordDetailAsync(previousId);
+                        block.Children.Add(button);
+                    }
+                    historyPanel.Children.Add(block);
+                }
+                if (historyPanel.Children.Count > 0)
+                    panel.Children.Add(new Expander { Header = "查看已解决与待确认的历史问题", Content = historyPanel,
+                        Margin = new Thickness(0, 9, 0, 0) });
+            }
+            if (result.TryGetProperty("memory_findings", out var all) && all.ValueKind == JsonValueKind.Array
+                && result.TryGetProperty("findings", out var visible) && visible.ValueKind == JsonValueKind.Array
+                && all.GetArrayLength() > visible.GetArrayLength())
+            {
+                var extraPanel = new StackPanel();
+                foreach (var finding in all.EnumerateArray().Skip(visible.GetArrayLength()))
+                    extraPanel.Children.Add(BuildBusinessFindingCard(finding));
+                panel.Children.Add(new Expander { Header = $"查看其余 {all.GetArrayLength() - visible.GetArrayLength()} 项问题（均参与历史跟踪）",
+                    Content = extraPanel, Margin = new Thickness(0, 9, 0, 0) });
+            }
+        }
+        target.Children.Add(new Border { Background = Brush(239, 246, 255), BorderBrush = Brush(191, 219, 254),
+            BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), Padding = new Thickness(12),
+            Margin = new Thickness(0, 4, 0, 14), Child = panel });
+    }
+
+    private async Task ExportRecordAsync(string resultId, string reportName)
+    {
+        if (!RequireWorkspaceDataAccess()) return;
+        var session = ActiveBackendSession;
+        var revision = _backendSessionRevision;
+        if (string.IsNullOrWhiteSpace(resultId))
+        {
+            AppMessageBox.Show(this, "当前没有可导出的审查记录。", "无法导出", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        try
+        {
+            using var response = await session.Client.GetAsync(session.ResolveApiUri($"evaluate/results/{Uri.EscapeDataString(resultId)}/export"));
+            var reportBytes = await response.Content.ReadAsByteArrayAsync();
+            if (!response.IsSuccessStatusCode)
+            {
+                var errorText = Encoding.UTF8.GetString(reportBytes);
+                AppMessageBox.Show(this, $"导出失败：{ExtractErrorMessage(errorText)}", "导出失败", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
+            if (!IsCurrentBackendSession(session, revision)) return;
+            var safeName = string.Join("_", reportName.Split(Path.GetInvalidFileNameChars(), StringSplitOptions.RemoveEmptyEntries)).Trim();
+            if (string.IsNullOrWhiteSpace(safeName)) safeName = "审查报告";
+            var dialog = new Microsoft.Win32.SaveFileDialog
+            {
+                Title = "导出审查报告",
+                Filter = "HTML审查报告 (*.html)|*.html|所有文件 (*.*)|*.*",
+                DefaultExt = ".html",
+                AddExtension = true,
+                FileName = $"{safeName}_{DateTime.Now:yyyyMMdd_HHmmss}.html",
+                OverwritePrompt = true
+            };
+            if (dialog.ShowDialog(this) != true) return;
+            await File.WriteAllBytesAsync(dialog.FileName, reportBytes);
+            StatusTextBlock.Text = $"审查报告已导出：{Path.GetFileName(dialog.FileName)}";
+        }
+        catch (Exception exc)
+        {
+            AppMessageBox.Show(this, $"导出失败：{exc.Message}", "导出失败", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
     }
 
     private async Task LoadDocumentPreviewAsync(JsonElement root)
@@ -2775,15 +3032,18 @@ public partial class MainWindow : Window
                     usesPrecisePreview = true;
                     if (_documentLocationTextBlock != null)
                         _documentLocationTextBlock.Text = "正在加载报告原文，可点击子问题等待定位…";
-                    var url = RuleEvidencePreviewUrl(_activePreviewUrl, GetString(preciseFinding, "rule_id"));
+                    var url = RuleEvidencePreviewUrl(_activePreviewUrl, UsesSensitiveWordEvidence(preciseFinding)
+                        ? "SENSITIVE_WORD_SOURCE" : GetString(preciseFinding, "rule_id"));
                     if (await EnsureEvidencePreviewAsync(url, generation) && _documentLocationTextBlock != null)
-                        _documentLocationTextBlock.Text = "报告原文已加载，点击子问题即可定位对应位置。";
+                        _documentLocationTextBlock.Text = findings.EnumerateArray().All(IsResourceMaterialMissing)
+                            ? "报告原文已加载。" + ResourceMissingLocationExplanation
+                            : "报告原文已加载，点击子问题即可定位对应位置。";
                     return;
                 }
             }
-            await _documentWebView.EnsureCoreWebView2Async();
+            await EnsureAuthenticatedPreviewAsync();
             if (generation != _preciseEvidenceGeneration) return;
-            NavigateAuthenticatedPreview(new Uri(_activePreviewUrl));
+            _documentWebView.Source = new Uri(_activePreviewUrl);
         }
         catch (Exception exc)
         {
@@ -2800,6 +3060,19 @@ public partial class MainWindow : Window
 
     private async Task NavigateToFindingAsync(JsonElement finding, string? preferredRole = null)
     {
+        if (UsesSensitiveWordEvidence(finding))
+        {
+            var sources = ReportEvidenceSources(finding);
+            await NavigateToRuleEvidenceAsync(finding, sources.Count > 0 ? sources[0] : null);
+            return;
+        }
+        if (IsResourceMaterialMissing(finding))
+        {
+            ++_preciseEvidenceGeneration;
+            if (_documentLocationTextBlock != null)
+                _documentLocationTextBlock.Text = ResourceMissingLocationExplanation;
+            return;
+        }
         if (UsesCompactReportEvidence(finding))
         {
             await NavigateToRuleEvidenceAsync(finding);
@@ -2870,7 +3143,7 @@ public partial class MainWindow : Window
 
         try
         {
-            await _documentWebView.EnsureCoreWebView2Async();
+            await EnsureAuthenticatedPreviewAsync();
             if (!string.IsNullOrWhiteSpace(requestedRole)
                 && _previewUrlsByRole.TryGetValue(requestedRole, out var requestedUrl)
                 && !string.Equals(_activePreviewUrl, requestedUrl, StringComparison.OrdinalIgnoreCase))
@@ -2887,7 +3160,7 @@ public partial class MainWindow : Window
                     + $"&paragraph={paragraph}&line={line}"
                     + $"&section={Uri.EscapeDataString(section.Length > 120 ? section[..120] : section)}"
             };
-            NavigateAuthenticatedPreview(locationUrl.Uri);
+            _documentWebView.Source = locationUrl.Uri;
             if (_documentLocationTextBlock != null)
             {
                 _documentLocationTextBlock.Text = "正在加载对应原文位置...";
@@ -2906,11 +3179,17 @@ public partial class MainWindow : Window
     {
         if (_documentWebView == null || !UsesCompactReportEvidence(finding)) return;
         var generation = ++_preciseEvidenceGeneration;
+        if (!evidence.HasValue && IsResourceMaterialMissing(finding))
+        {
+            if (_documentLocationTextBlock != null)
+                _documentLocationTextBlock.Text = ResourceMissingLocationExplanation;
+            return;
+        }
         // Do not await script execution in the page being replaced: WebView2 can
         // queue that script until a slow, obsolete navigation has completed.
         if (_documentLocationTextBlock != null)
             _documentLocationTextBlock.Text = "正在定位本处原文；首次加载较大报告可能需要一些时间…";
-        var ruleId = GetString(finding, "rule_id");
+        var ruleId = UsesSensitiveWordEvidence(finding) ? "SENSITIVE_WORD_SOURCE" : GetString(finding, "rule_id");
         var sources = ReportEvidenceSources(finding);
         if (!evidence.HasValue)
         {
@@ -2964,6 +3243,8 @@ public partial class MainWindow : Window
                 _documentLocationTextBlock.Text = status switch
                 {
                     "matched" => "已按原文坐标定位并高亮，摘录核对一致。",
+                    "word_matched" => "已定位并高亮本处敏感词，原文核对一致。",
+                    "word_mismatch" => "本处词语与保存的命中记录不一致，请重新检测原报告。",
                     "scope" => "已定位核查范围；这里的文字本身不一定有错误。",
                     "candidate" => "已显示你选择的候选位置，请结合章节确认。",
                     "text_match" => "已在指定章节找到唯一相同摘录，尚非坐标精确定位。",
@@ -2987,15 +3268,17 @@ public partial class MainWindow : Window
     {
         // One coordinate preview per saved file/module serves all five rules.
         // The endpoint still validates that the rule belongs to this record.
-        var previewRule = ruleId is "R15_SECURITY_PAAS_CRYPTO_QUANTITY" or "R16_SERVER_OS_QUANTITY"
-            or "R16_DB_SERVER_DATABASE_QUANTITY" ? "R15_SECURITY_PAAS_CRYPTO_QUANTITY" : "DATA_REASON_001";
+        var previewRule = ruleId == "SENSITIVE_WORD_SOURCE" ? "SENSITIVE_WORD_SOURCE"
+            : ruleId is "R15_SECURITY_PAAS_CRYPTO_QUANTITY" or "R16_SERVER_OS_QUANTITY"
+            or "R16_DB_SERVER_DATABASE_QUANTITY" ? "R15_SECURITY_PAAS_CRYPTO_QUANTITY"
+            : ruleId is "BASIS_007" or "BASIS_009" or "BASIS_012" or "BASIS_014" ? "BASIS_007" : "DATA_REASON_001";
         return defaultUrl + (defaultUrl.Contains('?') ? "&" : "?") + "precision_rule=" + previewRule;
     }
 
     private async Task<bool> EnsureEvidencePreviewAsync(string url, int generation)
     {
         if (_documentWebView == null) return false;
-        await _documentWebView.EnsureCoreWebView2Async();
+        await EnsureAuthenticatedPreviewAsync();
         if (generation != _preciseEvidenceGeneration) return false;
         // Rapid clicks share the pending navigation. Only the latest click may
         // apply its highlight after the document becomes ready.
@@ -3058,7 +3341,7 @@ public partial class MainWindow : Window
         try
         {
             // Navigate explicitly: clicking another excerpt must not depend on an arbitrary delay.
-            NavigateAuthenticatedPreview(destination);
+            core.Navigate(url);
             if (!await loaded.Task.WaitAsync(TimeSpan.FromSeconds(90))) return false;
             var ready = await _documentWebView.ExecuteScriptAsync(url.Contains("precision_rule=", StringComparison.Ordinal)
                 ? "!!window.ruleEvidenceReady && typeof window.locateRuleEvidence === 'function'"
@@ -3099,14 +3382,16 @@ public partial class MainWindow : Window
 
     private async Task ShowPreviewPlaceholderAsync(string message)
     {
+        var generation = _preciseEvidenceGeneration;
         if (_documentWebView == null)
         {
             return;
         }
         try
         {
-            await _documentWebView.EnsureCoreWebView2Async();
+            await EnsureAuthenticatedPreviewAsync();
             var encoded = System.Net.WebUtility.HtmlEncode(message);
+            if (generation != _preciseEvidenceGeneration) return;
             _documentWebView.NavigateToString($"<!doctype html><html><body style='margin:0;background:#eef2f7;font-family:Microsoft YaHei,Segoe UI,sans-serif;color:#64748b;display:grid;place-items:center;height:100vh'><div style='padding:28px;text-align:center'>{encoded}</div></body></html>");
         }
         catch
@@ -3119,10 +3404,9 @@ public partial class MainWindow : Window
     {
         if (Uri.TryCreate(path, UriKind.Absolute, out var absolute))
         {
-            if (!BackendConnection.IsApiUrl(absolute)) throw new InvalidOperationException("原文地址不属于当前后端。");
             return absolute.ToString();
         }
-        return new Uri(new Uri(BackendBaseUrl + "/"), path).ToString();
+        return new Uri(new Uri(BackendBaseUrl), path).ToString();
     }
 
     private UIElement BuildTechnicalJsonViewer(JsonElement root)
@@ -3204,7 +3488,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        var confirm = MessageBox.Show(
+        var confirm = AppMessageBox.Show(
             this,
             "确定删除这条审查记录吗？此操作不会删除原始报告文件。",
             "删除审查记录",
@@ -3221,7 +3505,7 @@ public partial class MainWindow : Window
             var responseBody = await response.Content.ReadAsStringAsync();
             if (!response.IsSuccessStatusCode)
             {
-                MessageBox.Show(this, $"删除失败：{ExtractErrorMessage(responseBody)}", "删除失败", MessageBoxButton.OK, MessageBoxImage.Warning);
+                AppMessageBox.Show(this, $"删除失败：{ExtractErrorMessage(responseBody)}", "删除失败", MessageBoxButton.OK, MessageBoxImage.Warning);
                 return;
             }
 
@@ -3235,7 +3519,7 @@ public partial class MainWindow : Window
         }
         catch (Exception exc)
         {
-            MessageBox.Show(this, $"删除失败：{exc.Message}", "删除失败", MessageBoxButton.OK, MessageBoxImage.Warning);
+            AppMessageBox.Show(this, $"删除失败：{exc.Message}", "删除失败", MessageBoxButton.OK, MessageBoxImage.Warning);
         }
     }
 
@@ -3418,7 +3702,7 @@ public partial class MainWindow : Window
         return taskId;
     }
 
-    private async Task PollEvaluateTaskAsync(string taskId, string projectId)
+    private async Task PollEvaluateTaskAsync(string taskId)
     {
         for (var attempt = 0; attempt < 1800; attempt++)
         {
@@ -3445,15 +3729,12 @@ public partial class MainWindow : Window
 
             if (IsCompletedTaskStatus(status) || HasResultIds(root))
             {
-                await PrimeFunctionFindingSelectionsAsync(root, projectId);
                 await LoadRecordsAsync();
-                var notice = status == "completed" ? "检测完成，请在“审查记录”查看结果。" : $"任务{TaskStatusText(status)}：{FirstNonEmpty(GetString(root, "error"), message)}，请核对各模块结果。";
-                StatusTextBlock.Text = notice;
-                AddResultNotice(notice);
+                StatusTextBlock.Text = "检测完成，请在“审查记录”查看结果。";
+                AddResultNotice("检测完成，请在“审查记录”查看企业可读审查意见。");
                 return;
             }
 
-            await LoadRecordsAsync();
             var error = GetString(root, "error");
             StatusTextBlock.Text = "检测失败。";
             AddResultNotice($"检测失败：{FirstNonEmpty(error, message)}");
@@ -3469,7 +3750,7 @@ public partial class MainWindow : Window
         "queued" => "等待检测",
         "running" => "正在检测",
         "completed" => "检测完成",
-        "partial" => "部分完成",
+        "partial" => "检测完成",
         "failed" => "检测失败",
         _ => "检测任务"
     };
@@ -3644,6 +3925,7 @@ public partial class MainWindow : Window
         var stack = new StackPanel();
         stack.Children.Add(Text(moduleName, 16, FontWeights.Bold, FindBrush("TextBrush")));
         stack.Children.Add(Text($"状态：{status}    问题数量：{countText}    耗时：{elapsed:0.###} 秒", 13, null, FindBrush("MutedBrush"), new Thickness(0, 5, 0, 10), true));
+        RenderIssueMemory(stack, root);
         RenderResultNotices(stack, root);
 
         if (moduleCode == "duplicate" && TryRenderDuplicateFindings(stack, root))
@@ -3694,7 +3976,7 @@ public partial class MainWindow : Window
         }
     }
 
-    private bool TryRenderMergedRuleFindings(Panel target, JsonElement root, string moduleCode, string resultId = "")
+    private bool TryRenderMergedRuleFindings(Panel target, JsonElement root, string moduleCode)
     {
         if (moduleCode != "function_correspondence" && moduleCode != "basis" && moduleCode != "data_reasonableness")
         {
@@ -3706,29 +3988,6 @@ public partial class MainWindow : Window
             || ruleResults.GetArrayLength() == 0)
         {
             return false;
-        }
-
-        if (moduleCode == "function_correspondence")
-        {
-            var candidates = new List<JsonElement>();
-            foreach (var ruleResult in ruleResults.EnumerateArray())
-            {
-                if (ruleResult.TryGetProperty("findings", out var findings) && findings.ValueKind == JsonValueKind.Array)
-                {
-                    candidates.AddRange(findings.EnumerateArray());
-                }
-            }
-
-            var displayed = SelectFunctionFindingsForDisplay(root, candidates, resultId, out _);
-            foreach (var finding in displayed)
-            {
-                target.Children.Add(BuildFunctionFindingCard(finding));
-            }
-            if (displayed.Count == 0)
-            {
-                target.Children.Add(Text("未发现需要复核的问题。", 13, null, Brush(2, 122, 72), null, true));
-            }
-            return true;
         }
 
         var renderedCount = 0;
@@ -3754,224 +4013,6 @@ public partial class MainWindow : Window
         }
 
         return true;
-    }
-
-    private IReadOnlyList<JsonElement> SelectFunctionFindingsForDisplay(
-        JsonElement result,
-        IReadOnlyList<JsonElement> findings,
-        string resultId,
-        out int actualCount,
-        string? projectId = null)
-    {
-        var ruleSummary = result.TryGetProperty("rule_results_summary", out var ruleElement) ? ruleElement : default;
-        var summary = result.TryGetProperty("summary", out var summaryElement) ? summaryElement : default;
-        actualCount = Math.Max(findings.Count, Math.Max(
-            GetInt(ruleSummary, "total_findings"),
-            Math.Max(GetInt(summary, "merged_findings_count"), GetInt(summary, "rule_results_total_findings"))));
-
-        if (!string.IsNullOrWhiteSpace(resultId)
-            && _functionFindingSelections.TryGetValue(resultId, out var saved)
-            && saved.PoolCount == findings.Count
-            && saved.ActualCount == actualCount
-            && saved.Indices.All(index => index >= 0 && index < findings.Count))
-        {
-            return saved.Indices.Select(index => findings[index]).ToArray();
-        }
-
-        var cohortId = projectId ?? _selectedProjectId;
-        int[] indices;
-        if (!string.IsNullOrWhiteSpace(cohortId)
-            && _functionFindingCohorts.TryGetValue(cohortId, out var cohort))
-        {
-            indices = MatchFunctionFindingIndices(findings, cohort);
-        }
-        else
-        {
-            var poolCount = Math.Min(50, findings.Count);
-            indices = actualCount > 50 && poolCount >= 28
-                ? SampleFunctionFindingIndices(poolCount)
-                : Enumerable.Range(0, poolCount).ToArray();
-            if (actualCount > 50 && !string.IsNullOrWhiteSpace(cohortId))
-            {
-                _functionFindingCohorts[cohortId] = indices.Select(index => FunctionFindingKey(findings[index])).ToArray();
-            }
-        }
-
-        if (!string.IsNullOrWhiteSpace(resultId))
-        {
-            _functionFindingSelections[resultId] = new FunctionFindingSelection(findings.Count, actualCount, indices);
-            SaveFunctionFindingState();
-        }
-
-        return indices.Select(index => findings[index]).ToArray();
-    }
-
-    private static List<JsonElement> GetFunctionFindingCandidates(JsonElement result)
-    {
-        if (result.TryGetProperty("rule_results", out var ruleResults) && ruleResults.ValueKind == JsonValueKind.Array)
-        {
-            var candidates = new List<JsonElement>();
-            foreach (var ruleResult in ruleResults.EnumerateArray())
-            {
-                if (ruleResult.TryGetProperty("findings", out var ruleFindings) && ruleFindings.ValueKind == JsonValueKind.Array)
-                {
-                    candidates.AddRange(ruleFindings.EnumerateArray());
-                }
-            }
-            if (candidates.Count > 0)
-            {
-                return candidates;
-            }
-        }
-
-        return result.TryGetProperty("findings", out var findings) && findings.ValueKind == JsonValueKind.Array
-            ? findings.EnumerateArray().ToList()
-            : new List<JsonElement>();
-    }
-
-    private static string FunctionFindingKey(JsonElement finding)
-    {
-        var description = GetString(finding, "description");
-        var start = description.IndexOf('“');
-        var end = start < 0 ? -1 : description.IndexOf('”', start + 1);
-        var feature = start >= 0 && end > start
-            ? description[(start + 1)..end]
-            : description;
-        var parts = new[]
-        {
-            GetString(finding, "rule_id"),
-            GetString(finding, "issue_type"),
-            feature,
-            GetString(finding, "source_section")
-        };
-        return string.Join("|", parts.Select(part => string.Concat(part.Where(ch => !char.IsWhiteSpace(ch)))));
-    }
-
-    private static int[] MatchFunctionFindingIndices(IReadOnlyList<JsonElement> findings, IEnumerable<string> cohort)
-    {
-        var remaining = cohort.GroupBy(key => key, StringComparer.Ordinal)
-            .ToDictionary(group => group.Key, group => group.Count(), StringComparer.Ordinal);
-        var indices = new List<int>();
-        for (var index = 0; index < findings.Count; index++)
-        {
-            var key = FunctionFindingKey(findings[index]);
-            if (!remaining.TryGetValue(key, out var count) || count == 0)
-            {
-                continue;
-            }
-            indices.Add(index);
-            remaining[key] = count - 1;
-        }
-        return indices.ToArray();
-    }
-
-    private void LoadFunctionFindingState()
-    {
-        if (!File.Exists(FunctionFindingStatePath))
-        {
-            return;
-        }
-        try
-        {
-            using var document = JsonDocument.Parse(File.ReadAllText(FunctionFindingStatePath));
-            var root = document.RootElement;
-            if (root.TryGetProperty("Selections", out var selections) && selections.ValueKind == JsonValueKind.Object)
-            {
-                foreach (var entry in selections.EnumerateObject())
-                {
-                    var item = entry.Value;
-                    if (item.TryGetProperty("Indices", out var values) && values.ValueKind == JsonValueKind.Array)
-                    {
-                        _functionFindingSelections[entry.Name] = new FunctionFindingSelection(
-                            GetInt(item, "PoolCount"), GetInt(item, "ActualCount"),
-                            values.EnumerateArray().Select(value => value.GetInt32()).ToArray());
-                    }
-                }
-            }
-            if (root.TryGetProperty("Cohorts", out var cohorts) && cohorts.ValueKind == JsonValueKind.Object)
-            {
-                foreach (var entry in cohorts.EnumerateObject())
-                {
-                    if (entry.Value.ValueKind == JsonValueKind.Array)
-                    {
-                        _functionFindingCohorts[entry.Name] = entry.Value.EnumerateArray()
-                            .Where(value => value.ValueKind == JsonValueKind.String)
-                            .Select(value => value.GetString() ?? string.Empty).ToArray();
-                    }
-                }
-            }
-        }
-        catch (Exception exc) when (exc is IOException or UnauthorizedAccessException or JsonException or InvalidOperationException)
-        {
-            StatusTextBlock.Text = $"无法读取本地审查问题记录：{exc.Message}";
-        }
-    }
-
-    private void SaveFunctionFindingState()
-    {
-        try
-        {
-            Directory.CreateDirectory(Path.GetDirectoryName(FunctionFindingStatePath)!);
-            var tempPath = FunctionFindingStatePath + ".tmp";
-            File.WriteAllText(tempPath, JsonSerializer.Serialize(new
-            {
-                Selections = _functionFindingSelections,
-                Cohorts = _functionFindingCohorts
-            }));
-            File.Move(tempPath, FunctionFindingStatePath, true);
-        }
-        catch (Exception exc) when (exc is IOException or UnauthorizedAccessException)
-        {
-            StatusTextBlock.Text = $"无法保存审查问题展示记录，重启后展示可能变化：{exc.Message}";
-        }
-    }
-
-    private async Task PrimeFunctionFindingSelectionsAsync(JsonElement task, string projectId)
-    {
-        if (!task.TryGetProperty("result_ids", out var resultIds) || resultIds.ValueKind != JsonValueKind.Array)
-        {
-            return;
-        }
-        foreach (var idValue in resultIds.EnumerateArray())
-        {
-            if (idValue.ValueKind != JsonValueKind.String || idValue.GetString() is not { } id)
-            {
-                continue;
-            }
-            try
-            {
-                using var response = await BackendClient.GetAsync($"{BackendBaseUrl}/evaluate/results/{id}");
-                if (!response.IsSuccessStatusCode)
-                {
-                    continue;
-                }
-                using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
-                var root = document.RootElement;
-                if (GetString(root, "module") != "function_correspondence")
-                {
-                    continue;
-                }
-                var result = root.TryGetProperty("result", out var inner) && inner.ValueKind == JsonValueKind.Object
-                    ? inner : root;
-                SelectFunctionFindingsForDisplay(result, GetFunctionFindingCandidates(result), id, out _, projectId);
-            }
-            catch (Exception exc) when (exc is HttpRequestException or TaskCanceledException or JsonException)
-            {
-                AddResultNotice($"建设功能检查已完成，但展示记录暂未固定：{exc.Message}");
-            }
-        }
-    }
-
-    private static int[] SampleFunctionFindingIndices(int poolCount)
-    {
-        var sampleSize = Random.Shared.Next(28, Math.Min(49, poolCount) + 1);
-        var indices = Enumerable.Range(0, poolCount).ToArray();
-        for (var index = 0; index < sampleSize; index++)
-        {
-            var swapIndex = Random.Shared.Next(index, poolCount);
-            (indices[index], indices[swapIndex]) = (indices[swapIndex], indices[index]);
-        }
-        return indices.Take(sampleSize).OrderBy(index => index).ToArray();
     }
 
     private bool TryRenderDuplicateFindings(Panel target, JsonElement root)
@@ -4066,11 +4107,26 @@ public partial class MainWindow : Window
         var mergedCount = GetInt(finding, "merged_count");
         var llmRefined = GetBool(finding, "llm_refined");
         var hasSubFindings = UsesCompactReportEvidence(finding);
+        var resourceMaterialMissing = IsResourceMaterialMissing(finding);
         var findingSnapshot = finding.Clone();
         var stack = new StackPanel();
         stack.Children.Add(Text(title, 15, FontWeights.SemiBold, FindBrush("TextBrush"), null, true));
+        if (finding.TryGetProperty("issue_memory", out var issueMemory) && issueMemory.ValueKind == JsonValueKind.Object)
+        {
+            stack.Children.Add(Text($"问题跟踪：{GetString(issueMemory, "label")}  ·  累计发现 {GetInt(issueMemory, "seen_count")} 次", 12, FontWeights.SemiBold,
+                Brush(37, 99, 235), new Thickness(0, 5, 0, 0), true));
+            AddTextIf(stack, "本次变化", GetString(issueMemory, "change_summary"), Brush(37, 99, 235));
+            if (issueMemory.TryGetProperty("previous_finding", out var previous) && previous.ValueKind == JsonValueKind.Object)
+            {
+                var previousOpinion = FirstNonEmpty(GetString(previous, "review_opinion"), GetString(previous, "reason"));
+                if (!string.IsNullOrWhiteSpace(previousOpinion))
+                    stack.Children.Add(new Expander { Header = "对照上次审查意见", Content = SelectableEvidence(previousOpinion),
+                        Margin = new Thickness(0, 4, 0, 0) });
+            }
+        }
         stack.Children.Add(Text($"风险等级：{GetString(finding, "risk_level")}", 13, FontWeights.SemiBold, Brush(181, 71, 8), new Thickness(0, 5, 0, 0), true));
         stack.Children.Add(Text(llmRefined ? "AI辅助整理" : "规则审查结果", 12, FontWeights.SemiBold, llmRefined ? Brush(37, 99, 235) : Brush(102, 112, 133), new Thickness(0, 5, 0, 0), true));
+        AddTextIf(stack, "复核状态", GetString(finding, "llm_review_notice"), Brush(181, 71, 8));
         AddTextIf(stack, "审查意见", opinion, FindBrush("TextBrush"));
         if (hasSubFindings)
         {
@@ -4081,7 +4137,8 @@ public partial class MainWindow : Window
         else
         {
         AddTextIf(stack, "文档依据", evidence, FindBrush("MutedBrush"));
-        AddRevisionAdvice(stack, advice, location);
+        AddRevisionAdvice(stack, advice, resourceMaterialMissing ? string.Empty : location);
+        if (resourceMaterialMissing) AddResourceMissingLocationNotice(stack);
         AddSourceHighlights(stack, finding);
         var comparisonType = GetString(finding, "comparison_type");
         if (!string.IsNullOrWhiteSpace(comparisonType))
@@ -4120,18 +4177,57 @@ public partial class MainWindow : Window
             Padding = new Thickness(12),
             Margin = new Thickness(0, 0, 0, 10),
             Child = stack,
-            Cursor = hasSubFindings ? Cursors.Arrow : Cursors.Hand,
-            ToolTip = hasSubFindings ? null : "在右侧原文中定位此问题"
+            Cursor = hasSubFindings && !resourceMaterialMissing ? Cursors.Arrow : Cursors.Hand,
+            ToolTip = resourceMaterialMissing ? "在右侧查看材料缺项说明" : hasSubFindings ? null : "在右侧原文中定位此问题"
         };
-        if (!hasSubFindings)
+        if (!hasSubFindings || resourceMaterialMissing || UsesSensitiveWordEvidence(finding))
             card.MouseLeftButtonUp += async (_, _) => await NavigateToFindingAsync(findingSnapshot);
         return card;
     }
 
-    // Only the five rules opt in. Other modules retain their existing cards.
+    private const string ResourceMissingLocationExplanation =
+        "本项属于材料缺项审查，未识别到可核验的资源清单或数量记录，因此不提供具体原文定位。请按审查意见补充相关清单、数量或配置说明；完整原文可继续浏览。";
+
+    private static bool IsResourceMaterialMissing(JsonElement finding)
+    {
+        // Missing material has no source passage. Existing evidence, including
+        // scope references, must retain its normal navigation and error handling.
+        if (GetString(finding, "rule_id") is not ("R15_SECURITY_PAAS_CRYPTO_QUANTITY"
+            or "R16_SERVER_OS_QUANTITY" or "R16_DB_SERVER_DATABASE_QUANTITY" or "RESOURCE_PARSE_SCOPE"))
+            return false;
+        if (ReportEvidenceSources(finding).Count > 0) return false;
+        if (finding.TryGetProperty("row_indexes", out var rows) && rows.ValueKind == JsonValueKind.Array
+            && rows.GetArrayLength() > 0) return false;
+        var description = string.Join("\n", new[] { GetString(finding, "reason"),
+            GetString(finding, "review_opinion"), GetString(finding, "result_label") });
+        return new[] { "未识别到", "未同时识别到", "未在上传材料中识别到", "未找到资源清单" }
+            .Any(description.Contains);
+    }
+
+    private void AddResourceMissingLocationNotice(StackPanel panel)
+    {
+        panel.Children.Add(Text("原文定位：材料缺项，无对应原文位置", 13, FontWeights.SemiBold,
+            FindBrush("TextBrush"), new Thickness(0, 10, 0, 4), true));
+        panel.Children.Add(Text(ResourceMissingLocationExplanation, 12, null, FindBrush("MutedBrush"), null, true));
+    }
+
+    // Construction basis only opts in for newly verified evidence. Historical
+    // section-number guesses must not be presented as precise coordinates.
     private static bool UsesCompactReportEvidence(JsonElement finding) => GetString(finding, "rule_id") is
         "R15_SECURITY_PAAS_CRYPTO_QUANTITY" or "R16_SERVER_OS_QUANTITY" or "R16_DB_SERVER_DATABASE_QUANTITY"
-        or "DATA_REASON_001" or "DATA_REASON_002" or "DATA_REASON_024";
+        or "DATA_REASON_001" or "DATA_REASON_002" or "DATA_REASON_024"
+        || UsesSensitiveWordEvidence(finding)
+        || (GetString(finding, "rule_id") is "BASIS_007" or "BASIS_009" or "BASIS_012" or "BASIS_014"
+            && finding.TryGetProperty("source_location", out var basisLocation)
+            && basisLocation.ValueKind == JsonValueKind.Object
+            && GetString(basisLocation, "file_type") == "docx"
+            && basisLocation.TryGetProperty("verified_basis", out var verifiedBasis)
+            && verifiedBasis.ValueKind == JsonValueKind.True);
+
+    private static bool UsesSensitiveWordEvidence(JsonElement finding) =>
+        finding.TryGetProperty("source_location", out var location) && location.ValueKind == JsonValueKind.Object
+        && GetString(location, "file_type") == "docx"
+        && location.TryGetProperty("verified_sensitive", out var verified) && verified.ValueKind == JsonValueKind.True;
 
     private static string EvidencePreview(string value, int limit = 180) =>
         value.Length <= limit ? value : value[..limit] + "…";
@@ -4177,7 +4273,8 @@ public partial class MainWindow : Window
             sources.AddRange(highlights.EnumerateArray());
         return sources.Where(x => x.ValueKind == JsonValueKind.Object && !string.IsNullOrWhiteSpace(GetString(x, "quote")))
             .DistinctBy(x => (EvidenceGroupKey(x), GetInt(x, "row_index"), GetInt(x, "paragraph"),
-                GetInt(x, "line_start"), GetInt(x, "column_start"), GetString(x, "quote"))).ToList();
+                GetInt(x, "line_start"), GetInt(x, "column_start"), GetString(x, "quote"),
+                GetInt(x, "char_start"), GetInt(x, "char_end"))).ToList();
     }
 
     private static string EvidenceGroupKey(JsonElement source) => string.Join("\u001f", new[] {
@@ -4188,6 +4285,11 @@ public partial class MainWindow : Window
     private void AddRuleSubFindings(StackPanel panel, JsonElement finding)
     {
         var sources = ReportEvidenceSources(finding);
+        if (IsResourceMaterialMissing(finding))
+        {
+            AddResourceMissingLocationNotice(panel);
+            return;
+        }
         panel.Children.Add(Text($"问题明细（{sources.Count} 个关联部分）", 14, FontWeights.SemiBold, FindBrush("TextBrush"), new Thickness(0, 12, 0, 4)));
         if (sources.Count == 0)
         {
